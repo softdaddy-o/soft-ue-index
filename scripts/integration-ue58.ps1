@@ -29,6 +29,16 @@ function Set-ProcessArguments([Diagnostics.ProcessStartInfo] $Info, [string[]] $
     }
     $Info.Arguments = (($Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument $_ }) -join ' ')
 }
+function Stop-ChildProcess([Diagnostics.Process] $Process) {
+    try { if ($Process.HasExited) { return } } catch { return }
+    try {
+        $treeKill = $Process.GetType().GetMethods() | Where-Object {
+            $_.Name -eq 'Kill' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType -eq [bool]
+        } | Select-Object -First 1
+        if ($treeKill) { [void]$treeKill.Invoke($Process, @($true)) } else { $Process.Kill() }
+    } catch [InvalidOperationException] { }
+    try { [void]$Process.WaitForExit(5000) } catch [InvalidOperationException] { }
+}
 function Invoke-External([string] $FileName, [string[]] $Arguments) {
     $remaining = [Math]::Floor(($script:Deadline - (Get-Date)).TotalSeconds)
     if ($remaining -lt 1) { throw 'overall integration timeout expired' }
@@ -39,7 +49,7 @@ function Invoke-External([string] $FileName, [string[]] $Arguments) {
     $process = [Diagnostics.Process]::Start($psi)
     $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit([int]$remaining * 1000)) {
-        $process.Kill($true); $process.WaitForExit(); $process.Dispose()
+        Stop-ChildProcess $process; $process.Dispose()
         throw 'external command timed out'
     }
     $out.Wait(); $err.Wait(); $code = $process.ExitCode; $text = $out.Result; $process.Dispose()
@@ -125,8 +135,7 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
             $id++
         }
     } finally {
-        if (-not $process.HasExited) { $process.Kill($true) }
-        $process.WaitForExit()
+        Stop-ChildProcess $process
         $stderr.Wait($TimeoutSeconds * 1000) | Out-Null
         $process.Dispose()
     }
