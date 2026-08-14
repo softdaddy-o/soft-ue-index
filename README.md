@@ -1,13 +1,13 @@
 # soft-ue-index
 
-`soft-ue-index` generates and maintains a small, validated `compile_commands.json` for Windows Unreal Engine 5.8 projects, then exposes clangd code intelligence through a read-only MCP server. It is designed for one or more projects without indexing an entire engine in a separate database service.
+`soft-ue-index` generates and maintains a validated `compile_commands.json` for Windows Unreal Engine 5.8 projects, then exposes clangd code intelligence through a read-only MCP server. It is designed for one or more projects without running a separate database service.
 
 ## Prerequisites
 
 - Windows 10 or later.
 - A source-enabled Unreal Engine 5.8 installation associated with the project.
 - LLVM/clangd compatible with the engine's `Windows_SDK.json` requirements. `doctor` finds LLVM from the normal installation locations, `LLVM_PATH`, and `PATH`.
-- Generated project files/build artifacts sufficient for UnrealBuildTool to produce a clang compilation database.
+- Rider project metadata or generated project files/build artifacts sufficient for UnrealBuildTool to produce a clang compilation database.
 
 The program uses Unreal's bundled .NET runtime and UnrealBuildTool. It does not modify the `.uproject`, engine, source files, or build settings.
 
@@ -39,6 +39,8 @@ soft-ue-index list
 soft-ue-index generate mygame
 soft-ue-index status mygame --json
 ```
+
+`generate` first uses existing Rider metadata when it is available, including installed-engine modules that UnrealBuildTool may treat as already compiled. It falls back to UnrealBuildTool otherwise. Use `soft-ue-index generate mygame --engine-scope=full` to include every module represented by Rider's UnrealEditor metadata; the default keeps the engine scope to modules associated with the project target.
 
 Projects are registered in a per-user registry. The default Windows location is `%AppData%/soft-ue-index/registry.json`; generated databases and private generation logs are in `%LocalAppData%/soft-ue-index/projects/`. Paths are canonicalized, so adding the same project through a different case or junction does not create a duplicate registration.
 
@@ -73,6 +75,8 @@ Example client configuration:
 
 The server provides `list_projects`, `project_status`, `search_symbols`, `find_definition`, `find_references`, `find_implementations`, `document_symbols`, `hover`, `call_hierarchy`, and `read_symbol_source`. Every source query requires an explicit registered project and is bounded by result, response, and source-read limits. It only reads the selected project and its associated engine roots.
 
+The first query starts clangd lazily and opens one safe project translation unit to trigger background indexing. Project symbols and engine declarations included by that unit become available first. A cold Unreal Engine index can continue filling in the background; later sessions reuse persistent shards from the project's per-user cache. Source or build-rule changes handled by `watch` update only the affected work instead of rebuilding the entire index from scratch.
+
 ## Local UE 5.8 integration check
 
 The repository includes a non-destructive PowerShell check. It calls `doctor`, registers and generates one project, verifies project and engine translation-unit coverage, and makes bounded MCP queries. It does not build or edit the project.
@@ -89,6 +93,7 @@ The repository includes a non-destructive PowerShell check. It calls `doctor`, r
 - `doctor` reports generated headers or response files missing: generate IDE project files and build the editor target once, then run `generate` again.
 - Generation fails: inspect the per-project `ubt.log` beside the generated compilation database. The previous valid database is retained on failure.
 - MCP reports a project is not ready: run `generate <project>` and verify `status <project> --json` shows a compilation database and clangd path.
+- A cold search returns no engine symbol yet: keep the MCP server running while background indexing fills the per-user cache, then retry. Project symbols and commonly included engine declarations are normally available first.
 
 ## Privacy and removal
 

@@ -80,6 +80,12 @@ function Test-UnderRoot([string] $Path, [string] $Root) {
 function Assert-UnderRoot([string] $Uri, [string] $Root, [string] $Kind) {
     if (-not (Test-UnderRoot (Convert-FileUriToPath $Uri) $Root)) { throw "MCP $Kind result was outside its expected source root" }
 }
+function Assert-UnderRegisteredRoots([string] $Uri, [string] $ProjectRoot, [string] $EngineRoot) {
+    $path = Convert-FileUriToPath $Uri
+    if (-not (Test-UnderRoot $path $ProjectRoot) -and -not (Test-UnderRoot $path $EngineRoot)) {
+        throw 'MCP definition was outside the registered project and engine roots'
+    }
+}
 
 function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $EngineRoot, [string] $ProjectQuery, [string] $EngineQuery) {
     $psi = [Diagnostics.ProcessStartInfo]::new()
@@ -138,7 +144,9 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
                 if ($definitions.Count -eq 0 -and (Get-Date).AddSeconds(1) -lt $script:Deadline) { Start-Sleep -Seconds 1 }
             }
             if ($definitions.Count -eq 0) { throw "MCP find_definition timed out for $($case.Kind) source" }
-            Assert-UnderRoot $definitions[0].uri $case.Root $case.Kind
+            # Unreal declarations can resolve through generated code or an engine
+            # base declaration, even when the searched symbol belongs to the other root.
+            Assert-UnderRegisteredRoots $definitions[0].uri $ProjectRoot $EngineRoot
             $references = Send-Request @{ jsonrpc = '2.0'; id = $id; method = 'tools/call'; params = @{ name = 'find_references'; arguments = @{ project_id = $ProjectID; position = $position; max_items = 10 } } }
             $id++
             if (-not $references.result) { throw "MCP find_references failed for $($case.Kind) symbol" }
