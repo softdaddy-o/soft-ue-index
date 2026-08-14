@@ -41,6 +41,7 @@ type Client struct {
 	closed    bool
 	next      atomic.Uint64
 	wg        sync.WaitGroup
+	requests  chan wireMessage
 }
 
 func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Client {
@@ -50,9 +51,10 @@ func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Clien
 	if options.RequestTimeout <= 0 {
 		options.RequestTimeout = 15 * time.Second
 	}
-	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{})}
-	c.wg.Add(1)
+	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32)}
+	c.wg.Add(2)
 	go c.readLoop()
+	go c.requestLoop()
 	return c
 }
 func (c *Client) readLoop() {
@@ -74,7 +76,13 @@ func (c *Client) readLoop() {
 			continue
 		}
 		if m.Method != "" && len(m.ID) != 0 {
-			go c.respondServerRequest(m)
+			select {
+			case c.requests <- m:
+			case <-c.done:
+				return
+			default:
+				_ = c.send(wireMessage{JSONRPC: "2.0", ID: m.ID, Error: &rpcError{Code: -32000, Message: "server request queue full"}})
+			}
 			continue
 		}
 		var id uint64
@@ -89,6 +97,17 @@ func (c *Client) readLoop() {
 			case ch <- m:
 			default:
 			}
+		}
+	}
+}
+func (c *Client) requestLoop() {
+	defer c.wg.Done()
+	for {
+		select {
+		case m := <-c.requests:
+			c.respondServerRequest(m)
+		case <-c.done:
+			return
 		}
 	}
 }

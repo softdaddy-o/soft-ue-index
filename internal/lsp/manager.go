@@ -55,16 +55,22 @@ func (ExecFactory) Start(ctx context.Context, path string, args []string, logPat
 		cmd.Stderr = f
 		logFile = f
 	}
+	cleanup := func(err error) (Process, error) {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return nil, err
+	}
 	in, e := cmd.StdinPipe()
 	if e != nil {
-		return nil, e
+		return cleanup(e)
 	}
 	out, e := cmd.StdoutPipe()
 	if e != nil {
-		return nil, e
+		return cleanup(e)
 	}
 	if e = cmd.Start(); e != nil {
-		return nil, e
+		return cleanup(e)
 	}
 	return &execProcess{Cmd: cmd, in: in, out: out, log: logFile}, nil
 }
@@ -160,6 +166,15 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 		s.cancel = cancel
 		p, err := m.start(sessionCtx, cfg)
 		m.mu.Lock()
+		if m.closed || m.sessions[cfg.ID] != s {
+			m.mu.Unlock()
+			if p != nil {
+				_ = p.Kill()
+				_ = p.Wait()
+			}
+			cancel()
+			return nil, ErrClosed
+		}
 		if err == nil {
 			s.process = p
 			s.client = NewClient(p.Stdout(), p.Stdin(), ClientOptions{})
