@@ -330,6 +330,31 @@ func TestClientCancelsTimeout(t *testing.T) {
 	}
 }
 
+func TestCallDoesNotBlockOnCancellationPastOriginalDeadline(t *testing.T) {
+	a, b := net.Pipe()
+	c := NewClient(a, a, ClientOptions{RequestTimeout: 100 * time.Millisecond})
+	defer c.Close()
+	requestRead := make(chan struct{})
+	go func() {
+		_, _ = readFrame(bufio.NewReader(b), 4096)
+		close(requestRead)
+		// Deliberately stop reading before the cancellation notification.
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := c.Call(ctx, "slow", nil, nil)
+	elapsed := time.Since(started)
+	_ = b.Close()
+	<-requestRead
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v", err)
+	}
+	if elapsed > 70*time.Millisecond {
+		t.Fatalf("Call took %v after its original deadline", elapsed)
+	}
+}
+
 func TestClientCapsLaterCallerDeadlineAtRequestTimeout(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()

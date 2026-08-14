@@ -218,7 +218,9 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 	}
 	select {
 	case <-ctx.Done():
-		_ = c.Notify("$/cancelRequest", map[string]any{"id": id})
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		_ = c.sendContext(cancelCtx, wireMessage{JSONRPC: "2.0", Method: "$/cancelRequest", Params: mustJSON(map[string]any{"id": id})})
+		cancel()
 		return ctx.Err()
 	case m, ok := <-response:
 		if !ok {
