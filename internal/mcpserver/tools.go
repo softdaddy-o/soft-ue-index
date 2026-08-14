@@ -2,6 +2,8 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -17,58 +19,83 @@ func (s *Server) MCPServer(version string) *mcp.Server {
 		MaxItems int `json:"max_items,omitempty"`
 	}) (*mcp.CallToolResult, ListProjectsResult, error) {
 		r, e := s.ListProjects(ctx, in.MaxItems)
-		return s.textResult(e), r, nil
+		res, e := s.toolResult(r, e)
+		return res, r, e
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "project_status", Description: "Get compilation database status for one explicit project."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ProjectStatusInput) (*mcp.CallToolResult, ProjectStatusResult, error) {
 		r, e := s.ProjectStatus(ctx, in)
-		return s.textResult(e), r, nil
+		res, e := s.toolResult(r, e)
+		return res, r, e
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "search_symbols", Description: "Search symbols in one explicit project."}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchSymbolsInput) (*mcp.CallToolResult, SearchSymbolsResult, error) {
 		r, e := s.SearchSymbols(ctx, in)
-		return s.textResult(e), r, nil
+		res, e := s.toolResult(r, e)
+		return res, r, e
 	})
-	addLocations(m, "find_definition", "Find a definition.", s.FindDefinition, s.textResult)
-	addLocations(m, "find_references", "Find references.", s.FindReferences, s.textResult)
-	addLocations(m, "find_implementations", "Find implementations.", s.FindImplementations, s.textResult)
+	addLocations(m, "find_definition", "Find a definition.", s.FindDefinition, s)
+	addLocations(m, "find_references", "Find references.", s.FindReferences, s)
+	addLocations(m, "find_implementations", "Find implementations.", s.FindImplementations, s)
 	mcp.AddTool(m, &mcp.Tool{Name: "document_symbols", Description: "List document symbols for a project or engine source file."}, func(ctx context.Context, _ *mcp.CallToolRequest, in PathQueryInput) (*mcp.CallToolResult, DocumentSymbolsResult, error) {
 		r, e := s.DocumentSymbols(ctx, in)
-		return s.textResult(e), r, nil
+		res, e := s.toolResult(r, e)
+		return res, r, e
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "hover", Description: "Get hover information at a source position."}, func(ctx context.Context, _ *mcp.CallToolRequest, in LocationQueryInput) (*mcp.CallToolResult, HoverResult, error) {
 		r, e := s.Hover(ctx, in)
-		return s.textResult(e), r, nil
+		res, e := s.toolResult(r, e)
+		return res, r, e
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "call_hierarchy", Description: "Prepare, list incoming, or list outgoing calls at a source position."}, func(ctx context.Context, _ *mcp.CallToolRequest, in CallHierarchyInput) (*mcp.CallToolResult, CallHierarchyResult, error) {
 		r, e := s.CallHierarchy(ctx, in)
-		return s.textResult(e), r, nil
+		res, e := s.toolResult(r, e)
+		return res, r, e
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "read_symbol_source", Description: "Read a line-bounded source excerpt inside the selected project or engine."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ReadSymbolSourceInput) (*mcp.CallToolResult, ReadSymbolSourceResult, error) {
 		r, e := s.ReadSymbolSource(ctx, in)
-		return s.textResult(e), r, nil
+		res, e := s.toolResult(r, e)
+		return res, r, e
 	})
 	return m
 }
 
-func addLocations(m *mcp.Server, name, description string, f func(context.Context, LocationQueryInput) (LocationsResult, error), result func(error) *mcp.CallToolResult) {
+func addLocations(m *mcp.Server, name, description string, f func(context.Context, LocationQueryInput) (LocationsResult, error), s *Server) {
 	mcp.AddTool(m, &mcp.Tool{Name: name, Description: description}, func(ctx context.Context, _ *mcp.CallToolRequest, in LocationQueryInput) (*mcp.CallToolResult, LocationsResult, error) {
 		r, e := f(ctx, in)
-		return result(e), r, nil
+		res, e := s.toolResult(r, e)
+		return res, r, e
 	})
 }
 
-func (s *Server) textResult(err error) *mcp.CallToolResult {
-	if err == nil {
-		return &mcp.CallToolResult{}
+// toolResult reserves a conservative 256-byte JSON-RPC envelope for a normal
+// SDK request ID and the newline delimiter. Successful typed output is checked
+// in the same CallToolResult shape that the SDK serializes. Error results use a
+// regular, already-sanitized tool error so the SDK does not attach output.
+func (s *Server) toolResult(out any, err error) (*mcp.CallToolResult, error) {
+	if err != nil {
+		return nil, s.compactToolError(mapError(err))
 	}
+	result := &mcp.CallToolResult{Content: []mcp.Content{}, StructuredContent: out}
+	if s.fitsToolResult(result) {
+		return result, nil
+	}
+	return nil, s.compactToolError(ErrLimitExceeded)
+}
+
+func (s *Server) fitsToolResult(result *mcp.CallToolResult) bool {
+	encoded, err := json.Marshal(result)
+	return err == nil && len(encoded)+protocolEnvelopeBytes <= s.limits.MaxResponseBytes
+}
+
+func (s *Server) compactToolError(err error) error {
 	message := mapError(err).Error()
-	max := s.limits.MaxResponseBytes / 8
-	if max < 32 {
-		max = 32
+	for len(message) > 0 {
+		result := &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: message}}}
+		if s.fitsToolResult(result) {
+			return errors.New(message)
+		}
+		message = message[:len(message)-1]
 	}
-	if len(message) > max {
-		message = message[:max]
-	}
-	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: message}}}
+	return errors.New("error")
 }
 
 // RunStdio serves MCP only through stdin/stdout. Callers must send diagnostics

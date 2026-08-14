@@ -23,6 +23,7 @@ var (
 	ErrProjectNotFound = errors.New("project not found")
 	ErrPathForbidden   = errors.New("path is outside the selected project or engine")
 	ErrLimitExceeded   = errors.New("request exceeds configured limit")
+	ErrInvalidLimits   = errors.New("configured response limit is too small")
 )
 
 type ProjectLoader interface {
@@ -53,13 +54,14 @@ type Server struct {
 	queries  Queries
 	openFile func(string) (io.ReadCloser, error)
 	limits   Limits
+	limitErr error
 }
 
 func New(d Dependencies) *Server {
 	if d.OpenFile == nil {
 		d.OpenFile = func(path string) (io.ReadCloser, error) { return os.Open(path) }
 	}
-	return &Server{projects: d.Projects, queries: d.Queries, openFile: d.OpenFile, limits: d.Limits.normalized()}
+	return &Server{projects: d.Projects, queries: d.Queries, openFile: d.OpenFile, limits: d.Limits.normalized(), limitErr: d.Limits.validate()}
 }
 
 type SearchSymbolsInput struct {
@@ -96,8 +98,8 @@ func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (Sear
 		result.Truncated = true
 	}
 	result.Items, result.Truncated = s.filterSymbols(p, result.Items, result.Truncated)
-	result.Items, result.Truncated = trimSymbols(result.Items, s.limits.MaxResponseBytes, result.Truncated)
-	return bounded(s.limits.MaxResponseBytes, result)
+	result.Items, result.Truncated = trimSymbols(result.Items, s.outputLimit(), result.Truncated)
+	return bounded(s.outputLimit(), result)
 }
 
 type TextPosition struct {
@@ -179,8 +181,8 @@ func (s *Server) locations(ctx context.Context, kind string, in LocationQueryInp
 		r.Truncated = true
 	}
 	r.Items, r.Truncated = s.filterLocations(p, r.Items, r.Truncated)
-	r.Items, r.Truncated = trimLocations(r.Items, s.limits.MaxResponseBytes, r.Truncated)
-	return bounded(s.limits.MaxResponseBytes, r)
+	r.Items, r.Truncated = trimLocations(r.Items, s.outputLimit(), r.Truncated)
+	return bounded(s.outputLimit(), r)
 }
 func (s *Server) FindDefinition(ctx context.Context, in LocationQueryInput) (LocationsResult, error) {
 	return s.locations(ctx, "definition", in)
@@ -215,8 +217,8 @@ func (s *Server) DocumentSymbols(ctx context.Context, in PathQueryInput) (Docume
 		r.Items = r.Items[:max]
 		r.Truncated = true
 	}
-	r.Items, r.Truncated = trimDocumentSymbols(r.Items, s.limits.MaxResponseBytes, r.Truncated)
-	return bounded(s.limits.MaxResponseBytes, r)
+	r.Items, r.Truncated = trimDocumentSymbols(r.Items, s.outputLimit(), r.Truncated)
+	return bounded(s.outputLimit(), r)
 }
 func (s *Server) Hover(ctx context.Context, in LocationQueryInput) (HoverResult, error) {
 	p, err := s.project(ctx, in.ProjectID)
@@ -236,11 +238,11 @@ func (s *Server) Hover(ctx context.Context, in LocationQueryInput) (HoverResult,
 		return HoverResult{}, mapError(err)
 	}
 	r := HoverResult{Item: v}
-	if v != nil && len(v.Contents.Value) > s.limits.MaxResponseBytes {
-		v.Contents.Value = v.Contents.Value[:s.limits.MaxResponseBytes]
+	if v != nil && len(v.Contents.Value) > s.outputLimit() {
+		v.Contents.Value = v.Contents.Value[:s.outputLimit()]
 		r.Truncated = true
 	}
-	return bounded(s.limits.MaxResponseBytes, r)
+	return bounded(s.outputLimit(), r)
 }
 func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (CallHierarchyResult, error) {
 	p, err := s.project(ctx, in.ProjectID)
@@ -283,7 +285,7 @@ func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (Call
 		}
 	}
 	if kind == "prepare" || in.MaxDepth == 0 {
-		return trimCallHierarchy(r, s.limits.MaxResponseBytes)
+		return trimCallHierarchy(r, s.outputLimit())
 	}
 	frontier := make([]lsp.CallHierarchyItem, 0, len(r.Nodes))
 	for _, node := range r.Nodes {
@@ -328,7 +330,7 @@ func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (Call
 		}
 		frontier = next
 	}
-	return trimCallHierarchy(r, s.limits.MaxResponseBytes)
+	return trimCallHierarchy(r, s.outputLimit())
 }
 func (s *Server) validatePosition(p registry.Project, v TextPosition) error {
 	if v.Line < 0 || v.Character < 0 {
@@ -356,6 +358,9 @@ type ProjectSummary struct {
 }
 
 func (s *Server) ListProjects(ctx context.Context, maxItems int) (ListProjectsResult, error) {
+	if s.limitErr != nil {
+		return ListProjectsResult{}, s.limitErr
+	}
 	if s.projects == nil {
 		return ListProjectsResult{}, errors.New("project registry is unavailable")
 	}
@@ -372,7 +377,7 @@ func (s *Server) ListProjects(ctx context.Context, maxItems int) (ListProjectsRe
 		}
 		out.Items = append(out.Items, ProjectSummary{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Generation.CompilationDatabase != ""})
 	}
-	return bounded(s.limits.MaxResponseBytes, out)
+	return bounded(s.outputLimit(), out)
 }
 
 type ProjectStatusInput struct {
@@ -391,7 +396,7 @@ func (s *Server) ProjectStatus(ctx context.Context, in ProjectStatusInput) (Proj
 	if err != nil {
 		return ProjectStatusResult{}, err
 	}
-	return bounded(s.limits.MaxResponseBytes, ProjectStatusResult{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Generation.CompilationDatabase != "", LastFingerprint: p.Generation.LastFingerprint})
+	return bounded(s.outputLimit(), ProjectStatusResult{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Generation.CompilationDatabase != "", LastFingerprint: p.Generation.LastFingerprint})
 }
 
 type ReadSymbolSourceInput struct {
@@ -472,12 +477,18 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 		}
 		if b.Len()+need > limit {
 			remaining := limit - b.Len()
+			emitted := false
 			if end >= in.StartLine && remaining > 0 {
 				b.WriteByte('\n')
 				remaining--
+				emitted = true
 			}
 			if remaining > 0 {
 				b.WriteString(part[:min(remaining, len(part))])
+				emitted = true
+			}
+			if emitted {
+				end = line
 			}
 			truncated = true
 			break
@@ -488,7 +499,7 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 		b.WriteString(part)
 		end = line
 		if line == in.EndLine {
-			return bounded(s.limits.MaxResponseBytes, ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated})
+			return bounded(s.outputLimit(), ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated})
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -500,10 +511,13 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	if line < in.StartLine {
 		return ReadSymbolSourceResult{}, errors.New("start_line is outside the file")
 	}
-	return bounded(s.limits.MaxResponseBytes, ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated})
+	return bounded(s.outputLimit(), ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated})
 }
 
 func (s *Server) project(ctx context.Context, id string) (registry.Project, error) {
+	if s.limitErr != nil {
+		return registry.Project{}, s.limitErr
+	}
 	if id == "" {
 		return registry.Project{}, ErrProjectRequired
 	}
@@ -521,6 +535,7 @@ func (s *Server) project(ctx context.Context, id string) (registry.Project, erro
 	}
 	return registry.Project{}, fmt.Errorf("%w: %s", ErrProjectNotFound, id)
 }
+func (s *Server) outputLimit() int { return s.limits.MaxResponseBytes - protocolEnvelopeBytes }
 func (s *Server) itemLimit(requested int) int {
 	if requested > 0 && requested < s.limits.MaxItems {
 		return requested

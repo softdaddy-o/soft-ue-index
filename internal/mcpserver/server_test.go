@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,7 +39,7 @@ func TestReadSymbolSourceRejectsOutsideRootAndBoundsBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Text != "line " || !r.Truncated {
+	if r.Text != "line " || !r.Truncated || r.EndLine != 1 {
 		t.Fatalf("bounded result: %#v", r)
 	}
 	outside := filepath.Join(t.TempDir(), "secret.cpp")
@@ -130,6 +131,13 @@ func TestSearchSymbolsRejectsMissingOrUnknownProject(t *testing.T) {
 	}
 	if _, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "missing", Query: "Actor"}); !errors.Is(err, ErrProjectNotFound) {
 		t.Fatalf("unknown project: %v", err)
+	}
+}
+
+func TestRejectsResponseLimitsTooSmallForMCPEnvelope(t *testing.T) {
+	s := New(Dependencies{Projects: fakeProjects{}, Limits: Limits{MaxResponseBytes: minimumResponseBytes - 1}})
+	if _, err := s.ListProjects(context.Background(), 1); !errors.Is(err, ErrInvalidLimits) {
+		t.Fatalf("limit validation: %v", err)
 	}
 }
 
@@ -299,10 +307,81 @@ func TestMCPStdioHelperProcess(t *testing.T) {
 	if os.Getenv("SOFT_UE_INDEX_MCP_HELPER") != "1" {
 		return
 	}
-	if err := New(Dependencies{Projects: fakeProjects{}}).RunStdio(context.Background(), "test"); err != nil {
+	q := &fakeQueries{symbols: []lsp.Symbol{{Name: "s"}}}
+	if os.Getenv("SOFT_UE_INDEX_MCP_MODE") == "error" {
+		q.err = errors.New(strings.Repeat("backend-secret", 1<<18))
+	}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: "P.uproject"}}}, Queries: q, Limits: Limits{MaxResponseBytes: 512}})
+	if err := s.RunStdio(context.Background(), "test"); err != nil {
 		os.Exit(2)
 	}
 	os.Exit(0)
+}
+
+func TestOfficialSDKStdioCallToolFramesRespectResponseCap(t *testing.T) {
+	for _, mode := range []string{"success", "error"} {
+		t.Run(mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=TestMCPStdioHelperProcess", "--")
+			cmd.Env = append(os.Environ(), "SOFT_UE_INDEX_MCP_HELPER=1", "SOFT_UE_INDEX_MCP_MODE="+mode)
+			in, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = in.Close(); _ = cmd.Wait() }()
+			write := func(v any) {
+				if err := json.NewEncoder(in).Encode(v); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": "2026-07-28", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "test", "version": "test"}}})
+			scanner := bufio.NewScanner(out)
+			scanner.Buffer(make([]byte, 1024), 64*1024)
+			for scanner.Scan() {
+				var msg struct {
+					ID int `json:"id"`
+				}
+				if json.Unmarshal(scanner.Bytes(), &msg) == nil && msg.ID == 1 {
+					break
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				t.Fatal(err)
+			}
+			write(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+			write(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": map[string]any{"name": "search_symbols", "arguments": map[string]any{"project_id": "p", "query": "x"}}})
+			for scanner.Scan() {
+				line := append([]byte(nil), scanner.Bytes()...)
+				var msg struct {
+					ID     int                 `json:"id"`
+					Result *mcp.CallToolResult `json:"result"`
+				}
+				if json.Unmarshal(line, &msg) != nil || msg.ID != 2 {
+					continue
+				}
+				if len(line)+1 > 512 {
+					t.Fatalf("stdio frame=%d", len(line)+1)
+				}
+				if msg.Result == nil || msg.Result.IsError != (mode == "error") {
+					t.Fatalf("result=%#v", msg.Result)
+				}
+				if strings.Contains(string(line), "backend-secret") {
+					t.Fatal("backend error leaked")
+				}
+				return
+			}
+			if err := scanner.Err(); err != nil {
+				t.Fatal(err)
+			}
+			t.Fatal("missing tools/call response")
+		})
+	}
 }
 
 func TestOfficialSDKCommandTransportKeepsStdoutProtocolClean(t *testing.T) {
@@ -422,13 +501,13 @@ func TestCallHierarchyLimitsItemsAndSerializedBytes(t *testing.T) {
 	big := a
 	big.Name = strings.Repeat("x", 4096)
 	q.roots = []lsp.CallHierarchyItem{big}
-	s = New(Dependencies{Projects: project, Queries: q, Limits: Limits{MaxCallDepth: 1, MaxItems: 5, MaxResponseBytes: 256}})
+	s = New(Dependencies{Projects: project, Queries: q, Limits: Limits{MaxCallDepth: 1, MaxItems: 5, MaxResponseBytes: 512}})
 	got, err = s.CallHierarchy(context.Background(), CallHierarchyInput{ProjectID: "p", Position: TextPosition{Path: path}})
 	if err != nil || !got.Truncated {
 		t.Fatalf("byte cap=%#v err=%v", got, err)
 	}
 	encoded, _ := json.Marshal(got)
-	if len(encoded) > 256 {
+	if len(encoded) > 512-protocolEnvelopeBytes {
 		t.Fatalf("serialized result exceeded cap: %d", len(encoded))
 	}
 }
