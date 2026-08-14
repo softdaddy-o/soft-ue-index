@@ -146,20 +146,53 @@ func TestClientRepliesToServerConfigurationRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-func TestServerRequestFloodIsBoundedAndCloseCompletes(t *testing.T) {
+func TestServerRequestFloodReturnsOneBoundedResponsePerRequest(t *testing.T) {
 	a, b := net.Pipe()
 	c := NewClient(a, a, ClientOptions{})
+	const count = 80
+	writeDone := make(chan struct{})
 	go func() {
-		for i := 0; i < 100; i++ {
+		defer close(writeDone)
+		for i := 0; i < count; i++ {
 			_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: mustJSON(i), Method: "workspace/configuration", Params: mustJSON(map[string]any{"items": []any{}})}))
 		}
-		_ = b.Close()
 	}()
+	// Let the bounded queue fill while the server deliberately withholds reads.
+	time.Sleep(20 * time.Millisecond)
+	r := bufio.NewReader(b)
+	seen := map[int]bool{}
+	overloaded := false
+	for len(seen) < count {
+		body, err := readFrame(r, 1024*1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var reply wireMessage
+		if err := json.Unmarshal(body, &reply); err != nil {
+			t.Fatal(err)
+		}
+		var id int
+		if err := json.Unmarshal(reply.ID, &id); err != nil {
+			t.Fatal(err)
+		}
+		if seen[id] {
+			t.Fatalf("duplicate reply %d", id)
+		}
+		seen[id] = true
+		if reply.Error != nil && reply.Error.Code == -32000 {
+			overloaded = true
+		}
+	}
+	<-writeDone
+	if !overloaded {
+		t.Fatal("expected bounded queue overload")
+	}
 	done := make(chan struct{})
 	go func() { c.Close(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("close blocked by flooded requests")
+		t.Fatal("close blocked by flood")
 	}
+	_ = b.Close()
 }
