@@ -55,10 +55,17 @@ function Convert-FileUriToPath([string] $Uri) {
 }
 
 function Test-UnderRoot([string] $Path, [string] $Root) {
-    try { $path = [IO.Path]::GetFullPath($Path); $root = [IO.Path]::GetFullPath($Root) } catch { return $false }
-    if ($path -eq $root) { return $true }
-    $relative = [IO.Path]::GetRelativePath($root, $path)
-    return -not ([IO.Path]::IsPathRooted($relative) -or $relative -eq '..' -or $relative.StartsWith('..' + [IO.Path]::DirectorySeparatorChar))
+    try {
+        if (Test-Path -LiteralPath $Path) { $path = (Resolve-Path -LiteralPath $Path).Path } else { $path = [IO.Path]::GetFullPath($Path) }
+        if (Test-Path -LiteralPath $Root) { $root = (Resolve-Path -LiteralPath $Root).Path } else { $root = [IO.Path]::GetFullPath($Root) }
+    } catch { return $false }
+    [char[]]$separators = @([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $root = $root.TrimEnd($separators)
+    if ([string]::Equals($path.TrimEnd($separators), $root, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    foreach ($separator in $separators | Select-Object -Unique) {
+        if ($path.StartsWith($root + $separator, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
 }
 function Assert-UnderRoot([string] $Uri, [string] $Root, [string] $Kind) {
     if (-not (Test-UnderRoot (Convert-FileUriToPath $Uri) $Root)) { throw "MCP $Kind result was outside its expected source root" }
@@ -125,7 +132,7 @@ if ($Engine) {
 }
 if ($Clangd) {
     if (-not (Test-Path -LiteralPath $Clangd -PathType Leaf)) { throw 'clangd executable was not found' }
-    Invoke-External $Clangd @('--version')
+    $null = Invoke-External $Clangd @('--version')
 }
 
 $start = Get-Date
