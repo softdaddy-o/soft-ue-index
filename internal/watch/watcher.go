@@ -21,9 +21,12 @@ type Watcher struct {
 	native        *fsnotify.Watcher
 	coordinator   *Coordinator
 	onSourceWrite func(SourceWrite)
+	attachTree    func(string) error
 	dirs          sync.Map
 	done          chan struct{}
+	errors        chan error
 	once          sync.Once
+	failOnce      sync.Once
 	mu            sync.RWMutex
 	projects      []ProjectRoots
 }
@@ -37,7 +40,8 @@ func NewWatcherWithOptions(coordinator *Coordinator, options WatcherOptions) (*W
 	if err != nil {
 		return nil, err
 	}
-	w := &Watcher{native: n, coordinator: coordinator, onSourceWrite: options.SourceWrite, done: make(chan struct{})}
+	w := &Watcher{native: n, coordinator: coordinator, onSourceWrite: options.SourceWrite, done: make(chan struct{}), errors: make(chan error, 1)}
+	w.attachTree = w.addTree
 	go w.loop()
 	return w, nil
 }
@@ -132,7 +136,12 @@ func (w *Watcher) loop() {
 				return
 			}
 			w.handleEvent(event)
-		case <-w.native.Errors: // errors are transient; keep unrelated projects alive.
+		case err, ok := <-w.native.Errors:
+			if !ok {
+				return
+			}
+			w.fail(err)
+			return
 		}
 	}
 }
@@ -143,7 +152,10 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	ids := w.projectsFor(event.Name)
 	if event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
 		if info, err := os.Stat(event.Name); err == nil && info.IsDir() && w.isRelevantDirectory(event.Name) {
-			_ = w.addTree(event.Name)
+			if err := w.attachTree(event.Name); err != nil {
+				w.fail(err)
+				return
+			}
 			if w.coordinator != nil {
 				for _, id := range ids {
 					w.coordinator.Invalidate(id)
@@ -173,6 +185,15 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		}
 	}
 }
+func (w *Watcher) fail(err error) {
+	if err == nil {
+		return
+	}
+	w.failOnce.Do(func() { w.errors <- err })
+}
+
+func (w *Watcher) Errors() <-chan error { return w.errors }
+
 func (w *Watcher) isWatchedDirectory(path string) bool {
 	_, ok := w.dirs.Load(filepath.Clean(path))
 	return ok

@@ -1,6 +1,7 @@
 package watch
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,51 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 )
+
+func TestNativeWatcherErrorIsSurfaced(t *testing.T) {
+	w, err := NewWatcher(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	want := errors.New("watch buffer overflow")
+	w.native.Errors <- want
+	select {
+	case got := <-w.Errors():
+		if !errors.Is(got, want) {
+			t.Fatalf("got %v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("native watcher error was discarded")
+	}
+}
+
+func TestCreatedDirectoryAttachmentFailureIsSurfaced(t *testing.T) {
+	root := t.TempDir()
+	created := filepath.Join(root, "Source", "NewModule")
+	if err := os.MkdirAll(created, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.AddProject(ProjectRoots{ID: "game", ProjectRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("attach failed")
+	w.attachTree = func(string) error { return want }
+	w.handleEvent(fsnotify.Event{Name: created, Op: fsnotify.Create})
+	select {
+	case got := <-w.Errors():
+		if !errors.Is(got, want) {
+			t.Fatalf("got %v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tree attachment failure was discarded")
+	}
+}
 
 func TestAddProjectPreservesEmptyEngineRoot(t *testing.T) {
 	root := t.TempDir()

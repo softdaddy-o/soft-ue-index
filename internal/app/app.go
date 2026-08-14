@@ -306,17 +306,22 @@ func (a *App) mcp(ctx context.Context) error {
 	}
 	manager := lsp.NewManager(nil)
 	defer manager.Close()
-	watchCtx, stopWatch := context.WithCancel(ctx)
-	watchDone := make(chan struct{})
+	serveCtx, stop := context.WithCancel(ctx)
+	watchDone := make(chan error, 1)
 	go func() {
-		defer close(watchDone)
-		if err := a.watchRealWithSink(watchCtx, r.Projects, manager); err != nil && watchCtx.Err() == nil {
+		err := a.watchRealWithSink(serveCtx, r.Projects, manager)
+		if err != nil && serveCtx.Err() == nil {
 			a.reportWatchError(err)
+			stop()
 		}
+		watchDone <- err
 	}()
-	err = mcpserver.New(mcpserver.Dependencies{Projects: a.d.Store, Queries: lspQueries{manager: manager}}).RunStdio(ctx, "dev")
-	stopWatch()
-	<-watchDone
+	err = mcpserver.New(mcpserver.Dependencies{Projects: a.d.Store, Queries: lspQueries{manager: manager}}).RunStdio(serveCtx, "dev")
+	stop()
+	watchErr := <-watchDone
+	if watchErr != nil {
+		return watchErr
+	}
 	return err
 }
 func (a *App) writeJSON(v any) error {
@@ -578,8 +583,12 @@ func (a *App) watchRealWithSink(ctx context.Context, projects []registry.Project
 	if added == 0 && startupErr != nil {
 		return startupErr
 	}
-	<-ctx.Done()
-	return nil
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-w.Errors():
+		return fmt.Errorf("filesystem watcher: %w", err)
+	}
 }
 
 const watchPersistAttempts = 3
