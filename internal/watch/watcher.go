@@ -16,6 +16,7 @@ type ProjectRoots struct{ ID, ProjectRoot, EngineRoot string }
 type SourceWrite struct {
 	ProjectID, Path string
 	Removed         bool
+	ChangeType      int
 }
 type WatcherOptions struct{ SourceWrite func(SourceWrite) }
 
@@ -183,8 +184,14 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 			_, err := os.Stat(event.Name)
 			removed = os.IsNotExist(err)
 		}
+		changeType := 2
+		if event.Op&(fsnotify.Create|fsnotify.Rename) != 0 && !removed {
+			changeType = 1
+		} else if removed {
+			changeType = 3
+		}
 		for _, id := range ids {
-			w.onSourceWrite(SourceWrite{ProjectID: id, Path: event.Name, Removed: removed})
+			w.onSourceWrite(SourceWrite{ProjectID: id, Path: event.Name, Removed: removed, ChangeType: changeType})
 		}
 	}
 	if RequiresCompDB(event.Name, event.Op) && w.coordinator != nil {

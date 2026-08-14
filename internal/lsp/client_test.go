@@ -85,6 +85,28 @@ func TestSourceWriteNotifiesWatchedFileWhenDocumentIsClosed(t *testing.T) {
 	}
 }
 
+func TestSourceCreateNotifiesCreatedWhenDocumentIsClosed(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{})
+	defer c.Close()
+	uri := "file:///game/Source/New.cpp"
+	done := make(chan wireMessage, 1)
+	go func() {
+		body, _ := readFrame(bufio.NewReader(b), 4096)
+		var message wireMessage
+		_ = json.Unmarshal(body, &message)
+		done <- message
+	}()
+	if err := c.SourceFileChanged(uri, "new", 1); err != nil {
+		t.Fatal(err)
+	}
+	message := <-done
+	if message.Method != "workspace/didChangeWatchedFiles" || !strings.Contains(string(message.Params), `"type":1`) {
+		t.Fatalf("message=%+v params=%s", message, message.Params)
+	}
+}
+
 func TestSourceRemovalClosesOpenDocumentAndNotifiesDeletion(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()

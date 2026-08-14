@@ -138,7 +138,7 @@ func TestAtomicSourceReplacementAndRemovalNotifyAndInvalidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Create})
-	if got := <-changes; got.Path != path || got.Removed {
+	if got := <-changes; got.Path != path || got.Removed || got.ChangeType != 1 {
 		t.Fatalf("create change=%+v", got)
 	}
 	if got := <-results; got.ProjectID != "game" {

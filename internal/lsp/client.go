@@ -535,12 +535,16 @@ func (c *Client) DidClose(uri string) error {
 
 // SourceFileChanged refreshes an open document's in-memory AST. Closed files
 // are delegated to clangd's background index through the watched-files event.
-func (c *Client) SourceFileChanged(uri, text string) error {
+func (c *Client) SourceFileChanged(uri, text string, watchedType ...int) error {
 	c.openMu.Lock()
 	defer c.openMu.Unlock()
 	version, open := c.opened[uri]
 	if !open {
-		return c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": []map[string]any{{"uri": uri, "type": 2}}})
+		changeType := 2
+		if len(watchedType) > 0 && watchedType[0] == 1 {
+			changeType = 1
+		}
+		return c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": []map[string]any{{"uri": uri, "type": changeType}}})
 	}
 	version++
 	if err := c.Notify("textDocument/didChange", map[string]any{

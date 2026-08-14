@@ -558,6 +558,7 @@ func (f watchGenerator) Generate(ctx context.Context, id string) error { return 
 
 type sourceChangeSink interface {
 	SourceFileChanged(string, string) error
+	SourceFileCreated(string, string) error
 	SourceFileRemoved(string, string) error
 }
 
@@ -600,6 +601,8 @@ func (a *App) watchRealWithSink(ctx context.Context, projects []registry.Project
 			var err error
 			if change.Removed {
 				err = sink.SourceFileRemoved(change.ProjectID, change.Path)
+			} else if change.ChangeType == 1 {
+				err = sink.SourceFileCreated(change.ProjectID, change.Path)
 			} else {
 				err = sink.SourceFileChanged(change.ProjectID, change.Path)
 			}

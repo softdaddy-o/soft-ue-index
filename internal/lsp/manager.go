@@ -495,6 +495,14 @@ func (m *Manager) Release(id string) {
 // SourceFileChanged forwards an ordinary source write to an existing project
 // session without starting clangd solely for a filesystem notification.
 func (m *Manager) SourceFileChanged(id, path string) error {
+	return m.sourceFileChanged(id, path, 2)
+}
+
+func (m *Manager) SourceFileCreated(id, path string) error {
+	return m.sourceFileChanged(id, path, 1)
+}
+
+func (m *Manager) sourceFileChanged(id, path string, watchedType int) error {
 	m.mu.Lock()
 	s := m.sessions[id]
 	var client *Client
@@ -509,7 +517,7 @@ func (m *Manager) SourceFileChanged(id, path string) error {
 	if err != nil {
 		return err
 	}
-	return client.SourceFileChanged(pathURI(seed.Path), string(seed.Text))
+	return client.SourceFileChanged(pathURI(seed.Path), string(seed.Text), watchedType)
 }
 
 // SourceFileRemoved forwards a deletion only to an already-running session.
