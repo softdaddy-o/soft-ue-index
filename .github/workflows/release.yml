@@ -2,23 +2,28 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
-
-permissions:
-  contents: write
+    tags: ['v*']
 
 jobs:
-  release:
+  verify-build:
+    permissions:
+      contents: read
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
-      - name: Test
-        run: go test ./...
-      - name: Build archive
+      - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2.30.0
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+      - name: Verify with race detector
+        shell: msys2 {0}
+        run: CC=gcc go test -race ./...
+      - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/package | Out-Null
@@ -27,8 +32,22 @@ jobs:
           Compress-Archive -Path dist/package/* -DestinationPath "dist/soft-ue-index-windows-amd64.zip"
           $hash = (Get-FileHash "dist/soft-ue-index-windows-amd64.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  soft-ue-index-windows-amd64.zip" | Set-Content -NoNewline dist/soft-ue-index-windows-amd64.zip.sha256
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-files
+          path: dist/
+          retention-days: 1
+  publish:
+    needs: verify-build
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+          path: dist
+      - uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           generate_release_notes: true
           files: |

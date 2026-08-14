@@ -5,23 +5,42 @@ param(
     [Parameter(Mandatory = $true)] [string] $EngineSymbol,
     [string] $Engine,
     [string] $Clangd,
+    [ValidateRange(1, 3600)] [int] $TimeoutSeconds = 300,
     [string] $Executable = 'soft-ue-index.exe'
 )
 
 $ErrorActionPreference = 'Stop'
 
+function Invoke-External([string] $FileName, [string[]] $Arguments) {
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $FileName; $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { [void]$psi.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::Start($psi)
+    $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        $process.Kill($true); $process.WaitForExit(); $process.Dispose()
+        throw 'external command timed out'
+    }
+    $out.Wait(); $err.Wait(); $code = $process.ExitCode; $process.Dispose()
+    if ($code -ne 0) { throw "external command failed with exit code $code" }
+}
 function Invoke-Tool([string[]] $Arguments) {
-    $null = & $Executable @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "soft-ue-index failed with exit code $LASTEXITCODE" }
+    Invoke-External $Executable $Arguments
 }
 
 function Convert-FileUriToPath([string] $Uri) {
     return ([Uri]$Uri).LocalPath
 }
 
+function Test-UnderRoot([string] $Path, [string] $Root) {
+    try { $path = [IO.Path]::GetFullPath($Path); $root = [IO.Path]::GetFullPath($Root) } catch { return $false }
+    if ($path -eq $root) { return $true }
+    $relative = [IO.Path]::GetRelativePath($root, $path)
+    return -not ([IO.Path]::IsPathRooted($relative) -or $relative -eq '..' -or $relative.StartsWith('..' + [IO.Path]::DirectorySeparatorChar))
+}
 function Assert-UnderRoot([string] $Uri, [string] $Root, [string] $Kind) {
-    $path = Convert-FileUriToPath $Uri
-    if (-not $path.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) { throw "MCP $Kind result was outside its expected source root" }
+    if (-not (Test-UnderRoot (Convert-FileUriToPath $Uri) $Root)) { throw "MCP $Kind result was outside its expected source root" }
 }
 
 function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $EngineRoot, [string] $ProjectQuery, [string] $EngineQuery) {
@@ -33,11 +52,14 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $process = [Diagnostics.Process]::Start($psi)
+    $stderr = $process.StandardError.ReadToEndAsync()
     try {
         function Send-Request([hashtable] $Request) {
             $process.StandardInput.WriteLine(($Request | ConvertTo-Json -Compress -Depth 10))
             $process.StandardInput.Flush()
-            $line = $process.StandardOutput.ReadLine()
+            $read = $process.StandardOutput.ReadLineAsync()
+            if (-not $read.Wait($TimeoutSeconds * 1000)) { throw 'MCP request timed out' }
+            $line = $read.Result
             if ([string]::IsNullOrWhiteSpace($line)) { throw 'MCP server returned no response' }
             return $line | ConvertFrom-Json
         }
@@ -51,7 +73,7 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
             $response = Send-Request @{ jsonrpc = '2.0'; id = $id; method = 'tools/call'; params = @{ name = 'search_symbols'; arguments = @{ project_id = $ProjectID; query = $case.Query; max_items = 10 } } }
             $items = @($response.result.structuredContent.items)
             if ($items.Count -eq 0) { throw "MCP search_symbols returned no $($case.Kind) result" }
-            $symbol = $items | Where-Object { (Convert-FileUriToPath $_.location.uri).StartsWith($case.Root, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            $symbol = $items | Where-Object { Test-UnderRoot (Convert-FileUriToPath $_.location.uri) $case.Root } | Select-Object -First 1
             if (-not $symbol) { throw "MCP search_symbols did not return a $($case.Kind) source result" }
             Assert-UnderRoot $symbol.location.uri $case.Root $case.Kind
             $position = @{ path = (Convert-FileUriToPath $symbol.location.uri); line = $symbol.location.range.start.line; character = $symbol.location.range.start.character }
@@ -65,6 +87,8 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
         }
     } finally {
         if (-not $process.HasExited) { $process.Kill($true) }
+        $process.WaitForExit()
+        $stderr.Wait($TimeoutSeconds * 1000) | Out-Null
         $process.Dispose()
     }
 }
@@ -79,8 +103,7 @@ if ($Engine) {
 }
 if ($Clangd) {
     if (-not (Test-Path -LiteralPath $Clangd -PathType Leaf)) { throw 'clangd executable was not found' }
-    $null = & $Clangd --version 2>&1
-    if ($LASTEXITCODE -ne 0) { throw 'clangd version check failed' }
+    Invoke-External $Clangd @('--version')
 }
 
 $start = Get-Date
