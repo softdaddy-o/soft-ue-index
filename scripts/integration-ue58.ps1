@@ -12,13 +12,30 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
+function ConvertTo-WindowsCommandLineArgument([string] $Value) {
+    if ($null -eq $Value) { return '""' }
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    # Quote according to CommandLineToArgvW: double backslashes before quotes
+    # and before the closing quote so PS 5.1 can safely use Arguments.
+    $escaped = $Value -replace '(\\*)"', '$1$1\\"'
+    $escaped = $escaped -replace '(\\+)$', '$1$1'
+    return '"' + $escaped + '"'
+}
+function Set-ProcessArguments([Diagnostics.ProcessStartInfo] $Info, [string[]] $Arguments) {
+    $argumentList = $Info.GetType().GetProperty('ArgumentList')
+    if ($null -ne $argumentList -and $null -ne $Info.ArgumentList) {
+        foreach ($argument in $Arguments) { [void]$Info.ArgumentList.Add($argument) }
+        return
+    }
+    $Info.Arguments = (($Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument $_ }) -join ' ')
+}
 function Invoke-External([string] $FileName, [string[]] $Arguments) {
     $remaining = [Math]::Floor(($script:Deadline - (Get-Date)).TotalSeconds)
     if ($remaining -lt 1) { throw 'overall integration timeout expired' }
     $psi = [Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $FileName; $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-    foreach ($argument in $Arguments) { [void]$psi.ArgumentList.Add($argument) }
+    Set-ProcessArguments $psi $Arguments
     $process = [Diagnostics.Process]::Start($psi)
     $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit([int]$remaining * 1000)) {
@@ -50,7 +67,7 @@ function Assert-UnderRoot([string] $Uri, [string] $Root, [string] $Kind) {
 function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $EngineRoot, [string] $ProjectQuery, [string] $EngineQuery) {
     $psi = [Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $Executable
-    $psi.ArgumentList.Add('mcp')
+    Set-ProcessArguments $psi @('mcp')
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
