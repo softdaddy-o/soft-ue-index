@@ -583,6 +583,31 @@ func TestSynthesizeRiderRejectsEscapingGeneratedCodeDirectory(t *testing.T) {
 	}
 }
 
+func TestCanonicalIncludingMissingRejectsDanglingSymlinkComponents(t *testing.T) {
+	root := t.TempDir()
+	container := filepath.Join(root, "Project", "Intermediate")
+	if err := os.MkdirAll(container, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dangling := filepath.Join(container, "DanglingGenerated")
+	if err := os.Symlink(filepath.Join(root, "Outside", "MissingTarget"), dangling); err != nil {
+		t.Skipf("cannot create dangling symlink on this platform: %v", err)
+	}
+	for _, path := range []string{dangling, filepath.Join(dangling, "Missing", "UHT")} {
+		if resolved, err := canonicalIncludingMissing(path); err == nil {
+			t.Fatalf("dangling symlink component was accepted as %q", resolved)
+		}
+	}
+	ordinaryMissing := filepath.Join(container, "OrdinaryMissing", "UHT")
+	resolved, err := canonicalIncludingMissing(ordinaryMissing)
+	if err != nil {
+		t.Fatalf("ordinary missing suffix was rejected: %v", err)
+	}
+	if !within(resolved, filepath.Join(root, "Project")) {
+		t.Fatalf("ordinary missing suffix escaped project: %q", resolved)
+	}
+}
+
 func TestStringsFromJSONNestedObjectsAreDeterministic(t *testing.T) {
 	raw := json.RawMessage(`{"z":{"second":"B","first":"A"},"a":["C","D"]}`)
 	want := strings.Join(stringsFromJSON(raw), ",")

@@ -473,8 +473,12 @@ func canonicalIncludingMissing(path string) (string, error) {
 	current := filepath.Clean(absolute)
 	missing := make([]string, 0)
 	for {
-		resolved, err := filepath.EvalSymlinks(current)
+		_, err := os.Lstat(current)
 		if err == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(current)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
 			for i := len(missing) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, missing[i])
 			}
