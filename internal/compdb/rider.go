@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 type RiderInput struct {
@@ -36,7 +37,7 @@ type riderTarget struct {
 }
 type riderModule struct {
 	Directory              string          `json:"Directory"`
-	Rules                  any             `json:"Rules"`
+	Rules                  string          `json:"Rules"`
 	GeneratedCodeDirectory string          `json:"GeneratedCodeDirectory"`
 	ToolchainInfo          json.RawMessage `json:"ToolchainInfo"`
 	riderRules
@@ -56,6 +57,45 @@ type riderRules struct {
 	ApiDefinitions           []string `json:"ApiDefinitions"`
 }
 
+// UnmarshalJSON accepts both Rider forms seen in the wild: older metadata puts
+// compile settings under Rules, while current UE metadata keeps Rules as the
+// module's .Build.cs path and puts settings on the module itself.
+func (m *riderModule) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		Directory              string          `json:"Directory"`
+		Rules                  json.RawMessage `json:"Rules"`
+		GeneratedCodeDirectory string          `json:"GeneratedCodeDirectory"`
+		ToolchainInfo          json.RawMessage `json:"ToolchainInfo"`
+		riderRules
+	}
+	var w wire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	m.Directory, m.GeneratedCodeDirectory, m.ToolchainInfo, m.riderRules = w.Directory, w.GeneratedCodeDirectory, w.ToolchainInfo, w.riderRules
+	if len(w.Rules) == 0 || string(w.Rules) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(w.Rules, &m.Rules); err == nil {
+		return nil
+	}
+	var nested riderRules
+	if err := json.Unmarshal(w.Rules, &nested); err != nil {
+		return fmt.Errorf("decode Rider module Rules: %w", err)
+	}
+	m.riderRules = mergeRiderRules(nested, m.riderRules)
+	return nil
+}
+
+func mergeRiderRules(a, b riderRules) riderRules {
+	return riderRules{
+		PublicIncludePaths: unique(append(a.PublicIncludePaths, b.PublicIncludePaths...)), PrivateIncludePaths: unique(append(a.PrivateIncludePaths, b.PrivateIncludePaths...)), IncludePaths: unique(append(a.IncludePaths, b.IncludePaths...)),
+		Definitions: unique(append(a.Definitions, b.Definitions...)), PublicDefinitions: unique(append(a.PublicDefinitions, b.PublicDefinitions...)), PrivateDefinitions: unique(append(a.PrivateDefinitions, b.PrivateDefinitions...)),
+		ForceIncludeFiles: unique(append(a.ForceIncludeFiles, b.ForceIncludeFiles...)), SystemIncludePaths: unique(append(a.SystemIncludePaths, b.SystemIncludePaths...)), InternalIncludePaths: unique(append(a.InternalIncludePaths, b.InternalIncludePaths...)),
+		LegacyPublicIncludePaths: unique(append(a.LegacyPublicIncludePaths, b.LegacyPublicIncludePaths...)), ProjectDefinitions: unique(append(a.ProjectDefinitions, b.ProjectDefinitions...)), ApiDefinitions: unique(append(a.ApiDefinitions, b.ApiDefinitions...)),
+	}
+}
+
 func RiderMetadataDir(projectRoot string) string {
 	return filepath.Join(projectRoot, "Intermediate", "ProjectFiles", ".Rider", "Win64", "Development", "Editor")
 }
@@ -65,6 +105,9 @@ func RiderMetadataAvailable(projectRoot, target, targetFile string) bool {
 	return err == nil
 }
 
+// RiderMetadataStale is retained for callers that cannot identify a target.
+// New indexing code must use RiderMetadataStaleFor so unrelated Rider JSON does
+// not influence whether a selected target can be reused.
 func RiderMetadataStale(projectRoot string) bool {
 	files, _ := filepath.Glob(filepath.Join(RiderMetadataDir(projectRoot), "*.json"))
 	if len(files) == 0 {
@@ -93,6 +136,109 @@ func RiderMetadataStale(projectRoot string) bool {
 		return nil
 	})
 	return stale
+}
+
+// RiderMetadataStaleFor compares only metadata selected for this indexing
+// request against its target, module rule, and applicable project descriptors.
+func RiderMetadataStaleFor(projectRoot, engineRoot, target, targetFile string, engineScopeFull bool) (bool, error) {
+	project, err := canonical(projectRoot)
+	if err != nil {
+		return false, err
+	}
+	engine, err := canonical(engineRoot)
+	if err != nil {
+		return false, err
+	}
+	selected, err := selectRiderTarget(RiderMetadataDir(project), target, targetFile, project)
+	if err != nil {
+		return false, err
+	}
+	all := []riderSelectedTarget{selected}
+	if engineScopeFull {
+		editor, err := selectRiderTarget(RiderMetadataDir(project), "UnrealEditor", "", engine)
+		if err != nil {
+			return false, fmt.Errorf("rider_metadata_missing: full engine scope requires UnrealEditor metadata: %w", err)
+		}
+		all = append(all, editor)
+	}
+	oldest := timeForSelections(all)
+	if oldest.IsZero() {
+		return true, nil
+	}
+	for _, selected := range all {
+		if newer(selected.TargetFile, oldest) {
+			return true, nil
+		}
+		for _, module := range selected.Modules {
+			if module.Rules == "" {
+				continue
+			}
+			rules := module.Rules
+			if !filepath.IsAbs(rules) {
+				rules = filepath.Join(module.Directory, rules)
+			}
+			if path, e := canonical(rules); e == nil && (within(path, project) || within(path, engine)) && newer(path, oldest) {
+				return true, nil
+			}
+		}
+	}
+	// The project descriptor is always relevant. A plugin descriptor is only
+	// relevant when it is an ancestor of a selected project module.
+	for _, descriptor := range relevantDescriptors(project, all) {
+		if newer(descriptor, oldest) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func timeForSelections(selected []riderSelectedTarget) (oldest time.Time) {
+	for _, s := range selected {
+		info, err := os.Stat(s.MetadataPath)
+		if err != nil {
+			return time.Time{}
+		}
+		if oldest.IsZero() || info.ModTime().Before(oldest) {
+			oldest = info.ModTime()
+		}
+	}
+	return oldest
+}
+
+func newer(path string, than time.Time) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.ModTime().After(than)
+}
+
+func relevantDescriptors(project string, targets []riderSelectedTarget) []string {
+	set := map[string]bool{}
+	uprojects, _ := filepath.Glob(filepath.Join(project, "*.uproject"))
+	for _, path := range uprojects {
+		set[path] = true
+	}
+	for _, target := range targets {
+		for _, module := range target.Modules {
+			dir, err := canonical(module.Directory)
+			if err != nil || !within(dir, project) {
+				continue
+			}
+			for current := dir; ; current = filepath.Dir(current) {
+				plugins, _ := filepath.Glob(filepath.Join(current, "*.uplugin"))
+				for _, path := range plugins {
+					set[path] = true
+				}
+				if strings.EqualFold(current, project) {
+					break
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for path := range set {
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func SynthesizeRider(in RiderInput) (RiderResult, error) {
@@ -229,13 +375,19 @@ func deepestModule(file string, mods []riderResolvedModule) *riderResolvedModule
 	}
 	return best
 }
-func selectRiderTarget(dir, name, targetFile, projectRoot string) (riderTarget, error) {
+
+type riderSelectedTarget struct {
+	riderTarget
+	MetadataPath string
+}
+
+func selectRiderTarget(dir, name, targetFile, projectRoot string) (riderSelectedTarget, error) {
 	files, e := filepath.Glob(filepath.Join(dir, "*.json"))
 	if e != nil {
-		return riderTarget{}, e
+		return riderSelectedTarget{}, e
 	}
 	wanted, _ := canonical(targetFile)
-	var matches []riderTarget
+	var matches []riderSelectedTarget
 	for _, f := range files {
 		b, e := os.ReadFile(f)
 		if e != nil {
@@ -248,21 +400,25 @@ func selectRiderTarget(dir, name, targetFile, projectRoot string) (riderTarget, 
 		tf, _ := canonical(r.TargetFile)
 		safe := within(tf, projectRoot) && strings.EqualFold(filepath.Base(tf), name+".Target.cs")
 		if strings.EqualFold(r.Name, name) && safe && (targetFile == "" || strings.EqualFold(tf, wanted)) {
-			matches = append(matches, r)
+			metadata, e := canonical(f)
+			if e != nil {
+				continue
+			}
+			matches = append(matches, riderSelectedTarget{riderTarget: r, MetadataPath: metadata})
 		}
 	}
 	if len(matches) == 1 {
 		return matches[0], nil
 	}
 	if len(matches) > 1 {
-		return riderTarget{}, fmt.Errorf("rider_metadata_ambiguous: target %q", name)
+		return riderSelectedTarget{}, fmt.Errorf("rider_metadata_ambiguous: target %q", name)
 	}
-	return riderTarget{}, fmt.Errorf("rider_metadata_missing: target %q", name)
+	return riderSelectedTarget{}, fmt.Errorf("rider_metadata_missing: target %q", name)
 }
 func response(m riderResolvedModule, compiler string, rootIncludes, rootDefinitions []string) string {
 	_ = compiler
-	inc := unique(append(append(append(append([]string{}, rootIncludes...), m.rules.PublicIncludePaths...), m.rules.PrivateIncludePaths...), m.rules.IncludePaths...))
-	defs := unique(append(append(append(append([]string{}, rootDefinitions...), m.rules.Definitions...), m.rules.PublicDefinitions...), m.rules.PrivateDefinitions...))
+	inc := unique(append(append(append(append(append(append(append([]string{}, rootIncludes...), m.rules.PublicIncludePaths...), m.rules.PrivateIncludePaths...), m.rules.IncludePaths...), m.rules.SystemIncludePaths...), m.rules.InternalIncludePaths...), m.rules.LegacyPublicIncludePaths...))
+	defs := unique(append(append(append(append(append(append([]string{}, rootDefinitions...), m.rules.Definitions...), m.rules.PublicDefinitions...), m.rules.PrivateDefinitions...), m.rules.ProjectDefinitions...), m.rules.ApiDefinitions...))
 	var a = []string{"/nologo", "/TP", "/std:c++20", "--target=x86_64-pc-windows-msvc", "/utf-8", "/Zc:__cplusplus", "/permissive-"}
 	for _, x := range inc {
 		if !filepath.IsAbs(x) {

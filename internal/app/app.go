@@ -321,8 +321,8 @@ func (a *App) generateRealScoped(ctx context.Context, p registry.Project, engine
 	}
 	projectRoot := filepath.Dir(p.UProject)
 	targetFile := ""
-	metadataPresent := compdb.RiderMetadataAvailable(projectRoot, p.Target, targetFile)
-	metadataStale := compdb.RiderMetadataStale(projectRoot)
+	metadataStale, metadataErr := compdb.RiderMetadataStaleFor(projectRoot, p.Engine.Root, p.Target, targetFile, engineScopeFull)
+	metadataPresent := metadataErr == nil
 	if metadataPresent && !metadataStale {
 		staging, stageErr := os.MkdirTemp(cache, "rider-")
 		if stageErr != nil {
@@ -341,6 +341,9 @@ func (a *App) generateRealScoped(ctx context.Context, p registry.Project, engine
 		return p, fmt.Errorf("rider metadata generation: %w", stageErr)
 	}
 	if _, installedErr := os.Stat(filepath.Join(p.Engine.Root, "Engine", "Build", "InstalledBuild.txt")); installedErr == nil {
+		if metadataErr != nil {
+			return p, fmt.Errorf("rider metadata unavailable: %w", metadataErr)
+		}
 		if metadataStale {
 			return p, errors.New("rider_metadata_stale: regenerate Rider project metadata before indexing")
 		}

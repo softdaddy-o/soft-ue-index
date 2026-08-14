@@ -76,6 +76,128 @@ func TestRiderMetadataStaleWhenRulesNewer(t *testing.T) {
 	}
 }
 
+func TestRiderMetadataStaleForUsesOnlySelectedTargetMetadata(t *testing.T) {
+	root := t.TempDir()
+	project, engine := filepath.Join(root, "P"), filepath.Join(root, "E")
+	dir := RiderMetadataDir(project)
+	for _, path := range []string{filepath.Join(project, "Source", "Game"), filepath.Join(project, "Source", "Other"), engine, dir} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targetFile := filepath.Join(project, "Source", "GameEditor.Target.cs")
+	rules := filepath.Join(project, "Source", "Game", "Game.Build.cs")
+	uproject := filepath.Join(project, "P.uproject")
+	for _, path := range []string{targetFile, rules, uproject, filepath.Join(project, "Source", "Other", "Other.Build.cs")} {
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	meta := `{"Name":"GameEditor","TargetFile":"` + filepath.ToSlash(targetFile) + `","Modules":{"Game":{"Directory":"` + filepath.ToSlash(filepath.Dir(rules)) + `","Rules":"Game.Build.cs"}}}`
+	selected := filepath.Join(dir, "GameEditor.json")
+	if err := os.WriteFile(selected, []byte(meta), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Unrelated.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	newerThanSources := time.Now().Add(time.Hour)
+	if err := os.Chtimes(selected, newerThanSources, newerThanSources); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dir, "Unrelated.json"), time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := RiderMetadataStaleFor(project, engine, "GameEditor", targetFile, false)
+	if err != nil || stale {
+		t.Fatalf("selected metadata should be fresh: stale=%v err=%v", stale, err)
+	}
+	if err := os.Chtimes(rules, time.Now().Add(2*time.Hour), time.Now().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	stale, err = RiderMetadataStaleFor(project, engine, "GameEditor", targetFile, false)
+	if err != nil || !stale {
+		t.Fatalf("selected rules should stale metadata: stale=%v err=%v", stale, err)
+	}
+}
+
+func TestRiderMetadataStaleForFullScopeIncludesUnrealEditorOnlyWhenRequested(t *testing.T) {
+	root := t.TempDir()
+	project, engine := filepath.Join(root, "P"), filepath.Join(root, "E")
+	dir := RiderMetadataDir(project)
+	for _, path := range []string{filepath.Join(project, "Source", "Game"), filepath.Join(engine, "Source", "Core"), dir} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projectTarget := filepath.Join(project, "Source", "GameEditor.Target.cs")
+	engineTarget := filepath.Join(engine, "Source", "UnrealEditor.Target.cs")
+	engineRules := filepath.Join(engine, "Source", "Core", "Core.Build.cs")
+	for _, path := range []string{projectTarget, engineTarget, engineRules, filepath.Join(project, "P.uproject")} {
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projectMeta := `{"Name":"GameEditor","TargetFile":"` + filepath.ToSlash(projectTarget) + `","Modules":{"Game":{"Directory":"` + filepath.ToSlash(filepath.Join(project, "Source", "Game")) + `"}}}`
+	engineMeta := `{"Name":"UnrealEditor","TargetFile":"` + filepath.ToSlash(engineTarget) + `","Modules":{"Core":{"Directory":"` + filepath.ToSlash(filepath.Join(engine, "Source", "Core")) + `","Rules":"Core.Build.cs"}}}`
+	for name, meta := range map[string]string{"project.json": projectMeta, "engine.json": engineMeta} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(meta), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh := time.Now().Add(time.Hour)
+	for _, path := range []string{filepath.Join(dir, "project.json"), filepath.Join(dir, "engine.json")} {
+		if err := os.Chtimes(path, fresh, fresh); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(engineRules, time.Now().Add(2*time.Hour), time.Now().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := RiderMetadataStaleFor(project, engine, "GameEditor", projectTarget, false)
+	if err != nil || stale {
+		t.Fatalf("project-only should ignore engine metadata: stale=%v err=%v", stale, err)
+	}
+	stale, err = RiderMetadataStaleFor(project, engine, "GameEditor", projectTarget, true)
+	if err != nil || !stale {
+		t.Fatalf("full scope should use UnrealEditor rules: stale=%v err=%v", stale, err)
+	}
+}
+
+func TestRiderMetadataStaleForRejectsMalformedAndAmbiguousTargets(t *testing.T) {
+	root := t.TempDir()
+	project, engine := filepath.Join(root, "P"), filepath.Join(root, "E")
+	dir := RiderMetadataDir(project)
+	if err := os.MkdirAll(filepath.Join(project, "Source"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(engine, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	targetFile := filepath.Join(project, "Source", "GameEditor.Target.cs")
+	if err := os.WriteFile(targetFile, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "broken.json"), []byte(`{`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RiderMetadataStaleFor(project, engine, "GameEditor", targetFile, false); err == nil || !strings.Contains(err.Error(), "rider_metadata_missing") {
+		t.Fatalf("malformed metadata should fail safely: %v", err)
+	}
+	meta := `{"Name":"GameEditor","TargetFile":"` + filepath.ToSlash(targetFile) + `","Modules":{}}`
+	for _, name := range []string{"one.json", "two.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(meta), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := RiderMetadataStaleFor(project, engine, "GameEditor", targetFile, false); err == nil || !strings.Contains(err.Error(), "rider_metadata_ambiguous") {
+		t.Fatalf("ambiguous metadata should fail safely: %v", err)
+	}
+}
+
 func TestSynthesizeRiderPersistsContentAddressedResponsesAndRootEnvironment(t *testing.T) {
 	root := t.TempDir()
 	project := filepath.Join(root, "P")

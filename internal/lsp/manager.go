@@ -162,7 +162,12 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 		s.starting = make(chan struct{})
 		wait := s.starting
 		sessionCtx, cancel := context.WithCancel(context.Background())
-		s.cancel = cancel
+		keepSessionContext := false
+		defer func() {
+			if !keepSessionContext {
+				cancel()
+			}
+		}()
 		m.mu.Unlock()
 		p, err := m.start(sessionCtx, cfg)
 		m.mu.Lock()
@@ -179,6 +184,7 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 		}
 		if err == nil {
 			s.process = p
+			s.cancel = cancel
 			s.client = NewClient(p.Stdout(), p.Stdin(), ClientOptions{})
 			err = s.client.Initialize(ctx, cfg.RootURI)
 			if err == nil {
@@ -207,6 +213,7 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 		if err != nil {
 			return nil, err
 		}
+		keepSessionContext = true
 		return c, nil
 	}
 }
