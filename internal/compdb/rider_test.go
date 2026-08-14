@@ -2,6 +2,7 @@ package compdb
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -409,6 +410,27 @@ func TestStringsFromJSONNestedObjectsAreDeterministic(t *testing.T) {
 	}
 	if want != "C,D,A,B" {
 		t.Fatalf("order=%q", want)
+	}
+}
+
+func TestRiderModuleIndexLookupScalesWithPathDepth(t *testing.T) {
+	root := t.TempDir()
+	modules := make([]riderResolvedModule, 10_000)
+	for i := range modules {
+		modules[i] = riderResolvedModule{name: fmt.Sprintf("Module%05d", i), dir: filepath.Join(root, fmt.Sprintf("Module%05d", i))}
+	}
+	child := riderResolvedModule{name: "Nested", dir: filepath.Join(modules[len(modules)-1].dir, "Private")}
+	modules = append(modules, child)
+	index := newRiderModuleIndex(modules)
+	got, probes := index.lookupWithProbes(filepath.Join(child.dir, "Detail", "Thing.cpp"))
+	if got == nil || got.name != "Nested" {
+		t.Fatalf("deepest module = %#v", got)
+	}
+	if probes > 4 {
+		t.Fatalf("lookup probed %d ancestors for %d modules", probes, len(modules))
+	}
+	if roots := riderModuleWalkRoots(modules); len(roots) != len(modules)-1 {
+		t.Fatalf("nested module should share its parent walk: roots=%d modules=%d", len(roots), len(modules))
 	}
 }
 

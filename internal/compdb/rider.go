@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -297,7 +298,13 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 		}
 		all = append(all, riderResolvedModule{name: name, dir: d, generatedDir: generated, rules: module.riderRules})
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].dir < all[j].dir })
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].dir != all[j].dir {
+			return all[i].dir < all[j].dir
+		}
+		return all[i].name < all[j].name
+	})
+	moduleIndex := newRiderModuleIndex(all)
 	allAPIDefinitions := make([]string, 0)
 	for _, module := range all {
 		allAPIDefinitions = append(allAPIDefinitions, module.rules.ApiDefinitions...)
@@ -309,7 +316,7 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 	}
 	entries := make([]Entry, 0)
 	seen := map[string]bool{}
-	for _, root := range []string{project, engine} {
+	for _, root := range riderModuleWalkRoots(all) {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, e error) error {
 			if e != nil {
 				return nil
@@ -329,7 +336,7 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 			if e != nil || (!within(source, project) && !within(source, engine)) {
 				return nil
 			}
-			mod := deepestModule(source, all)
+			mod := moduleIndex.lookup(source)
 			if mod == nil {
 				return nil
 			}
@@ -405,14 +412,79 @@ type riderResolvedModule struct {
 	rules                   riderRules
 }
 
-func deepestModule(file string, mods []riderResolvedModule) *riderResolvedModule {
-	var best *riderResolvedModule
-	for i := range mods {
-		if within(file, mods[i].dir) && (best == nil || len(mods[i].dir) > len(best.dir)) {
-			best = &mods[i]
+type riderModuleIndex struct {
+	modules []riderResolvedModule
+	byDir   map[string]int
+}
+
+func newRiderModuleIndex(modules []riderResolvedModule) riderModuleIndex {
+	index := riderModuleIndex{modules: append([]riderResolvedModule(nil), modules...), byDir: make(map[string]int, len(modules))}
+	for i := range index.modules {
+		key := riderPathKey(index.modules[i].dir)
+		if _, exists := index.byDir[key]; !exists {
+			index.byDir[key] = i
 		}
 	}
-	return best
+	return index
+}
+
+func (index riderModuleIndex) lookup(file string) *riderResolvedModule {
+	module, _ := index.lookupWithProbes(file)
+	return module
+}
+
+func (index riderModuleIndex) lookupWithProbes(file string) (*riderResolvedModule, int) {
+	dir := filepath.Dir(filepath.Clean(file))
+	for probes := 1; ; probes++ {
+		if i, exists := index.byDir[riderPathKey(dir)]; exists {
+			return &index.modules[i], probes
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil, probes
+		}
+		dir = parent
+	}
+}
+
+func riderPathKey(path string) string {
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(path)
+	}
+	return path
+}
+
+func riderModuleWalkRoots(modules []riderResolvedModule) []string {
+	dirs := make([]string, 0, len(modules))
+	for _, module := range modules {
+		dirs = append(dirs, module.dir)
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		if len(dirs[i]) != len(dirs[j]) {
+			return len(dirs[i]) < len(dirs[j])
+		}
+		return dirs[i] < dirs[j]
+	})
+	roots := make([]string, 0, len(dirs))
+	rootKeys := make(map[string]bool, len(dirs))
+	for _, dir := range dirs {
+		covered := false
+		for current := dir; ; current = filepath.Dir(current) {
+			if rootKeys[riderPathKey(current)] {
+				covered = true
+				break
+			}
+			if parent := filepath.Dir(current); parent == current {
+				break
+			}
+		}
+		if !covered {
+			roots = append(roots, dir)
+			rootKeys[riderPathKey(dir)] = true
+		}
+	}
+	return roots
 }
 
 type riderSelectedTarget struct {
