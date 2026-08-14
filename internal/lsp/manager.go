@@ -2,15 +2,27 @@ package lsp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
 )
+
+const maxIndexSeedBytes = 4 << 20
+const maxSeedDatabaseBytes = 128 << 20
+
+var errNoIndexSeed = errors.New("no readable compilation database seed file")
+
+type indexSeed struct {
+	Path string
+	Text []byte
+}
 
 type Process interface {
 	Stdin() io.WriteCloser
@@ -234,7 +246,108 @@ func (m *Manager) startSession(id string, s *session, sessionCtx context.Context
 	m.mu.Unlock()
 	client := NewClient(p.Stdout(), p.Stdin(), ClientOptions{})
 	err = client.Initialize(sessionCtx, s.config.RootURI)
+	if err == nil && s.config.CompilationDatabase != "" {
+		var seed indexSeed
+		seed, err = selectIndexSeed(s.config.CompilationDatabase, s.config.RootURI, maxIndexSeedBytes)
+		if err == nil {
+			err = client.Notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": pathURI(seed.Path), "languageId": "cpp", "version": 1, "text": string(seed.Text)}})
+		} else if errors.Is(err, errNoIndexSeed) {
+			err = nil
+		}
+	}
 	_, _ = m.finishStartup(id, s, p, client, err)
+}
+
+func selectIndexSeed(database, rootURI string, maxBytes int64) (indexSeed, error) {
+	rootURL, err := url.Parse(rootURI)
+	if err != nil || rootURL.Scheme != "file" {
+		return indexSeed{}, errors.New("project root URI must be a file URI")
+	}
+	rootPath := filepath.FromSlash(rootURL.Path)
+	if len(rootPath) >= 3 && (rootPath[0] == '/' || rootPath[0] == '\\') && rootPath[2] == ':' {
+		rootPath = rootPath[1:]
+	}
+	root, err := filepath.Abs(rootPath)
+	if err != nil {
+		return indexSeed{}, err
+	}
+	f, err := os.Open(database)
+	if err != nil {
+		return indexSeed{}, err
+	}
+	defer f.Close()
+	if info, statErr := f.Stat(); statErr != nil || info.Size() > maxSeedDatabaseBytes {
+		return indexSeed{}, errors.New("compilation database exceeds seed scan limit")
+	}
+	d := json.NewDecoder(io.LimitReader(f, maxSeedDatabaseBytes+1))
+	tok, err := d.Token()
+	if err != nil || tok != json.Delim('[') {
+		return indexSeed{}, errors.New("compilation database must be an array")
+	}
+	count := 0
+	for ; d.More(); count++ {
+		if count >= 100000 {
+			return indexSeed{}, errors.New("compilation database seed scan limit exceeded")
+		}
+		var entry struct{ Directory, File string }
+		if err := d.Decode(&entry); err != nil {
+			return indexSeed{}, err
+		}
+		path := entry.File
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(entry.Directory, path)
+		}
+		path, err = filepath.Abs(path)
+		if err != nil {
+			continue
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() > maxBytes {
+			continue
+		}
+		if withinRoot(path, root) {
+			return readIndexSeed(path, maxBytes)
+		}
+	}
+	if count > 0 {
+		return indexSeed{}, errors.New("compilation database has no safe readable project seed")
+	}
+	return indexSeed{}, errNoIndexSeed
+}
+
+func readIndexSeed(path string, maxBytes int64) (indexSeed, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return indexSeed{}, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return indexSeed{}, err
+	}
+	if int64(len(b)) > maxBytes {
+		return indexSeed{}, errors.New("index seed source exceeds read limit")
+	}
+	return indexSeed{Path: path, Text: b}, nil
+}
+
+func withinRoot(path, root string) bool {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !filepath.IsAbs(rel) && !(len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator))
+}
+
+func pathURI(path string) string {
+	p := filepath.ToSlash(path)
+	if len(p) >= 2 && p[1] == ':' {
+		p = "/" + p
+	}
+	return (&url.URL{Scheme: "file", Path: p}).String()
 }
 
 // finishStartup is the only normal completion path for a session startup. It

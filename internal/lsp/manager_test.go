@@ -29,10 +29,11 @@ func (p *fakeProcess) Kill() error {
 }
 
 type fakeFactory struct {
-	mu   sync.Mutex
-	n    int
-	args [][]string
-	last *fakeProcess
+	mu      sync.Mutex
+	n       int
+	args    [][]string
+	methods []wireMessage
+	last    *fakeProcess
 }
 type slowFactory struct {
 	base  fakeFactory
@@ -72,6 +73,9 @@ func (f *fakeFactory) Start(_ context.Context, _ string, args []string, _ string
 			}
 			var m wireMessage
 			_ = json.Unmarshal(body, &m)
+			f.mu.Lock()
+			f.methods = append(f.methods, m)
+			f.mu.Unlock()
 			if m.Method == "initialize" || m.Method == "shutdown" {
 				_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: m.ID, Result: mustJSON(map[string]any{})}))
 			}
@@ -136,6 +140,86 @@ func TestManagerCreatesIsolatedPersistentShardRoots(t *testing.T) {
 	if filepath.Join(base, "a") == filepath.Join(base, "b") {
 		t.Fatal("not isolated")
 	}
+}
+
+func TestSelectIndexSeedPrefersProjectFileAndBoundsReads(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	engine := filepath.Join(root, "engine")
+	cache := filepath.Join(root, "cache")
+	for _, dir := range []string{project, engine, cache} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	engineFile := filepath.Join(engine, "Engine.cpp")
+	projectFile := filepath.Join(project, "Game.cpp")
+	if err := os.WriteFile(engineFile, []byte("engine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectFile, []byte("project"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db := []map[string]string{{"directory": engine, "file": engineFile}, {"directory": project, "file": projectFile}}
+	b, _ := json.Marshal(db)
+	if err := os.WriteFile(filepath.Join(cache, "compile_commands.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := selectIndexSeed(filepath.Join(cache, "compile_commands.json"), fileURIForTest(project), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seed.Path != projectFile || string(seed.Text) != "project" {
+		t.Fatalf("seed=%+v", seed)
+	}
+	if _, err := selectIndexSeed(filepath.Join(cache, "compile_commands.json"), fileURIForTest(project), 3); err == nil {
+		t.Fatal("expected bounded source read failure")
+	}
+}
+
+func TestManagerOpensSeedAfterInitializeBeforePublishing(t *testing.T) {
+	f := &fakeFactory{}
+	m := NewManager(f)
+	defer m.Close()
+	root, cache := t.TempDir(), t.TempDir()
+	source := filepath.Join(root, "Seed.cpp")
+	if err := os.WriteFile(source, []byte("int Seed;"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal([]map[string]string{{"directory": root, "file": source, "command": "clang-cl Seed.cpp"}})
+	db := filepath.Join(cache, "compile_commands.json")
+	if err := os.WriteFile(db, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Client(context.Background(), ProjectConfig{ID: "seed", Clangd: "fake", CacheDir: cache, CompilationDatabase: db, RootURI: fileURIForTest(root)}); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	messages := append([]wireMessage(nil), f.methods...)
+	f.mu.Unlock()
+	if len(messages) < 3 || messages[0].Method != "initialize" || messages[1].Method != "initialized" || messages[2].Method != "textDocument/didOpen" {
+		t.Fatalf("startup methods=%v", messages)
+	}
+	var params struct {
+		TextDocument struct {
+			URI, LanguageID, Text string
+			Version               int
+		} `json:"textDocument"`
+	}
+	if err := json.Unmarshal(messages[2].Params, &params); err != nil {
+		t.Fatal(err)
+	}
+	if params.TextDocument.URI != pathURI(source) || params.TextDocument.LanguageID != "cpp" || params.TextDocument.Version != 1 || params.TextDocument.Text != "int Seed;" {
+		t.Fatalf("didOpen=%+v", params)
+	}
+}
+
+func fileURIForTest(path string) string {
+	p := filepath.ToSlash(path)
+	if len(p) > 1 && p[1] == ':' {
+		p = "/" + p
+	}
+	return "file://" + p
 }
 
 func TestManagerCrashBackoffAndRestart(t *testing.T) {
