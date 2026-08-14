@@ -35,7 +35,7 @@ func BuildCommand(input Input) Command {
 	if platform == "" {
 		platform = "Win64"
 	}
-	return Command{Executable: input.DotNet, Args: []string{input.UBTDLL, "-Mode=GenerateClangDatabase", input.Target, configuration, platform, "-Compiler=Clang", "-NoExecCodeGenActions", "-Project=" + input.UProject, "-OutputDir=" + input.OutputDir, "-OutputFile=" + DatabaseName}}
+	return Command{Executable: input.DotNet, Args: []string{input.UBTDLL, "-Mode=GenerateClangDatabase", input.Target, configuration, platform, "-Compiler=Clang", "-NoExecCodeGenActions", "-Project=" + input.UProject, "-OutputDir=" + input.OutputDir, "-OutputFilename=" + DatabaseName}}
 }
 
 // Runner executes a process while retaining a complete private log and bounded returned output.

@@ -105,6 +105,13 @@ func Validate(path, projectRoot, engineRoot string) (ValidationResult, error) {
 	if _, err := decoder.Token(); err != nil {
 		return ValidationResult{}, fmt.Errorf("finish database: %w", err)
 	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return ValidationResult{}, errors.New("compilation database has trailing JSON data")
+		}
+		return ValidationResult{}, fmt.Errorf("compilation database has trailing data: %w", err)
+	}
 	if result.ProjectTranslationUnits == 0 || result.EngineTranslationUnits == 0 {
 		return ValidationResult{}, fmt.Errorf("insufficient coverage: project=%d engine=%d", result.ProjectTranslationUnits, result.EngineTranslationUnits)
 	}

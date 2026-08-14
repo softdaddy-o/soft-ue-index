@@ -23,7 +23,7 @@ func TestBuildGenerateCommand(t *testing.T) {
 	}
 	want := []string{ubt, "-Mode=GenerateClangDatabase", "GameEditor", "Development", "Win64", "-Compiler=Clang", "-NoExecCodeGenActions"}
 	assertContainsInOrder(t, got.Args, want...)
-	assertContainsInOrder(t, got.Args, "-Project="+filepath.Join(root, "Game.uproject"), "-OutputDir="+filepath.Join(root, "staging"), "-OutputFile=compile_commands.json")
+	assertContainsInOrder(t, got.Args, "-Project="+filepath.Join(root, "Game.uproject"), "-OutputDir="+filepath.Join(root, "staging"), "-OutputFilename=compile_commands.json")
 }
 
 func TestGenerateUsesStagingAndPrivateLog(t *testing.T) {

@@ -35,6 +35,27 @@ func TestValidateMalformedJSONPreservesOldDatabase(t *testing.T) {
 	assertOldDatabase(t, env.destination)
 }
 
+func TestValidateTrailingJSONPreservesOldDatabase(t *testing.T) {
+	env := newValidationEnv(t)
+	writeDatabase(t, env.staging, []Entry{env.projectEntry, env.engineEntry})
+	path := filepath.Join(env.staging, DatabaseName)
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(" trailing"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateAndPromote(ValidationInput{StagingDir: env.staging, DestinationDir: env.destination, ProjectRoot: env.projectRoot, EngineRoot: env.engineRoot}); err == nil {
+		t.Fatal("expected trailing JSON error")
+	}
+	assertOldDatabase(t, env.destination)
+}
+
 func TestValidateMissingResponseFilePreservesOldDatabase(t *testing.T) {
 	env := newValidationEnv(t)
 	env.engineEntry.Arguments = []string{env.compiler, "@missing.rsp", "-c", env.engineEntry.File}
