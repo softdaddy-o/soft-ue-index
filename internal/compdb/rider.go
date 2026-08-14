@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -353,9 +354,10 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 			if !filepath.IsAbs(generated) {
 				generated = filepath.Join(d, generated)
 			}
+			generated, e = canonicalIncludingMissing(generated)
 			info, statErr := os.Stat(generated)
-			generated, e = canonical(generated)
-			if statErr != nil || e != nil || !info.IsDir() || (!within(generated, project) && !within(generated, engine)) {
+			invalidType := statErr == nil && !info.IsDir()
+			if e != nil || invalidType || (statErr != nil && !errors.Is(statErr, os.ErrNotExist)) || (!within(generated, project) && !within(generated, engine)) {
 				return RiderResult{}, fmt.Errorf("rider module %q GeneratedCodeDirectory escapes project and engine roots", name)
 			}
 		}
@@ -458,6 +460,36 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 		return RiderResult{}, fmt.Errorf("rider metadata has insufficient coverage: project=%d engine=%d", result.ProjectTranslationUnits, result.EngineTranslationUnits)
 	}
 	return result, nil
+}
+
+// canonicalIncludingMissing resolves the nearest existing ancestor before
+// restoring missing suffixes. This permits not-yet-generated UHT directories
+// without allowing an existing junction or symlink ancestor to escape a root.
+func canonicalIncludingMissing(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(absolute)
+	missing := make([]string, 0)
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 func translationUnitClass(file, project, engine string) int {
