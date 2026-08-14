@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,8 +169,10 @@ func TestSemanticResultsExcludeOtherProjectPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := New(Dependencies{})
-	got, tr := s.filterLocations(project, []lsp.Location{{URI: "file://" + inside}, {URI: "file://" + outside}}, false)
-	if len(got) != 1 || got[0].URI != "file://"+inside || !tr {
+	insideURI := "file:///" + strings.ReplaceAll(inside, "\\", "/")
+	outsideURI := "file:///" + strings.ReplaceAll(outside, "\\", "/")
+	got, tr := s.filterLocations(project, []lsp.Location{{URI: insideURI}, {URI: outsideURI}}, false)
+	if len(got) != 1 || got[0].URI != insideURI || !tr {
 		t.Fatalf("unsafe results leaked: %#v %v", got, tr)
 	}
 }
@@ -282,5 +285,38 @@ func TestOfficialSDKCommandTransportKeepsStdoutProtocolClean(t *testing.T) {
 	}
 	if len(listed.Tools) != 10 {
 		t.Fatalf("want 10 tools, got %d", len(listed.Tools))
+	}
+}
+
+func TestFileURIPathDecodesAndRejectsRemoteOrMalformed(t *testing.T) {
+	p, err := fileURIPath("file:///work/My%20File.cpp", "linux")
+	if err != nil || p != "/work/My File.cpp" {
+		t.Fatalf("unix %q %v", p, err)
+	}
+	p, err = fileURIPath("file:///F:/Work/My%20File.cpp", "windows")
+	if err != nil || p != "F:\\Work\\My File.cpp" {
+		t.Fatalf("windows %q %v", p, err)
+	}
+	if _, err := fileURIPath("file://server/share/a.cpp", "windows"); !errors.Is(err, ErrPathForbidden) {
+		t.Fatalf("UNC: %v", err)
+	}
+	if _, err := fileURIPath("http://example/a", "linux"); !errors.Is(err, ErrPathForbidden) {
+		t.Fatalf("scheme: %v", err)
+	}
+}
+
+func TestCallHierarchyDepthIsBounded(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "S.cpp")
+	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}, Queries: &fakeQueries{}, Limits: Limits{MaxCallDepth: 2}})
+	_, err := s.CallHierarchy(context.Background(), CallHierarchyInput{ProjectID: "p", Position: TextPosition{Path: path}, MaxDepth: 3})
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("depth ceiling: %v", err)
+	}
+	if _, err := s.CallHierarchy(context.Background(), CallHierarchyInput{ProjectID: "p", Position: TextPosition{Path: path}, MaxDepth: 0}); err != nil {
+		t.Fatal(err)
 	}
 }

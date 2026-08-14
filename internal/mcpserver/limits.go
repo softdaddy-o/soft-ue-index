@@ -17,6 +17,7 @@ type Limits struct {
 	MaxPathBytes     int
 	MaxSourceBytes   int
 	MaxResponseBytes int
+	MaxCallDepth     int
 	Timeout          time.Duration
 }
 
@@ -35,6 +36,9 @@ func (l Limits) normalized() Limits {
 	}
 	if l.MaxResponseBytes <= 0 {
 		l.MaxResponseBytes = defaultMaxBytes
+	}
+	if l.MaxCallDepth <= 0 {
+		l.MaxCallDepth = 3
 	}
 	if l.Timeout <= 0 {
 		l.Timeout = 15 * time.Second

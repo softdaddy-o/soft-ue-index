@@ -30,9 +30,7 @@ func (s *Server) MCPServer(version string) *mcp.Server {
 	addLocations(m, "find_definition", "Find a definition.", s.FindDefinition)
 	addLocations(m, "find_references", "Find references.", s.FindReferences)
 	addLocations(m, "find_implementations", "Find implementations.", s.FindImplementations)
-	// DocumentSymbol is recursively nested. Use an untyped structured result here
-	// because JSON Schema cannot represent that recursive Go type.
-	mcp.AddTool(m, &mcp.Tool{Name: "document_symbols", Description: "List document symbols for a project or engine source file."}, func(ctx context.Context, _ *mcp.CallToolRequest, in PathQueryInput) (*mcp.CallToolResult, any, error) {
+	mcp.AddTool(m, &mcp.Tool{Name: "document_symbols", Description: "List document symbols for a project or engine source file."}, func(ctx context.Context, _ *mcp.CallToolRequest, in PathQueryInput) (*mcp.CallToolResult, DocumentSymbolsResult, error) {
 		r, e := s.DocumentSymbols(ctx, in)
 		return textResult(e), r, e
 	})

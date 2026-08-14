@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/softdaddy-o/soft-ue-index/internal/lsp"
@@ -111,6 +113,7 @@ type CallHierarchyInput struct {
 	Position  TextPosition `json:"position"`
 	Direction string       `json:"direction,omitempty"`
 	MaxItems  int          `json:"max_items,omitempty"`
+	MaxDepth  int          `json:"max_depth,omitempty"`
 }
 type LocationsResult struct {
 	Items     []lsp.Location `json:"items"`
@@ -245,6 +248,9 @@ func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (Call
 	if kind != "prepare" && kind != "incoming" && kind != "outgoing" {
 		return CallHierarchyResult{}, errors.New("direction must be prepare, incoming, or outgoing")
 	}
+	if in.MaxDepth < 0 || in.MaxDepth > s.limits.MaxCallDepth {
+		return CallHierarchyResult{}, ErrLimitExceeded
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.limits.Timeout)
 	defer cancel()
 	v, err := s.queries.CallHierarchy(ctx, p, kind, in.Position, s.itemLimit(in.MaxItems)+1)
@@ -371,6 +377,9 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	var b strings.Builder
 	truncated := false
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return ReadSymbolSourceResult{}, mapError(err)
+		}
 		line++
 		if line < in.StartLine {
 			continue
@@ -438,10 +447,16 @@ func (s *Server) itemLimit(requested int) int {
 	return s.limits.MaxItems
 }
 func mapError(err error) error {
+	if err == nil {
+		return nil
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("request timed out: %w", err)
 	}
-	return err
+	if errors.Is(err, ErrProjectRequired) || errors.Is(err, ErrProjectNotFound) || errors.Is(err, ErrPathForbidden) || errors.Is(err, ErrLimitExceeded) {
+		return err
+	}
+	return errors.New("code intelligence request failed")
 }
 
 func bounded[T any](limit int, value T) (T, error) {
@@ -486,9 +501,36 @@ func safePath(path string, roots ...string) (string, error) {
 	return "", ErrPathForbidden
 }
 
+// fileURIPath decodes only local file URIs. Hostnames other than localhost are
+// rejected to avoid treating remote UNC shares as trusted project files.
+func fileURIPath(raw, goos string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "file" {
+		return "", ErrPathForbidden
+	}
+	if u.Host != "" && u.Host != "localhost" {
+		return "", ErrPathForbidden
+	}
+	p, err := url.PathUnescape(u.EscapedPath())
+	if err != nil || p == "" {
+		return "", ErrPathForbidden
+	}
+	if goos == "windows" {
+		if len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+			p = p[1:]
+		}
+		p = strings.ReplaceAll(p, "/", "\\")
+	}
+	return p, nil
+}
+func runtimeGOOS() string { return runtime.GOOS }
+
 func (s *Server) allowed(p registry.Project, uri string) bool {
-	path := strings.TrimPrefix(uri, "file://")
-	_, err := safePath(path, filepath.Dir(p.UProject), p.Engine.Root)
+	path, err := fileURIPath(uri, runtimeGOOS())
+	if err != nil {
+		return false
+	}
+	_, err = safePath(path, filepath.Dir(p.UProject), p.Engine.Root)
 	return err == nil
 }
 func (s *Server) filterSymbols(p registry.Project, in []lsp.Symbol, truncated bool) ([]lsp.Symbol, bool) {
