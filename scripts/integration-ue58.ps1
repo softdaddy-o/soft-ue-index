@@ -111,7 +111,11 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
             Write-McpLine ($Request | ConvertTo-Json -Compress -Depth 10)
             $read = $process.StandardOutput.ReadLineAsync()
             $remaining = [Math]::Floor(($script:Deadline - (Get-Date)).TotalSeconds)
-            if ($remaining -lt 1 -or -not $read.Wait([int]$remaining * 1000)) { throw 'MCP request timed out' }
+            $requestTimeoutMs = [Math]::Min(45000, [int]$remaining * 1000)
+            if ($remaining -lt 1 -or -not $read.Wait($requestTimeoutMs)) {
+                $tool = if ($Request.params.name) { "/$($Request.params.name)" } else { '' }
+                throw "MCP request timed out: $($Request.method)$tool id=$($Request.id)"
+            }
             $line = $read.Result
             if ([string]::IsNullOrWhiteSpace($line)) {
                 if ($process.HasExited) { throw "MCP server exited with code $($process.ExitCode)" }
