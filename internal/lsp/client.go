@@ -161,11 +161,8 @@ func (c *Client) Notify(method string, params any) error {
 }
 func mustJSON(v any) json.RawMessage { b, _ := json.Marshal(v); return b }
 func (c *Client) Call(ctx context.Context, method string, params any, result any) error {
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.timeout)
-		defer cancel()
-	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
 	id := c.next.Add(1)
 	response := make(chan wireMessage, 1)
 	c.mu.Lock()

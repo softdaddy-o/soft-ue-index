@@ -71,6 +71,28 @@ func TestClientCancelsTimeout(t *testing.T) {
 		t.Fatal("no cancellation")
 	}
 }
+
+func TestClientCapsLaterCallerDeadlineAtRequestTimeout(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{RequestTimeout: 20 * time.Millisecond})
+	defer c.Close()
+	go func() {
+		r := bufio.NewReader(b)
+		_, _ = readFrame(r, 1024)
+		_, _ = readFrame(r, 1024) // $/cancelRequest
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := c.Call(ctx, "slow", nil, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 150*time.Millisecond {
+		t.Fatalf("request used caller deadline instead of client timeout: %v", elapsed)
+	}
+}
 func TestClientRejectsOversizedFrame(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()
