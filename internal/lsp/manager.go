@@ -446,7 +446,7 @@ func (m *Manager) start(ctx context.Context, cfg ProjectConfig) (Process, error)
 	if err := os.MkdirAll(filepath.Join(cfg.CacheDir, ".cache", "clangd", "index"), 0700); err != nil {
 		return nil, err
 	}
-	args := []string{"--compile-commands-dir=" + cfg.CacheDir, "--background-index", "--j=" + itoa(cfg.Threads), "--log=error"}
+	args := []string{"--compile-commands-dir=" + cfg.CacheDir, "--background-index", "--background-index-priority=background", "--j=" + itoa(cfg.Threads), "--log=error"}
 	p, err := m.factory.Start(ctx, cfg.Clangd, args, filepath.Join(cfg.CacheDir, "clangd.log"))
 	if err != nil {
 		return nil, err

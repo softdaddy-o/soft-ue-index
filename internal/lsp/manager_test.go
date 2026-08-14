@@ -118,6 +118,15 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	if f.args[0][0] != "--compile-commands-dir="+dir {
 		t.Fatalf("args=%v", f.args[0])
 	}
+	foundBackgroundPriority := false
+	for _, arg := range f.args[0] {
+		if arg == "--background-index-priority=background" {
+			foundBackgroundPriority = true
+		}
+	}
+	if !foundBackgroundPriority {
+		t.Fatalf("background index priority missing from args=%v", f.args[0])
+	}
 	m.Release("game")
 	m.Release("game")
 	time.Sleep(20 * time.Millisecond)
