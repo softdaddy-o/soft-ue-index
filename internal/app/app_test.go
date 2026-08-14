@@ -144,6 +144,58 @@ func TestFileURIEscapesWindowsAndUnicodePaths(t *testing.T) {
 	}
 }
 
+func TestLSPQueryResultsCannotEscapeProjectAndEngineRoots(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "Project")
+	engineRoot := filepath.Join(root, "Engine")
+	outsideRoot := filepath.Join(root, "Outside")
+	for _, dir := range []string{projectRoot, engineRoot, outsideRoot, filepath.Join(projectRoot, "Intermediate", "Generated")} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projectFile := filepath.Join(projectRoot, "Source.cpp")
+	engineFile := filepath.Join(engineRoot, "Core.cpp")
+	generatedFile := filepath.Join(projectRoot, "Intermediate", "Generated", "Thing.gen.cpp")
+	outsideFile := filepath.Join(outsideRoot, "secret.cpp")
+	for _, path := range []string{projectFile, engineFile, generatedFile, outsideFile} {
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := registry.Project{UProject: filepath.Join(projectRoot, "Game.uproject"), Engine: registry.Engine{Root: engineRoot}}
+	allowed := []string{fileURI(projectFile), fileURI(engineFile), fileURI(generatedFile)}
+	for _, uri := range allowed {
+		if !lspResultURIAllowed(p, uri) {
+			t.Fatalf("allowed URI rejected: %s", uri)
+		}
+	}
+	for _, uri := range []string{fileURI(outsideFile), "https://example.invalid/source.cpp", "not a URI", "file://server/share/source.cpp", ""} {
+		if lspResultURIAllowed(p, uri) {
+			t.Fatalf("forbidden URI accepted: %q", uri)
+		}
+	}
+
+	symbols := filterLSPSymbols(p, []lsp.Symbol{{Name: "project", Location: lsp.Location{URI: allowed[0]}}, {Name: "outside", Location: lsp.Location{URI: fileURI(outsideFile)}}, {Name: "malformed", Location: lsp.Location{URI: "not a URI"}}})
+	if len(symbols) != 1 || symbols[0].Name != "project" {
+		t.Fatalf("symbols leaked: %#v", symbols)
+	}
+	locations := filterLSPLocations(p, []lsp.Location{{URI: allowed[0]}, {URI: allowed[1]}, {URI: fileURI(outsideFile)}, {URI: "https://example.invalid/source.cpp"}})
+	if len(locations) != 2 {
+		t.Fatalf("definition/reference/implementation locations leaked: %#v", locations)
+	}
+	items := filterLSPCallItems(p, []lsp.CallHierarchyItem{{Name: "generated", URI: allowed[2]}, {Name: "outside", URI: fileURI(outsideFile)}})
+	if len(items) != 1 || items[0].Name != "generated" {
+		t.Fatalf("call hierarchy items leaked: %#v", items)
+	}
+	insideCall := lsp.CallHierarchyCall{From: &lsp.CallHierarchyItem{Name: "engine", URI: allowed[1]}, To: &lsp.CallHierarchyItem{Name: "project", URI: allowed[0]}}
+	escapeCall := lsp.CallHierarchyCall{From: &lsp.CallHierarchyItem{Name: "outside", URI: fileURI(outsideFile)}, To: &lsp.CallHierarchyItem{Name: "project", URI: allowed[0]}}
+	calls := filterLSPCalls(p, []lsp.CallHierarchyCall{insideCall, escapeCall})
+	if len(calls) != 1 || calls[0].From.Name != "engine" {
+		t.Fatalf("call hierarchy calls leaked: %#v", calls)
+	}
+}
+
 type appEnvironment map[string]string
 
 func (e appEnvironment) LookupEnv(name string) (string, bool) { value, ok := e[name]; return value, ok }

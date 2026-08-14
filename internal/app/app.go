@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -581,7 +582,8 @@ func (q lspQueries) Symbols(ctx context.Context, p registry.Project, s string, n
 	if e != nil {
 		return nil, e
 	}
-	return c.WorkspaceSymbols(ctx, s, lsp.Limits{MaxItems: n})
+	items, err := c.WorkspaceSymbols(ctx, s, lsp.Limits{MaxItems: n})
+	return filterLSPSymbols(p, items), err
 }
 func (q lspQueries) Locations(ctx context.Context, p registry.Project, kind string, v mcpserver.TextPosition, n int) ([]lsp.Location, error) {
 	c, done, e := q.client(ctx, p)
@@ -590,14 +592,16 @@ func (q lspQueries) Locations(ctx context.Context, p registry.Project, kind stri
 		return nil, e
 	}
 	pos := lsp.TextDocumentPosition{URI: fileURI(v.Path), Position: lsp.Position{Line: v.Line, Character: v.Character}}
+	var locations []lsp.Location
 	switch kind {
 	case "definition":
-		return c.Definitions(ctx, pos, lsp.Limits{MaxItems: n})
+		locations, e = c.Definitions(ctx, pos, lsp.Limits{MaxItems: n})
 	case "references":
-		return c.ReferenceLocations(ctx, pos, lsp.Limits{MaxItems: n})
+		locations, e = c.ReferenceLocations(ctx, pos, lsp.Limits{MaxItems: n})
 	default:
-		return c.Implementations(ctx, pos, lsp.Limits{MaxItems: n})
+		locations, e = c.Implementations(ctx, pos, lsp.Limits{MaxItems: n})
 	}
+	return filterLSPLocations(p, locations), e
 }
 func (q lspQueries) DocumentSymbols(ctx context.Context, p registry.Project, path string, n int) ([]lsp.DocumentSymbol, error) {
 	c, done, e := q.client(ctx, p)
@@ -621,7 +625,8 @@ func (q lspQueries) PrepareCallHierarchy(ctx context.Context, p registry.Project
 	if e != nil {
 		return nil, e
 	}
-	return c.PrepareCallHierarchy(ctx, lsp.TextDocumentPosition{URI: fileURI(v.Path), Position: lsp.Position{Line: v.Line, Character: v.Character}})
+	items, err := c.PrepareCallHierarchy(ctx, lsp.TextDocumentPosition{URI: fileURI(v.Path), Position: lsp.Position{Line: v.Line, Character: v.Character}})
+	return filterLSPCallItems(p, items), err
 }
 func (q lspQueries) IncomingCalls(ctx context.Context, p registry.Project, i lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error) {
 	c, done, e := q.client(ctx, p)
@@ -629,7 +634,8 @@ func (q lspQueries) IncomingCalls(ctx context.Context, p registry.Project, i lsp
 	if e != nil {
 		return nil, e
 	}
-	return c.IncomingCalls(ctx, i)
+	calls, err := c.IncomingCalls(ctx, i)
+	return filterLSPCalls(p, calls), err
 }
 func (q lspQueries) OutgoingCalls(ctx context.Context, p registry.Project, i lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error) {
 	c, done, e := q.client(ctx, p)
@@ -637,8 +643,119 @@ func (q lspQueries) OutgoingCalls(ctx context.Context, p registry.Project, i lsp
 	if e != nil {
 		return nil, e
 	}
-	return c.OutgoingCalls(ctx, i)
+	calls, err := c.OutgoingCalls(ctx, i)
+	return filterLSPCalls(p, calls), err
 }
+
+func filterLSPSymbols(p registry.Project, in []lsp.Symbol) []lsp.Symbol {
+	out := make([]lsp.Symbol, 0, len(in))
+	for _, item := range in {
+		if lspResultURIAllowed(p, item.Location.URI) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func filterLSPLocations(p registry.Project, in []lsp.Location) []lsp.Location {
+	out := make([]lsp.Location, 0, len(in))
+	for _, item := range in {
+		if lspResultURIAllowed(p, item.URI) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func filterLSPCallItems(p registry.Project, in []lsp.CallHierarchyItem) []lsp.CallHierarchyItem {
+	out := make([]lsp.CallHierarchyItem, 0, len(in))
+	for _, item := range in {
+		if lspResultURIAllowed(p, item.URI) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func filterLSPCalls(p registry.Project, in []lsp.CallHierarchyCall) []lsp.CallHierarchyCall {
+	out := make([]lsp.CallHierarchyCall, 0, len(in))
+	for _, call := range in {
+		hasItem := call.From != nil || call.To != nil
+		fromAllowed := call.From == nil || lspResultURIAllowed(p, call.From.URI)
+		toAllowed := call.To == nil || lspResultURIAllowed(p, call.To.URI)
+		if hasItem && fromAllowed && toAllowed {
+			out = append(out, call)
+		}
+	}
+	return out
+}
+
+func lspResultURIAllowed(p registry.Project, raw string) bool {
+	path, err := localFileURIPath(raw)
+	if err != nil {
+		return false
+	}
+	path, err = canonicalResultPath(path)
+	if err != nil {
+		return false
+	}
+	for _, root := range []string{filepath.Dir(p.UProject), p.Engine.Root} {
+		canonicalRoot, err := canonicalResultPath(root)
+		if err == nil && pathWithinRoot(path, canonicalRoot) {
+			return true
+		}
+	}
+	return false
+}
+
+func localFileURIPath(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(u.Scheme, "file") || u.Host != "" || u.Path == "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("invalid local file URI")
+	}
+	path := u.Path
+	if runtime.GOOS == "windows" && len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+		path = path[1:]
+	}
+	path = filepath.FromSlash(path)
+	if !filepath.IsAbs(path) {
+		return "", errors.New("file URI path is not absolute")
+	}
+	return path, nil
+}
+
+func canonicalResultPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(abs)
+	missing := make([]string, 0)
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func pathWithinRoot(path, root string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}
+
 func fileURI(path string) string {
 	p := filepath.ToSlash(path)
 	if len(p) >= 2 && p[1] == ':' {
