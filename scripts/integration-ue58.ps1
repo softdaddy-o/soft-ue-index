@@ -119,20 +119,29 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
         if (-not $projects.result) { throw 'MCP list_projects did not return a result' }
         $id = 3
         foreach ($case in @(@{ Query = $ProjectQuery; Root = $ProjectRoot; Kind = 'project' }, @{ Query = $EngineQuery; Root = $EngineRoot; Kind = 'engine' })) {
-            $response = Send-Request @{ jsonrpc = '2.0'; id = $id; method = 'tools/call'; params = @{ name = 'search_symbols'; arguments = @{ project_id = $ProjectID; query = $case.Query; max_items = 10 } } }
-            $items = @($response.result.structuredContent.items)
-            if ($items.Count -eq 0) { throw "MCP search_symbols returned no $($case.Kind) result" }
-            $symbol = $items | Where-Object { Test-UnderRoot (Convert-FileUriToPath $_.location.uri) $case.Root } | Select-Object -First 1
-            if (-not $symbol) { throw "MCP search_symbols did not return a $($case.Kind) source result" }
+            $symbol = $null
+            while (-not $symbol -and (Get-Date) -lt $script:Deadline) {
+                $response = Send-Request @{ jsonrpc = '2.0'; id = $id; method = 'tools/call'; params = @{ name = 'search_symbols'; arguments = @{ project_id = $ProjectID; query = $case.Query; max_items = 10 } } }
+                $id++
+                $items = @($response.result.structuredContent.items)
+                $symbol = $items | Where-Object { Test-UnderRoot (Convert-FileUriToPath $_.location.uri) $case.Root } | Select-Object -First 1
+                if (-not $symbol -and (Get-Date).AddSeconds(1) -lt $script:Deadline) { Start-Sleep -Seconds 1 }
+            }
+            if (-not $symbol) { throw "MCP search_symbols timed out for $($case.Kind) source" }
             Assert-UnderRoot $symbol.location.uri $case.Root $case.Kind
             $position = @{ path = (Convert-FileUriToPath $symbol.location.uri); line = $symbol.location.range.start.line; character = $symbol.location.range.start.character }
-            $definition = Send-Request @{ jsonrpc = '2.0'; id = ($id + 100); method = 'tools/call'; params = @{ name = 'find_definition'; arguments = @{ project_id = $ProjectID; position = $position; max_items = 10 } } }
-            $definitions = @($definition.result.structuredContent.items)
-            if ($definitions.Count -eq 0) { throw "MCP find_definition returned no $($case.Kind) result" }
+            $definitions = @()
+            while ($definitions.Count -eq 0 -and (Get-Date) -lt $script:Deadline) {
+                $definition = Send-Request @{ jsonrpc = '2.0'; id = $id; method = 'tools/call'; params = @{ name = 'find_definition'; arguments = @{ project_id = $ProjectID; position = $position; max_items = 10 } } }
+                $id++
+                $definitions = @($definition.result.structuredContent.items)
+                if ($definitions.Count -eq 0 -and (Get-Date).AddSeconds(1) -lt $script:Deadline) { Start-Sleep -Seconds 1 }
+            }
+            if ($definitions.Count -eq 0) { throw "MCP find_definition timed out for $($case.Kind) source" }
             Assert-UnderRoot $definitions[0].uri $case.Root $case.Kind
-            $references = Send-Request @{ jsonrpc = '2.0'; id = ($id + 200); method = 'tools/call'; params = @{ name = 'find_references'; arguments = @{ project_id = $ProjectID; position = $position; max_items = 10 } } }
-            if (-not $references.result) { throw "MCP find_references failed for $($case.Kind) symbol" }
+            $references = Send-Request @{ jsonrpc = '2.0'; id = $id; method = 'tools/call'; params = @{ name = 'find_references'; arguments = @{ project_id = $ProjectID; position = $position; max_items = 10 } } }
             $id++
+            if (-not $references.result) { throw "MCP find_references failed for $($case.Kind) symbol" }
         }
     } finally {
         Stop-ChildProcess $process
