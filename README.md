@@ -75,9 +75,13 @@ Example client configuration:
 
 The server provides `list_projects`, `project_status`, `search_symbols`, `find_definition`, `find_references`, `find_implementations`, `document_symbols`, `hover`, `call_hierarchy`, and `read_symbol_source`. Every source query requires an explicit registered project and is bounded by result, response, and source-read limits. It only reads the selected project and its associated engine roots.
 
+Malformed or oversized stdio requests are rejected before SDK dispatch and may close the MCP stream without a response. Restart the client connection after such a fail-closed rejection.
+
 The first query starts clangd lazily and opens one safe project translation unit to trigger background indexing. Project symbols and engine declarations included by that unit become available first. A cold Unreal Engine index can continue filling in the background; later sessions reuse persistent shards from the project's per-user cache. Source or build-rule changes handled by `watch` update only the affected work instead of rebuilding the entire index from scratch.
 
 Restart the MCP server after adding or removing registered projects so its project watcher set is refreshed.
+
+The MVP targets source/custom Unreal Engine installations registered in the current user's Unreal Engine Builds registry. Launcher-only binary installations are outside the current indexing scope unless they are source-enabled and registered there.
 
 ## Local UE 5.8 integration check
 

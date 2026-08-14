@@ -78,6 +78,12 @@ func TestRemoveUnknownProjectFails(t *testing.T) {
 	}
 }
 
+func TestStableIDAvoidsPortableCaseCollision(t *testing.T) {
+	if got := stableID("Game", []registry.Project{{ID: "GAME"}}); got != "game-2" {
+		t.Fatalf("stableID=%q", got)
+	}
+}
+
 func TestDoctorDefaultReturnsStructuredChecks(t *testing.T) {
 	store, err := registry.NewStore(t.TempDir())
 	if err != nil {

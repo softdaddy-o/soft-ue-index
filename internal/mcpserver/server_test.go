@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -416,7 +417,11 @@ func TestMCPStdioHelperProcess(t *testing.T) {
 	if os.Getenv("SOFT_UE_INDEX_MCP_MODE") == "error" {
 		q.err = errors.New(strings.Repeat("backend-secret", 1<<18))
 	}
-	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: "P.uproject"}}}, Queries: q, Limits: Limits{MaxResponseBytes: 512}})
+	responseBytes := 512
+	if os.Getenv("SOFT_UE_INDEX_MCP_MODE") == "command" {
+		responseBytes = defaultMaxBytes
+	}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: "P.uproject"}}}, Queries: q, Limits: Limits{MaxResponseBytes: responseBytes}})
 	if err := s.RunStdio(context.Background(), "test"); err != nil {
 		os.Exit(2)
 	}
@@ -493,6 +498,76 @@ func TestOfficialSDKStdioCallToolFramesRespectResponseCap(t *testing.T) {
 	}
 }
 
+func TestStdioRejectsOversizedMalformedArgumentsForEveryTool(t *testing.T) {
+	tools := []string{"list_projects", "project_status", "search_symbols", "find_definition", "find_references", "find_implementations", "document_symbols", "hover", "call_hierarchy", "read_symbol_source"}
+	for _, tool := range tools {
+		t.Run(tool, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=TestMCPStdioHelperProcess", "--")
+			cmd.Env = append(os.Environ(), "SOFT_UE_INDEX_MCP_HELPER=1")
+			in, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			encoder := json.NewEncoder(in)
+			if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": "2026-07-28", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "test", "version": "test"}}}); err != nil {
+				t.Fatal(err)
+			}
+			scanner := bufio.NewScanner(out)
+			scanner.Buffer(make([]byte, 1024), 64*1024)
+			initialized := false
+			for scanner.Scan() {
+				if len(scanner.Bytes())+1 > 512 {
+					t.Fatalf("oversized initialize frame=%d", len(scanner.Bytes())+1)
+				}
+				var response struct {
+					ID int `json:"id"`
+				}
+				if json.Unmarshal(scanner.Bytes(), &response) == nil && response.ID == 1 {
+					initialized = true
+					break
+				}
+			}
+			if !initialized {
+				t.Fatal("missing initialize response")
+			}
+			if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"}); err != nil {
+				t.Fatal(err)
+			}
+			field := "project_id"
+			if tool == "list_projects" {
+				field = "max_items"
+			}
+			request := map[string]any{"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": map[string]any{"name": tool, "arguments": map[string]any{field: strings.Repeat("x", 60000)}}}
+			// Fail-closed ingress may terminate while the oversized frame is still
+			// being written, so a broken pipe is an expected rejection outcome.
+			_ = encoder.Encode(request)
+			_ = in.Close()
+			var data []byte
+			for scanner.Scan() {
+				frame := append([]byte(nil), scanner.Bytes()...)
+				if len(frame)+1 > 512 {
+					t.Fatalf("oversized response frame=%d", len(frame)+1)
+				}
+				data = append(data, frame...)
+			}
+			if err := scanner.Err(); err != nil {
+				t.Fatal(err)
+			}
+			_ = cmd.Wait()
+			if bytes.Contains(data, []byte(strings.Repeat("x", 128))) {
+				t.Fatal("malformed argument was reflected")
+			}
+		})
+	}
+}
+
 func TestStdioIngressRejectsOversizedFramesAndStringIDs(t *testing.T) {
 	for _, input := range []string{
 		`{"jsonrpc":"2.0","id":"` + strings.Repeat("i", defaultMaxRequestIDBytes+1) + `","method":"tools/call","params":{}}` + "\n",
@@ -514,9 +589,8 @@ func TestStdioIngressRejectsOversizedFramesAndStringIDs(t *testing.T) {
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := io.WriteString(in, input); err != nil {
-				t.Fatal(err)
-			}
+			// The bounded reader may close the pipe before a hostile frame finishes.
+			_, _ = io.WriteString(in, input)
 			_ = in.Close()
 			done := make(chan error, 1)
 			go func() { done <- cmd.Wait() }()
@@ -578,7 +652,7 @@ func TestOfficialSDKCommandTransportKeepsStdoutProtocolClean(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	cmd := exec.Command(os.Args[0], "-test.run=TestMCPStdioHelperProcess", "--")
-	cmd.Env = append(os.Environ(), "SOFT_UE_INDEX_MCP_HELPER=1")
+	cmd.Env = append(os.Environ(), "SOFT_UE_INDEX_MCP_HELPER=1", "SOFT_UE_INDEX_MCP_MODE=command")
 	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "test"}, nil)
 	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
 	if err != nil {

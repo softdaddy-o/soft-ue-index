@@ -15,27 +15,27 @@ import (
 func TestProjectReadyRequiresUsableCompilationDatabase(t *testing.T) {
 	cache := t.TempDir()
 	db := filepath.Join(cache, "compile_commands.json")
-	p := Project{Generation: GenerationState{CacheDir: cache, CompilationDatabase: db}}
+	p := Project{Generation: GenerationState{CacheDir: cache, CompilationDatabase: db, LastFingerprint: "validated"}}
 	if p.Ready() {
 		t.Fatal("missing database reported ready")
 	}
-	if err := os.WriteFile(db, []byte("not json"), 0600); err != nil {
+	if err := os.WriteFile(db, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	if p.Ready() {
-		t.Fatal("invalid database reported ready")
+		t.Fatal("empty database reported ready")
 	}
-	if err := os.WriteFile(db, []byte(`[{"directory":"C:/project","file":"Foo.cpp","command":"clang Foo.cpp"}]`), 0600); err != nil {
+	if err := os.WriteFile(db, []byte("validated during promotion"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if !p.Ready() {
 		t.Fatal("valid database reported not ready")
 	}
-	if err := os.WriteFile(db, []byte(`[{"directory":"C:/project","file":"Foo.cpp","command":"clang Foo.cpp"} garbage`), 0600); err != nil {
+	if err := os.Truncate(db, 1<<30); err != nil {
 		t.Fatal(err)
 	}
-	if p.Ready() {
-		t.Fatal("database malformed after opening array reported ready")
+	if !p.Ready() {
+		t.Fatal("large validated database reported not ready")
 	}
 }
 
@@ -105,7 +105,7 @@ func TestSaveRejectsDuplicateIDsAndPaths(t *testing.T) {
 	dir := t.TempDir()
 	s := mustStore(t, dir)
 	project := filepath.Join(dir, "Game.uproject")
-	for _, projects := range [][]Project{{{ID: "same", UProject: project}, {ID: "same", UProject: filepath.Join(dir, "Other.uproject")}}, {{ID: "one", UProject: project}, {ID: "two", UProject: filepath.Join(dir, ".", "Game.uproject")}}} {
+	for _, projects := range [][]Project{{{ID: "same", UProject: project}, {ID: "same", UProject: filepath.Join(dir, "Other.uproject")}}, {{ID: "Game", UProject: project}, {ID: "game", UProject: filepath.Join(dir, "Other.uproject")}}, {{ID: "one", UProject: project}, {ID: "two", UProject: filepath.Join(dir, ".", "Game.uproject")}}} {
 		err := s.Save(context.Background(), Registry{Version: CurrentVersion, Projects: projects})
 		if !errors.Is(err, ErrDuplicateProject) {
 			t.Fatalf("got %v", err)

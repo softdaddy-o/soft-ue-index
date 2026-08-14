@@ -165,7 +165,7 @@ func stableID(name string, projects []registry.Project) string {
 	for n := 2; ; n++ {
 		found := false
 		for _, p := range projects {
-			if p.ID == id {
+			if strings.EqualFold(p.ID, id) {
 				found = true
 				break
 			}
