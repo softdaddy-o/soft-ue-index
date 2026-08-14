@@ -2,6 +2,7 @@ package diagnostics
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -54,6 +55,16 @@ func TestHumanAndJSONRenderSameCheckData(t *testing.T) {
 	}
 }
 
+func TestWindowsHostProbeWiresMSVCAndWindowsSDKIntoProbe(t *testing.T) {
+	probe := WindowsHostProbe{Environment: fakeEnvironment{"ProgramFiles": "C:/Program Files (x86)"}, FileSystem: fakeFiles{
+		"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.38/bin/Hostx64/x64/cl.exe": true,
+		"C:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/um/windows.h":                                  true,
+	}}.Apply(Probe{Engine: true})
+	if !probe.Engine || !probe.MSVC || !probe.WindowsSDK {
+		t.Errorf("Probe = %#v, want preserved engine plus detected MSVC and Windows SDK", probe)
+	}
+}
+
 func find(t *testing.T, report Report, code string) Result {
 	t.Helper()
 	for _, check := range report.Checks {
@@ -63,4 +74,24 @@ func find(t *testing.T, report Report, code string) Result {
 	}
 	t.Fatalf("check %q not found", code)
 	return Result{}
+}
+
+type fakeEnvironment map[string]string
+
+func (e fakeEnvironment) LookupEnv(name string) (string, bool) {
+	value, ok := e[name]
+	return value, ok
+}
+
+type fakeFiles map[string]bool
+
+func (f fakeFiles) Exists(path string) bool { return f[path] }
+func (f fakeFiles) Glob(pattern string) []string {
+	var matches []string
+	for path := range f {
+		if matched, _ := filepath.Match(pattern, path); matched {
+			matches = append(matches, path)
+		}
+	}
+	return matches
 }

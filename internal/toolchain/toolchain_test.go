@@ -3,6 +3,7 @@ package toolchain
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -68,6 +69,13 @@ func TestParseSDKConfigRejectsMalformedVersion(t *testing.T) {
 	}
 }
 
+func TestParseSDKConfigRejectsPrereleaseVersion(t *testing.T) {
+	_, err := ParseSDKConfig([]byte(`{"PreferredClangVersion":"20.1.8-rc1","MinimumClangVersion":"19.1.0"}`))
+	if !errors.Is(err, ErrMalformedSDKConfig) {
+		t.Fatalf("ParseSDKConfig() error = %v, want ErrMalformedSDKConfig", err)
+	}
+}
+
 func TestSelectClangdPrefersEnginePreferredVersionOverNewerCompatibleCandidate(t *testing.T) {
 	selection, err := SelectClangd(Config{Preferred: mustVersion(t, "18.1.8"), Minimum: mustVersion(t, "16.0.6")}, []Candidate{
 		{Path: "C:/LLVM/bin/clangd.exe", Source: SourceLLVMPath},
@@ -100,6 +108,14 @@ func TestSelectClangdUsesEngineRangePriorityBeforeCandidateDiscoveryOrder(t *tes
 func TestSelectClangdRejectsVersionAboveConfiguredPreferredRanges(t *testing.T) {
 	config := Config{Minimum: mustVersion(t, "19.1.0"), PreferredRanges: []Range{mustRange(t, "19.1.0-19.999")}}
 	_, err := SelectClangd(config, []Candidate{{Path: "too-new"}}, fakeRunner{outputs: map[string]string{"too-new": "clangd version 21.0.0"}})
+	if !errors.Is(err, ErrCompatibleClangdNotFound) {
+		t.Fatalf("SelectClangd() error = %v, want ErrCompatibleClangdNotFound", err)
+	}
+}
+
+func TestSelectClangdRejectsPrereleaseOutput(t *testing.T) {
+	config := Config{Minimum: mustVersion(t, "20.1.0"), PreferredRanges: []Range{mustRange(t, "20.1.0-20.999")}}
+	_, err := SelectClangd(config, []Candidate{{Path: "prerelease"}}, fakeRunner{outputs: map[string]string{"prerelease": "clangd version 20.1.8-rc1"}})
 	if !errors.Is(err, ErrCompatibleClangdNotFound) {
 		t.Fatalf("SelectClangd() error = %v, want ErrCompatibleClangdNotFound", err)
 	}
@@ -138,6 +154,40 @@ func TestDiscoverCandidatesUsesStableSourceOrderAndDeduplicates(t *testing.T) {
 	for index := range want {
 		if got[index] != want[index] {
 			t.Errorf("candidate %d = %q, want %q", index, got[index], want[index])
+		}
+	}
+}
+
+func TestDiscoverCandidatesSkipsEmptyEnvironmentSegments(t *testing.T) {
+	candidates := DiscoverCandidates("", fakeEnvironment{"LLVM_PATH": "", "PATH": ";;C:/llvm;;"}, fakeCandidates{})
+	for _, candidate := range candidates {
+		if strings.EqualFold(candidate.Path, "clangd.exe") || strings.HasPrefix(candidate.Path, "/clangd.exe") {
+			t.Errorf("candidate = %q, want no current-directory clangd candidate", candidate.Path)
+		}
+	}
+	if got, want := candidates[0].Path, "C:/llvm/clangd.exe"; got != want {
+		t.Errorf("first candidate = %q, want %q", got, want)
+	}
+}
+
+func TestWindowsCandidateProviderDiscoversStandardAndVisualStudioLLVM(t *testing.T) {
+	filesystem := fakeFiles{
+		"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin/clangd.exe":  true,
+		"C:/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x86/bin/clangd.exe": true,
+	}
+	provider := WindowsCandidateProvider{Environment: fakeEnvironment{"ProgramFiles": "C:/Program Files"}, FileSystem: filesystem}
+	candidates := DiscoverCandidates("", fakeEnvironment{}, provider)
+	want := []string{
+		"C:/Program Files/LLVM/bin/clangd.exe",
+		"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin/clangd.exe",
+		"C:/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x86/bin/clangd.exe",
+	}
+	if len(candidates) != len(want) {
+		t.Fatalf("candidates = %#v, want %d", candidates, len(want))
+	}
+	for index, path := range want {
+		if candidates[index].Path != path {
+			t.Errorf("candidate %d = %q, want %q", index, candidates[index].Path, path)
 		}
 	}
 }

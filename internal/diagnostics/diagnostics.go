@@ -4,6 +4,7 @@ package diagnostics
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -34,6 +35,54 @@ type Report struct {
 type Probe struct {
 	Engine, UBT, Dotnet, LLVM, MSVC, WindowsSDK, GeneratedHeaders, ResponseFiles bool
 }
+
+// Environment and FileSystem make Windows prerequisite checks independent of the real host.
+type Environment interface{ LookupEnv(string) (string, bool) }
+type FileSystem interface {
+	Exists(path string) bool
+	Glob(pattern string) []string
+}
+
+// WindowsHostProbe fills the Windows compiler and SDK fields of an existing Probe.
+type WindowsHostProbe struct {
+	Environment Environment
+	FileSystem  FileSystem
+}
+
+func (p WindowsHostProbe) Apply(probe Probe) Probe {
+	if p.Environment == nil || p.FileSystem == nil {
+		return probe
+	}
+	for _, root := range p.programFilesRoots() {
+		if anyExisting(p.FileSystem, windowsPath(root, "Microsoft Visual Studio", "*", "*", "VC", "Tools", "MSVC", "*", "bin", "Hostx64", "x64", "cl.exe")) {
+			probe.MSVC = true
+		}
+		if anyExisting(p.FileSystem, windowsPath(root, "Windows Kits", "10", "Include", "*", "um", "windows.h")) {
+			probe.WindowsSDK = true
+		}
+	}
+	return probe
+}
+
+func (p WindowsHostProbe) programFilesRoots() []string {
+	roots := []string{}
+	for _, name := range []string{"ProgramFiles", "ProgramFiles(x86)"} {
+		if value, ok := p.Environment.LookupEnv(name); ok && strings.TrimSpace(value) != "" {
+			roots = append(roots, value)
+		}
+	}
+	return roots
+}
+
+func anyExisting(filesystem FileSystem, pattern string) bool {
+	for _, path := range filesystem.Glob(pattern) {
+		if filesystem.Exists(path) {
+			return true
+		}
+	}
+	return false
+}
+func windowsPath(elements ...string) string { return filepath.ToSlash(filepath.Join(elements...)) }
 
 // Check converts tool discovery facts into complete, stable doctor results.
 func Check(probe Probe) Report {

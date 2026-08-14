@@ -19,7 +19,7 @@ var (
 	ErrCompatibleClangdNotFound = errors.New("compatible clangd not found")
 )
 
-var versionPattern = regexp.MustCompile(`^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+][0-9A-Za-z.-]+)?\s*$`)
+var versionPattern = regexp.MustCompile(`^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?\s*$`)
 var clangdVersionPattern = regexp.MustCompile(`(?i)\bclangd\s+version\s+([0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.-]+)?)`)
 
 // Version is a three-part compiler version. Pre-release suffixes are intentionally ignored.
@@ -219,6 +219,43 @@ type CandidateProvider interface {
 	VisualStudioCandidates() []Candidate
 }
 
+// WindowsCandidateProvider supplies conventional Windows LLVM locations without
+// depending on the process environment or real filesystem in tests.
+type WindowsCandidateProvider struct {
+	Environment Environment
+	FileSystem  FileSystem
+}
+
+func (p WindowsCandidateProvider) StandardCandidates() []Candidate {
+	programFiles, ok := p.Environment.LookupEnv("ProgramFiles")
+	if !ok || strings.TrimSpace(programFiles) == "" {
+		return nil
+	}
+	return []Candidate{{Path: windowsPath(programFiles, "LLVM", "bin", "clangd.exe"), Source: SourceStandardInstall}}
+}
+
+func (p WindowsCandidateProvider) VisualStudioCandidates() []Candidate {
+	if p.FileSystem == nil {
+		return nil
+	}
+	programFiles, ok := p.Environment.LookupEnv("ProgramFiles")
+	if !ok || strings.TrimSpace(programFiles) == "" {
+		return nil
+	}
+	var candidates []Candidate
+	for _, architecture := range []string{"x64", "x86"} {
+		pattern := windowsPath(programFiles, "Microsoft Visual Studio", "*", "*", "VC", "Tools", "Llvm", architecture, "bin", "clangd.exe")
+		paths := p.FileSystem.Glob(pattern)
+		sort.Strings(paths)
+		for _, path := range paths {
+			if p.FileSystem.Exists(path) {
+				candidates = append(candidates, Candidate{Path: path, Source: SourceVisualStudio})
+			}
+		}
+	}
+	return candidates
+}
+
 // FileSystem provides existence checks for machine-independent discovery.
 type FileSystem interface {
 	Exists(path string) bool
@@ -276,8 +313,13 @@ func DiscoverCandidates(explicit string, env Environment, provider CandidateProv
 
 func joinClangd(path string) string {
 	path = strings.TrimRight(strings.TrimSpace(path), "/\\")
+	if path == "" {
+		return ""
+	}
 	if strings.HasSuffix(strings.ToLower(path), "clangd.exe") {
 		return path
 	}
 	return path + "/clangd.exe"
 }
+
+func windowsPath(elements ...string) string { return filepath.ToSlash(filepath.Join(elements...)) }
