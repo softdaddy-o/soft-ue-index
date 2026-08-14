@@ -299,10 +299,6 @@ func (a *App) generateReal(ctx context.Context, p registry.Project) (registry.Pr
 	if err != nil {
 		return p, err
 	}
-	dotnet, ok := toolchain.FindBundledDotnet(p.Engine.Root, hostFiles{})
-	if !ok {
-		return p, errors.New("bundled Unreal dotnet was not found")
-	}
 	ubt := filepath.Join(p.Engine.Root, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.dll")
 	cache, err := projectCache(p.ID)
 	if err != nil {
@@ -310,6 +306,37 @@ func (a *App) generateReal(ctx context.Context, p registry.Project) (registry.Pr
 	}
 	if err = os.MkdirAll(cache, 0o700); err != nil {
 		return p, err
+	}
+	projectRoot := filepath.Dir(p.UProject)
+	targetFile := filepath.Join(projectRoot, "Source", p.Target+".Target.cs")
+	metadataPresent := compdb.RiderMetadataAvailable(projectRoot, p.Target, targetFile)
+	metadataStale := compdb.RiderMetadataStale(projectRoot)
+	if metadataPresent && !metadataStale {
+		staging, stageErr := os.MkdirTemp(cache, "rider-")
+		if stageErr != nil {
+			return p, stageErr
+		}
+		clangCL := filepath.Join(filepath.Dir(selection.Path), "clang-cl.exe")
+		rider, stageErr := compdb.SynthesizeRider(compdb.RiderInput{ProjectRoot: projectRoot, EngineRoot: p.Engine.Root, Target: p.Target, TargetFile: targetFile, StagingDir: staging, ClangCL: clangCL})
+		if stageErr == nil {
+			_, stageErr = compdb.ValidateAndPromote(compdb.ValidationInput{StagingDir: staging, DestinationDir: cache, ProjectRoot: projectRoot, EngineRoot: p.Engine.Root})
+		}
+		if stageErr == nil {
+			p.Generation = registry.GenerationState{CompilationDatabase: filepath.Join(cache, compdb.DatabaseName), CacheDir: cache, LastFingerprint: rider.Fingerprint, LastGeneratedAt: time.Now()}
+			p.Toolchain = registry.Toolchain{ClangdPath: selection.Path, ClangdVersion: selection.Version.String()}
+			return p, nil
+		}
+		return p, fmt.Errorf("rider metadata generation: %w", stageErr)
+	}
+	if _, installedErr := os.Stat(filepath.Join(p.Engine.Root, "Engine", "Build", "InstalledBuild.txt")); installedErr == nil {
+		if metadataStale {
+			return p, errors.New("rider_metadata_stale: regenerate Rider project metadata before indexing")
+		}
+		return p, errors.New("rider_metadata_missing: generate Rider project metadata before indexing")
+	}
+	dotnet, ok := toolchain.FindBundledDotnet(p.Engine.Root, hostFiles{})
+	if !ok {
+		return p, errors.New("bundled Unreal dotnet was not found")
 	}
 	staging, err := compdb.Generate(ctx, compdb.ExecRunner{}, compdb.Input{DotNet: dotnet, UBTDLL: ubt, UProject: p.UProject, Target: p.Target, Configuration: p.Configuration, Platform: p.Platform}, cache, filepath.Join(cache, "ubt.log"))
 	if err != nil {
