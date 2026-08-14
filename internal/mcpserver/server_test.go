@@ -182,6 +182,18 @@ type countedReader struct {
 	reads int
 }
 
+type blockingReader struct{ closed chan struct{} }
+
+func (r *blockingReader) Read([]byte) (int, error) { <-r.closed; return 0, errors.New("closed") }
+func (r *blockingReader) Close() error {
+	select {
+	case <-r.closed:
+	default:
+		close(r.closed)
+	}
+	return nil
+}
+
 func (r *countedReader) Read(p []byte) (int, error) {
 	r.reads++
 	if len(r.data) == 0 {
@@ -205,6 +217,27 @@ func TestReadSymbolSourceStreamsWithoutReadingWholeFile(t *testing.T) {
 	}
 	if got.Text != "first" || r.reads > 2 {
 		t.Fatalf("reader was not bounded: %#v reads=%d", got, r.reads)
+	}
+}
+
+func TestReadSymbolSourceCancellationClosesBlockedReader(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "S.cpp")
+	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r := &blockingReader{closed: make(chan struct{})}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}, OpenFile: func(string) (io.ReadCloser, error) { return r, nil }})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := s.ReadSymbolSource(ctx, ReadSymbolSourceInput{ProjectID: "p", Path: path, StartLine: 1, EndLine: 1})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cancel error: %v", err)
+	}
+	select {
+	case <-r.closed:
+	case <-time.After(time.Second):
+		t.Fatal("reader was not closed")
 	}
 }
 

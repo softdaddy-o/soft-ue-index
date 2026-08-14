@@ -367,7 +367,18 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	if in.MaxBytes > 0 && in.MaxBytes < limit {
 		limit = in.MaxBytes
 	}
-	defer file.Close()
+	// Close unblocks a potentially stalled Read when the request context ends.
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+		case <-stopWatch:
+		}
+	}()
+	defer func() { close(stopWatch); <-watchDone; _ = file.Close() }()
 	scanner := bufio.NewScanner(file)
 	// A fixed scanner ceiling bounds a single hostile line independently of the
 	// caller's output budget. Long lines are reported as a bounded read error.
@@ -414,6 +425,9 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		if ctx.Err() != nil {
+			return ReadSymbolSourceResult{}, mapError(ctx.Err())
+		}
 		return ReadSymbolSourceResult{}, mapError(err)
 	}
 	if line < in.StartLine {
