@@ -12,6 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/softdaddy-o/soft-ue-index/internal/cli"
+	"github.com/softdaddy-o/soft-ue-index/internal/diagnostics"
 	"github.com/softdaddy-o/soft-ue-index/internal/lsp"
 	"github.com/softdaddy-o/soft-ue-index/internal/mcpserver"
 	"github.com/softdaddy-o/soft-ue-index/internal/registry"
@@ -86,6 +87,31 @@ func TestDoctorDefaultReturnsStructuredChecks(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"checks"`) || !strings.Contains(out.String(), `"engine"`) {
 		t.Fatalf("doctor %q", out.String())
+	}
+}
+
+func TestDoctorDoesNotLetHealthyProjectMaskBrokenProject(t *testing.T) {
+	env := testutil.NewFakeUE58(t)
+	store, err := registry.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokenRoot := filepath.Join(t.TempDir(), "broken-engine")
+	projects := []registry.Project{
+		{ID: "healthy", Name: "Healthy", UProject: env.UProject, Engine: registry.Engine{Root: env.EngineRoot}},
+		{ID: "broken", Name: "Broken", UProject: filepath.Join(t.TempDir(), "Broken.uproject"), Engine: registry.Engine{Root: brokenRoot}},
+	}
+	if err := store.Save(context.Background(), registry.Registry{Version: registry.CurrentVersion, Projects: projects}); err != nil {
+		t.Fatal(err)
+	}
+	reportAny, err := New(Dependencies{Store: store}).doctorReal(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := reportAny.(diagnostics.Report)
+	engine := report.Checks[0]
+	if engine.Status != diagnostics.Fail || !strings.Contains(engine.Detail, "broken (Broken)") || strings.Contains(engine.Detail, brokenRoot) {
+		t.Fatalf("engine check=%+v", engine)
 	}
 }
 
@@ -441,6 +467,28 @@ func TestProjectGenerationLockSerializesAppInstances(t *testing.T) {
 	}
 	if err := <-secondDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestExecRunnerBoundsOutputAndTimeout(t *testing.T) {
+	if os.Getenv("SOFT_UE_INDEX_PROBE_HELPER") == "1" {
+		if len(os.Args) > 0 && strings.Contains(strings.Join(os.Args, " "), "noisy") {
+			fmt.Print(strings.Repeat("x", 4096))
+			return
+		}
+		time.Sleep(5 * time.Second)
+		return
+	}
+	t.Setenv("SOFT_UE_INDEX_PROBE_HELPER", "1")
+	runner := execRunner{Timeout: 2 * time.Second, MaxCapture: 128}
+	out, err := runner.Run(os.Args[0], "-test.run=TestExecRunnerBoundsOutputAndTimeout", "--", "noisy")
+	if err != nil || len(out) != 128 {
+		t.Fatalf("noisy output len=%d err=%v", len(out), err)
+	}
+	runner.Timeout = 100 * time.Millisecond
+	_, err = runner.Run(os.Args[0], "-test.run=TestExecRunnerBoundsOutputAndTimeout", "--", "hung")
+	if err == nil || err.Error() != "toolchain probe timed out" {
+		t.Fatalf("timeout error=%v", err)
 	}
 }
 

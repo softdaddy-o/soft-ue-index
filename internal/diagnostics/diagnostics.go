@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -120,3 +121,17 @@ func RenderHuman(report Report) string {
 
 // RenderJSON encodes the exact Report used by RenderHuman.
 func RenderJSON(report Report) ([]byte, error) { return json.Marshal(report) }
+
+// WithProjectFailures annotates failed checks with stable project labels. It
+// deliberately accepts labels rather than paths so reports remain share-safe.
+func WithProjectFailures(report Report, failures map[string][]string) Report {
+	for i := range report.Checks {
+		labels := failures[report.Checks[i].Code]
+		if len(labels) == 0 {
+			continue
+		}
+		sort.Strings(labels)
+		report.Checks[i].Detail += " Failing projects: " + strings.Join(labels, ", ") + "."
+	}
+	return report
+}

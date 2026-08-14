@@ -65,6 +65,23 @@ func TestWindowsHostProbeWiresMSVCAndWindowsSDKIntoProbe(t *testing.T) {
 	}
 }
 
+func TestProjectFailuresAppearInSharedJSONAndHumanReport(t *testing.T) {
+	report := WithProjectFailures(Check(Probe{}), map[string][]string{"engine": {"broken (Broken)", "alpha (Alpha)"}})
+	human := RenderHuman(report)
+	jsonData, err := RenderJSON(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"alpha (Alpha)", "broken (Broken)"} {
+		if !strings.Contains(human, want) || !strings.Contains(string(jsonData), want) {
+			t.Fatalf("missing %q: human=%q json=%s", want, human, jsonData)
+		}
+	}
+	if strings.Index(human, "alpha") > strings.Index(human, "broken") {
+		t.Fatal("project labels are not deterministic")
+	}
+}
+
 func find(t *testing.T, report Report, code string) Result {
 	t.Helper()
 	for _, check := range report.Checks {

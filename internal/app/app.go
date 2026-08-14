@@ -2,6 +2,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -429,15 +430,35 @@ func (a *App) doctorReal(ctx context.Context, store *registry.Store) (any, error
 		return nil, err
 	}
 	probe := diagnostics.Probe{}
+	if len(r.Projects) > 0 {
+		probe.Engine, probe.UBT, probe.Dotnet, probe.LLVM, probe.GeneratedHeaders, probe.ResponseFiles = true, true, true, true, true, true
+	}
+	failures := map[string][]string{}
 	updates := map[string]registry.Toolchain{}
 	for i := range r.Projects {
 		p := &r.Projects[i]
+		label := p.ID
+		if p.Name != "" && p.Name != p.ID {
+			label += " (" + p.Name + ")"
+		}
 		_, engineErr := unreal.ValidateEngine(p.Engine.Root)
-		probe.Engine = probe.Engine || engineErr == nil
+		engineOK := engineErr == nil
+		probe.Engine = probe.Engine && engineOK
+		if !engineOK {
+			failures["engine"] = append(failures["engine"], label)
+		}
 		ubt := filepath.Join(p.Engine.Root, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.dll")
-		probe.UBT = probe.UBT || a.d.Files.Exists(ubt)
+		ubtOK := a.d.Files.Exists(ubt)
+		probe.UBT = probe.UBT && ubtOK
+		if !ubtOK {
+			failures["ubt"] = append(failures["ubt"], label)
+		}
 		_, dotnet := toolchain.FindBundledDotnet(p.Engine.Root, a.d.Files)
-		probe.Dotnet = probe.Dotnet || dotnet
+		probe.Dotnet = probe.Dotnet && dotnet
+		if !dotnet {
+			failures["dotnet"] = append(failures["dotnet"], label)
+		}
+		llvmOK := false
 		configPath := filepath.Join(p.Engine.Root, "Engine", "Config", "Windows", "Windows_SDK.json")
 		configData, configErr := os.ReadFile(configPath)
 		if configErr == nil {
@@ -445,7 +466,7 @@ func (a *App) doctorReal(ctx context.Context, store *registry.Store) (any, error
 			if parseErr == nil {
 				selection, selectErr := toolchain.SelectClangd(config, toolchain.DiscoverCandidates(p.Toolchain.ClangdPath, a.d.Environment, toolchain.WindowsCandidateProvider{Environment: a.d.Environment, FileSystem: a.d.Files}), a.d.Runner)
 				if selectErr == nil {
-					probe.LLVM = true
+					llvmOK = true
 					if p.Toolchain.ClangdPath != selection.Path || p.Toolchain.ClangdVersion != selection.Version.String() {
 						p.Toolchain.ClangdPath = selection.Path
 						p.Toolchain.ClangdVersion = selection.Version.String()
@@ -454,9 +475,21 @@ func (a *App) doctorReal(ctx context.Context, store *registry.Store) (any, error
 				}
 			}
 		}
+		probe.LLVM = probe.LLVM && llvmOK
+		if !llvmOK {
+			failures["llvm"] = append(failures["llvm"], label)
+		}
 		projectRoot := filepath.Dir(p.UProject)
-		probe.GeneratedHeaders = probe.GeneratedHeaders || hasBuildArtifact(projectRoot, ".generated.h")
-		probe.ResponseFiles = probe.ResponseFiles || hasBuildArtifact(projectRoot, ".rsp")
+		generatedOK := hasBuildArtifact(projectRoot, ".generated.h")
+		probe.GeneratedHeaders = probe.GeneratedHeaders && generatedOK
+		if !generatedOK {
+			failures["generated-headers"] = append(failures["generated-headers"], label)
+		}
+		responseOK := hasBuildArtifact(projectRoot, ".rsp")
+		probe.ResponseFiles = probe.ResponseFiles && responseOK
+		if !responseOK {
+			failures["response-files"] = append(failures["response-files"], label)
+		}
 	}
 	if len(updates) != 0 {
 		if err := store.Update(ctx, func(latest *registry.Registry) error {
@@ -471,7 +504,7 @@ func (a *App) doctorReal(ctx context.Context, store *registry.Store) (any, error
 		}
 	}
 	probe = (diagnostics.WindowsHostProbe{Environment: a.d.Environment, FileSystem: a.d.Files}).Apply(probe)
-	return diagnostics.Check(probe), nil
+	return diagnostics.WithProjectFailures(diagnostics.Check(probe), failures), nil
 }
 
 const maxDoctorBuildEntries = 10_000
@@ -630,12 +663,57 @@ func (a *App) reportWatchError(err error) {
 	fmt.Fprintf(a.d.ErrorOutput, "watch: %v\n", err)
 }
 
-// execRunner remains intentionally small so diagnostics commands never invoke a shell.
-type execRunner struct{}
+const defaultProbeTimeout = 5 * time.Second
+const defaultProbeCapture = 32 << 10
 
-func (execRunner) Run(name string, args ...string) (string, error) {
-	b, e := exec.Command(name, args...).CombinedOutput()
-	return string(b), e
+type execRunner struct {
+	Timeout    time.Duration
+	MaxCapture int
+}
+
+func (r execRunner) Run(name string, args ...string) (string, error) {
+	return r.run(name, args...)
+}
+
+func (r execRunner) run(name string, args ...string) (string, error) {
+	timeout := r.Timeout
+	if timeout <= 0 {
+		timeout = defaultProbeTimeout
+	}
+	limit := r.MaxCapture
+	if limit <= 0 {
+		limit = defaultProbeCapture
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	buffer := &probeBuffer{limit: limit}
+	cmd.Stdout, cmd.Stderr = buffer, buffer
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return buffer.String(), errors.New("toolchain probe timed out")
+	}
+	return buffer.String(), err
+}
+
+type probeBuffer struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (b *probeBuffer) Len() int       { return b.buffer.Len() }
+func (b *probeBuffer) String() string { return b.buffer.String() }
+
+func (b *probeBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := b.limit - b.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+		}
+		_, _ = b.buffer.Write(p)
+	}
+	return n, nil
 }
 
 // lspQueries is the small translation boundary between registry-backed
