@@ -280,8 +280,11 @@ func relevantDescriptors(project, engine string, targets []riderSelectedTarget) 
 				for _, path := range plugins {
 					set[path] = true
 				}
-				if strings.EqualFold(filepath.Base(current), "Source") && !strings.EqualFold(filepath.Dir(current), project) && !strings.EqualFold(filepath.Dir(current), engine) {
-					pluginRoot = filepath.Dir(current)
+				if strings.EqualFold(filepath.Base(current), "Source") {
+					candidate := filepath.Dir(current)
+					if within(candidate, filepath.Join(project, "Plugins")) || within(candidate, filepath.Join(engine, "Engine", "Plugins")) {
+						pluginRoot = candidate
+					}
 				}
 				if strings.EqualFold(current, boundary) {
 					break

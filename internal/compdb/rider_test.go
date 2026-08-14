@@ -183,7 +183,7 @@ func TestRiderMetadataStaleForTracksSelectedEnginePluginDescriptor(t *testing.T)
 	root := t.TempDir()
 	project, engine := filepath.Join(root, "Project"), filepath.Join(root, "Engine")
 	gameDir := filepath.Join(project, "Source", "Game")
-	pluginRoot := filepath.Join(engine, "Plugins", "Runtime", "EnginePlugin")
+	pluginRoot := filepath.Join(engine, "Engine", "Plugins", "Runtime", "EnginePlugin")
 	pluginModule := filepath.Join(pluginRoot, "Source", "EnginePlugin")
 	metadataDir := RiderMetadataDir(project)
 	for _, dir := range []string{gameDir, pluginModule, metadataDir} {
@@ -230,6 +230,41 @@ func TestRiderMetadataStaleForTracksSelectedEnginePluginDescriptor(t *testing.T)
 	stale, err = RiderMetadataStaleFor(project, engine, "GameEditor", targetFile, false)
 	if err != nil || !stale {
 		t.Fatalf("removed selected engine plugin descriptor should stale metadata: stale=%v err=%v", stale, err)
+	}
+}
+
+func TestRiderMetadataStaleForDoesNotInventDescriptorForOrdinaryEngineSource(t *testing.T) {
+	root := t.TempDir()
+	project, engine := filepath.Join(root, "Project"), filepath.Join(root, "UEInstall")
+	gameDir := filepath.Join(project, "Source", "Game")
+	coreDir := filepath.Join(engine, "Engine", "Source", "Runtime", "Core")
+	metadataDir := RiderMetadataDir(project)
+	for _, dir := range []string{gameDir, coreDir, metadataDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targetFile := filepath.Join(project, "Source", "GameEditor.Target.cs")
+	uproject := filepath.Join(project, "Game.uproject")
+	for _, path := range []string{targetFile, uproject} {
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metadata := `{"Name":"GameEditor","TargetFile":"` + filepath.ToSlash(targetFile) + `","Modules":{` +
+		`"Game":{"Directory":"` + filepath.ToSlash(gameDir) + `"},` +
+		`"Core":{"Directory":"` + filepath.ToSlash(coreDir) + `"}}}`
+	metadataPath := filepath.Join(metadataDir, "GameEditor.json")
+	if err := os.WriteFile(metadataPath, []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fresh := time.Now().Add(time.Hour)
+	if err := os.Chtimes(metadataPath, fresh, fresh); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := RiderMetadataStaleFor(project, engine, "GameEditor", targetFile, false)
+	if err != nil || stale {
+		t.Fatalf("ordinary Engine/Source module was treated as a plugin: stale=%v err=%v", stale, err)
 	}
 }
 
