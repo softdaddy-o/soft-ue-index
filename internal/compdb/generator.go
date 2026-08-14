@@ -83,6 +83,12 @@ func Generate(ctx context.Context, runner Runner, input Input, stagingRoot, logP
 	if err != nil {
 		return "", fmt.Errorf("create staging: %w", err)
 	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.RemoveAll(staging)
+		}
+	}()
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("open generation log: %w", err)
@@ -96,5 +102,6 @@ func Generate(ctx context.Context, runner Runner, input Input, stagingRoot, logP
 	if _, err := os.Stat(filepath.Join(staging, DatabaseName)); err != nil {
 		return "", fmt.Errorf("generated database: %w", err)
 	}
+	keep = true
 	return staging, nil
 }

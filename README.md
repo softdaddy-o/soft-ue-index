@@ -29,12 +29,12 @@ go build -o soft-ue-index.exe ./cmd/soft-ue-index
 
 ## Register and generate
 
-Run `doctor` first. JSON output is useful for automation.
+Register a project first, then run `doctor`; project-dependent engine and toolchain checks use the registry. JSON output is useful for automation.
 
 ```powershell
+soft-ue-index add ./MyGame/MyGame.uproject
 soft-ue-index doctor
 soft-ue-index doctor --json
-soft-ue-index add ./MyGame/MyGame.uproject
 soft-ue-index list
 soft-ue-index generate mygame
 soft-ue-index status mygame --json

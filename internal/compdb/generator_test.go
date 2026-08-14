@@ -2,6 +2,7 @@ package compdb
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -24,6 +25,23 @@ func TestBuildGenerateCommand(t *testing.T) {
 	want := []string{ubt, "-Mode=GenerateClangDatabase", "GameEditor", "Win64", "Development", "-Compiler=Clang", "-NoExecCodeGenActions"}
 	assertContainsInOrder(t, got.Args, want...)
 	assertContainsInOrder(t, got.Args, "-Project="+filepath.Join(root, "Game.uproject"), "-OutputDir="+filepath.Join(root, "staging"), "-OutputFilename=compile_commands.json")
+}
+
+func TestGenerateRemovesStagingOnRunnerFailure(t *testing.T) {
+	root := t.TempDir()
+	runner := fakeRunner{err: errors.New("runner failed")}
+	if _, err := Generate(context.Background(), runner, Input{}, root, filepath.Join(root, "generation.log")); err == nil {
+		t.Fatal("expected failure")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && len(entry.Name()) >= 7 && entry.Name()[:7] == "compdb-" {
+			t.Fatalf("leaked staging %s", entry.Name())
+		}
+	}
 }
 
 func TestGenerateUsesStagingAndPrivateLog(t *testing.T) {
@@ -69,11 +87,16 @@ func TestGenerateUsesStagingAndPrivateLog(t *testing.T) {
 	}
 }
 
-type fakeRunner struct{ run func(Command, io.Writer) }
+type fakeRunner struct {
+	run func(Command, io.Writer)
+	err error
+}
 
 func (r fakeRunner) Run(_ context.Context, command Command, log io.Writer) (string, string, error) {
-	r.run(command, log)
-	return "", "", nil
+	if r.run != nil {
+		r.run(command, log)
+	}
+	return "", "", r.err
 }
 
 func assertContainsInOrder(t *testing.T, got []string, want ...string) {

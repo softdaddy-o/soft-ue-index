@@ -358,6 +358,40 @@ func TestEndToEndTwoProjectsShareEngine(t *testing.T) {
 	}
 }
 
+func TestWatchRealKeepsHealthyProjectWhenAnotherCannotBeWatched(t *testing.T) {
+	root := t.TempDir()
+	healthy := filepath.Join(root, "healthy")
+	if err := os.MkdirAll(filepath.Join(healthy, "Source"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	a := New(Dependencies{ErrorOutput: &stderr, Generate: func(context.Context, registry.Project) (registry.Project, error) {
+		t.Fatal("unexpected generation")
+		return registry.Project{}, nil
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- a.watchReal(ctx, []registry.Project{
+			{ID: "bad", UProject: filepath.Join(root, "missing", "Bad.uproject"), Engine: registry.Engine{Root: filepath.Join(root, "missing-engine")}},
+			{ID: "good", UProject: filepath.Join(healthy, "Good.uproject"), Engine: registry.Engine{Root: healthy}},
+		})
+	}()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("healthy watcher was aborted: %v", err)
+	default:
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "watch project bad") {
+		t.Fatalf("missing isolated error: %q", stderr.String())
+	}
+}
+
 func mustGenerate(t *testing.T, generated <-chan string, want string) {
 	t.Helper()
 	select {

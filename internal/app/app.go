@@ -324,11 +324,13 @@ func (a *App) generateRealScoped(ctx context.Context, p registry.Project, engine
 	targetFile := ""
 	metadataStale, metadataErr := compdb.RiderMetadataStaleFor(projectRoot, p.Engine.Root, p.Target, targetFile, engineScopeFull)
 	metadataPresent := metadataErr == nil
+	var riderErr error
 	if metadataPresent && !metadataStale {
 		staging, stageErr := os.MkdirTemp(cache, "rider-")
 		if stageErr != nil {
 			return p, stageErr
 		}
+		defer os.RemoveAll(staging)
 		clangCL := filepath.Join(filepath.Dir(selection.Path), "clang-cl.exe")
 		rider, stageErr := compdb.SynthesizeRider(compdb.RiderInput{ProjectRoot: projectRoot, EngineRoot: p.Engine.Root, Target: p.Target, TargetFile: targetFile, StagingDir: staging, ResponseDir: filepath.Join(cache, "responses"), ClangCL: clangCL, EngineScopeFull: engineScopeFull})
 		if stageErr == nil {
@@ -339,28 +341,24 @@ func (a *App) generateRealScoped(ctx context.Context, p registry.Project, engine
 			p.Toolchain = registry.Toolchain{ClangdPath: selection.Path, ClangdVersion: selection.Version.String()}
 			return p, nil
 		}
-		return p, fmt.Errorf("rider metadata generation: %w", stageErr)
-	}
-	if _, installedErr := os.Stat(filepath.Join(p.Engine.Root, "Engine", "Build", "InstalledBuild.txt")); installedErr == nil {
-		if metadataErr != nil {
-			return p, fmt.Errorf("rider metadata unavailable: %w", metadataErr)
-		}
-		if metadataStale {
-			return p, errors.New("rider_metadata_stale: regenerate Rider project metadata before indexing")
-		}
-		return p, errors.New("rider_metadata_missing: generate Rider project metadata before indexing")
+		riderErr = fmt.Errorf("rider metadata generation: %w", stageErr)
+	} else if metadataErr != nil {
+		riderErr = fmt.Errorf("rider metadata unavailable: %w", metadataErr)
+	} else if metadataStale {
+		riderErr = errors.New("rider_metadata_stale")
 	}
 	dotnet, ok := toolchain.FindBundledDotnet(p.Engine.Root, hostFiles{})
 	if !ok {
-		return p, errors.New("bundled Unreal dotnet was not found")
+		return p, errors.Join(riderErr, errors.New("bundled Unreal dotnet was not found"))
 	}
 	staging, err := compdb.Generate(ctx, compdb.ExecRunner{}, compdb.Input{DotNet: dotnet, UBTDLL: ubt, UProject: p.UProject, Target: p.Target, Configuration: p.Configuration, Platform: p.Platform}, cache, filepath.Join(cache, "ubt.log"))
 	if err != nil {
-		return p, err
+		return p, errors.Join(riderErr, err)
 	}
+	defer os.RemoveAll(staging)
 	result, err := compdb.ValidateAndPromote(compdb.ValidationInput{StagingDir: staging, DestinationDir: cache, ProjectRoot: filepath.Dir(p.UProject), EngineRoot: p.Engine.Root})
 	if err != nil {
-		return p, err
+		return p, errors.Join(riderErr, err)
 	}
 	p.Generation = registry.GenerationState{CompilationDatabase: filepath.Join(cache, compdb.DatabaseName), CacheDir: cache, LastFingerprint: result.Fingerprint, LastGeneratedAt: time.Now()}
 	p.Toolchain = registry.Toolchain{ClangdPath: selection.Path, ClangdVersion: selection.Version.String()}
@@ -509,10 +507,19 @@ func (a *App) watchReal(ctx context.Context, projects []registry.Project) error 
 		return err
 	}
 	defer w.Close()
+	added := 0
+	var startupErr error
 	for _, p := range projects {
 		if err := w.AddProject(uewatch.ProjectRoots{ID: p.ID, ProjectRoot: filepath.Dir(p.UProject), EngineRoot: p.Engine.Root}); err != nil {
-			return err
+			projectErr := fmt.Errorf("watch project %s: %w", p.ID, err)
+			startupErr = errors.Join(startupErr, projectErr)
+			a.reportWatchError(projectErr)
+			continue
 		}
+		added++
+	}
+	if added == 0 && startupErr != nil {
+		return startupErr
 	}
 	<-ctx.Done()
 	return nil
