@@ -26,6 +26,8 @@ jobs:
         run: |
           $unformatted = & gofmt -l (Get-ChildItem -Recurse -Filter *.go | ForEach-Object FullName)
           if ($unformatted) { $unformatted; throw 'gofmt reported unformatted files' }
+      - name: Verify module files
+        run: go mod tidy -diff
       - name: Vet
         run: go vet ./...
       - name: Test with race detector

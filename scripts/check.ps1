@@ -8,6 +8,8 @@ if ($unformatted) {
     $unformatted
     throw 'gofmt reported unformatted files'
 }
+go mod tidy -diff
+if ($LASTEXITCODE -ne 0) { throw 'go.mod or go.sum is not tidy' }
 go vet ./...
 if ($LASTEXITCODE -ne 0) { throw 'go vet failed' }
 if (-not $SkipRace) {
