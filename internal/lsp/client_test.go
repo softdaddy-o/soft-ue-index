@@ -146,3 +146,20 @@ func TestClientRepliesToServerConfigurationRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+func TestServerRequestFloodIsBoundedAndCloseCompletes(t *testing.T) {
+	a, b := net.Pipe()
+	c := NewClient(a, a, ClientOptions{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: mustJSON(i), Method: "workspace/configuration", Params: mustJSON(map[string]any{"items": []any{}})}))
+		}
+		_ = b.Close()
+	}()
+	done := make(chan struct{})
+	go func() { c.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("close blocked by flooded requests")
+	}
+}

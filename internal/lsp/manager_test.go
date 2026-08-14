@@ -31,6 +31,7 @@ type fakeFactory struct {
 	mu   sync.Mutex
 	n    int
 	args [][]string
+	last *fakeProcess
 }
 type slowFactory struct {
 	base  fakeFactory
@@ -53,6 +54,7 @@ func (f *fakeFactory) Start(_ context.Context, _ string, args []string, _ string
 	f.mu.Unlock()
 	a, b := net.Pipe()
 	p := &fakeProcess{conn: a, done: make(chan struct{})}
+	f.last = p
 	go func() {
 		r := bufio.NewReader(b)
 		defer b.Close()
@@ -244,5 +246,38 @@ func TestCallerCancellationDoesNotOwnSharedProcess(t *testing.T) {
 	f.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("caller cancellation restarted process: %d", n)
+	}
+}
+func TestCloseDuringStartupReturnsClosedAndKillsProcess(t *testing.T) {
+	f := &slowFactory{ready: make(chan struct{})}
+	m := NewManager(f)
+	cfg := ProjectConfig{ID: "race", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"}
+	result := make(chan error, 1)
+	go func() { _, e := m.Client(context.Background(), cfg); result <- e }()
+	time.Sleep(10 * time.Millisecond)
+	m.Close()
+	close(f.ready)
+	if e := <-result; e != ErrClosed {
+		t.Fatalf("got %v", e)
+	}
+	f.base.mu.Lock()
+	p := f.base.last
+	f.base.mu.Unlock()
+	select {
+	case <-p.done:
+	case <-time.After(time.Second):
+		t.Fatal("detached process")
+	}
+}
+
+func TestExecFactoryClosesLogOnStartFailure(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "private.log")
+	_, err := ExecFactory{}.Start(context.Background(), filepath.Join(dir, "missing.exe"), nil, log)
+	if err == nil {
+		t.Fatal("expected start failure")
+	}
+	if err := os.Rename(log, filepath.Join(dir, "renamed.log")); err != nil {
+		t.Fatalf("log remains open: %v", err)
 	}
 }

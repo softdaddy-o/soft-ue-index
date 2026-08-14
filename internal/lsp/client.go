@@ -81,7 +81,8 @@ func (c *Client) readLoop() {
 			case <-c.done:
 				return
 			default:
-				_ = c.send(wireMessage{JSONRPC: "2.0", ID: m.ID, Error: &rpcError{Code: -32000, Message: "server request queue full"}})
+				// The peer is flooding requests while not reading replies. Dropping the
+				// excess is safer than blocking the sole transport reader indefinitely.
 			}
 			continue
 		}
