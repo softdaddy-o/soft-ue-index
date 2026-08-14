@@ -179,6 +179,146 @@ func TestRiderMetadataStaleForFullScopeIncludesUnrealEditorOnlyWhenRequested(t *
 	}
 }
 
+func TestRiderMetadataStaleForTracksSelectedEnginePluginDescriptor(t *testing.T) {
+	root := t.TempDir()
+	project, engine := filepath.Join(root, "Project"), filepath.Join(root, "Engine")
+	gameDir := filepath.Join(project, "Source", "Game")
+	pluginRoot := filepath.Join(engine, "Plugins", "Runtime", "EnginePlugin")
+	pluginModule := filepath.Join(pluginRoot, "Source", "EnginePlugin")
+	metadataDir := RiderMetadataDir(project)
+	for _, dir := range []string{gameDir, pluginModule, metadataDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targetFile := filepath.Join(project, "Source", "GameEditor.Target.cs")
+	uproject := filepath.Join(project, "Game.uproject")
+	descriptor := filepath.Join(pluginRoot, "EnginePlugin.uplugin")
+	for _, path := range []string{targetFile, uproject, descriptor} {
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metadata := `{"Name":"GameEditor","TargetFile":"` + filepath.ToSlash(targetFile) + `","Modules":{` +
+		`"Game":{"Directory":"` + filepath.ToSlash(gameDir) + `"},` +
+		`"EnginePlugin":{"Directory":"` + filepath.ToSlash(pluginModule) + `"}}}`
+	metadataPath := filepath.Join(metadataDir, "GameEditor.json")
+	if err := os.WriteFile(metadataPath, []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+	metadataTime := time.Now().Add(time.Hour)
+	if err := os.Chtimes(metadataPath, metadataTime, metadataTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(descriptor, metadataTime.Add(time.Hour), metadataTime.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := RiderMetadataStaleFor(project, engine, "GameEditor", targetFile, false)
+	if err != nil || !stale {
+		t.Fatalf("selected engine plugin descriptor should stale metadata: stale=%v err=%v", stale, err)
+	}
+	if err := os.Chtimes(descriptor, metadataTime.Add(-time.Hour), metadataTime.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	stale, err = RiderMetadataStaleFor(project, engine, "GameEditor", targetFile, false)
+	if err != nil || stale {
+		t.Fatalf("older selected engine plugin descriptor should be fresh: stale=%v err=%v", stale, err)
+	}
+	if err := os.Remove(descriptor); err != nil {
+		t.Fatal(err)
+	}
+	stale, err = RiderMetadataStaleFor(project, engine, "GameEditor", targetFile, false)
+	if err != nil || !stale {
+		t.Fatalf("removed selected engine plugin descriptor should stale metadata: stale=%v err=%v", stale, err)
+	}
+}
+
+func TestRiderMetadataStaleForDetectsMissingAndNewProjectInputs(t *testing.T) {
+	setup := func(t *testing.T) (project, engine, targetFile, rules, metadata string, metadataTime time.Time) {
+		t.Helper()
+		root := t.TempDir()
+		project, engine = filepath.Join(root, "Project"), filepath.Join(root, "Engine")
+		module := filepath.Join(project, "Source", "Game")
+		metadataDir := RiderMetadataDir(project)
+		for _, dir := range []string{module, engine, metadataDir} {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		targetFile, rules = filepath.Join(project, "Source", "GameEditor.Target.cs"), filepath.Join(module, "Game.Build.cs")
+		for _, path := range []string{targetFile, rules, filepath.Join(project, "Game.uproject")} {
+			if err := os.WriteFile(path, nil, 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		body := `{"Name":"GameEditor","TargetFile":"` + filepath.ToSlash(targetFile) + `","Modules":{"Game":{"Directory":"` + filepath.ToSlash(module) + `","Rules":"Game.Build.cs"}}}`
+		metadata = filepath.Join(metadataDir, "GameEditor.json")
+		if err := os.WriteFile(metadata, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		metadataTime = time.Now().Add(time.Hour)
+		if err := os.Chtimes(metadata, metadataTime, metadataTime); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	t.Run("missing selected target", func(t *testing.T) {
+		project, engine, target, _, _, _ := setup(t)
+		if err := os.Remove(target); err != nil {
+			t.Fatal(err)
+		}
+		stale, err := RiderMetadataStaleFor(project, engine, "GameEditor", target, false)
+		if err != nil || !stale {
+			t.Fatalf("stale=%v err=%v", stale, err)
+		}
+	})
+	t.Run("missing selected rules after rename", func(t *testing.T) {
+		project, engine, target, rules, _, metadataTime := setup(t)
+		newRules := filepath.Join(filepath.Dir(rules), "Renamed.Build.cs")
+		if err := os.Rename(rules, newRules); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(newRules, metadataTime.Add(time.Hour), metadataTime.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		stale, err := RiderMetadataStaleFor(project, engine, "GameEditor", target, false)
+		if err != nil || !stale {
+			t.Fatalf("stale=%v err=%v", stale, err)
+		}
+	})
+	t.Run("new module rules", func(t *testing.T) {
+		project, engine, target, _, _, metadataTime := setup(t)
+		newRules := filepath.Join(project, "Source", "NewModule", "NewModule.Build.cs")
+		if err := os.MkdirAll(filepath.Dir(newRules), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(newRules, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(newRules, metadataTime.Add(time.Hour), metadataTime.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		stale, err := RiderMetadataStaleFor(project, engine, "GameEditor", target, false)
+		if err != nil || !stale {
+			t.Fatalf("stale=%v err=%v", stale, err)
+		}
+	})
+	t.Run("new target rules", func(t *testing.T) {
+		project, engine, target, _, _, metadataTime := setup(t)
+		newTarget := filepath.Join(project, "Source", "Server.Target.cs")
+		if err := os.WriteFile(newTarget, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(newTarget, metadataTime.Add(time.Hour), metadataTime.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		stale, err := RiderMetadataStaleFor(project, engine, "GameEditor", target, false)
+		if err != nil || !stale {
+			t.Fatalf("stale=%v err=%v", stale, err)
+		}
+	})
+}
+
 func TestRiderMetadataStaleForRejectsMalformedAndAmbiguousTargets(t *testing.T) {
 	root := t.TempDir()
 	project, engine := filepath.Join(root, "P"), filepath.Join(root, "E")

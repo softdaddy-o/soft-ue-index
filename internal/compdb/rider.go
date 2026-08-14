@@ -168,7 +168,7 @@ func RiderMetadataStaleFor(projectRoot, engineRoot, target, targetFile string, e
 		return true, nil
 	}
 	for _, selected := range all {
-		if newer(selected.TargetFile, oldest) {
+		if missingOrNewer(selected.TargetFile, oldest) {
 			return true, nil
 		}
 		for _, module := range selected.Modules {
@@ -179,15 +179,21 @@ func RiderMetadataStaleFor(projectRoot, engineRoot, target, targetFile string, e
 			if !filepath.IsAbs(rules) {
 				rules = filepath.Join(module.Directory, rules)
 			}
-			if path, e := canonical(rules); e == nil && (within(path, project) || within(path, engine)) && newer(path, oldest) {
+			path, e := canonical(rules)
+			if e != nil || (!within(path, project) && !within(path, engine)) || missingOrNewer(path, oldest) {
 				return true, nil
 			}
 		}
 	}
-	// The project descriptor is always relevant. A plugin descriptor is only
-	// relevant when it is an ancestor of a selected project module.
-	for _, descriptor := range relevantDescriptors(project, all) {
-		if newer(descriptor, oldest) {
+	// Project rules and descriptors can introduce modules that are absent from
+	// the selected metadata, so compare the bounded project source/plugin trees.
+	if projectInputsNewer(project, oldest) {
+		return true, nil
+	}
+	// Engine-wide scans are intentionally avoided; only plugin descriptors on
+	// selected module ancestor paths are applicable.
+	for _, descriptor := range relevantDescriptors(project, engine, all) {
+		if missingOrNewer(descriptor, oldest) {
 			return true, nil
 		}
 	}
@@ -212,25 +218,79 @@ func newer(path string, than time.Time) bool {
 	return err == nil && info.ModTime().After(than)
 }
 
-func relevantDescriptors(project string, targets []riderSelectedTarget) []string {
+func missingOrNewer(path string, than time.Time) bool {
+	info, err := os.Stat(path)
+	return err != nil || info.ModTime().After(than)
+}
+
+func projectInputsNewer(project string, than time.Time) bool {
+	newerInput := false
+	for _, root := range []string{filepath.Join(project, "Source"), filepath.Join(project, "Plugins")} {
+		_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if entry.IsDir() {
+				switch entry.Name() {
+				case "Binaries", "Intermediate", "Saved", ".git":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			name := entry.Name()
+			if (strings.HasSuffix(name, ".Build.cs") || strings.HasSuffix(name, ".Target.cs") || strings.EqualFold(filepath.Ext(name), ".uplugin")) && newer(path, than) {
+				newerInput = true
+				return fs.SkipAll
+			}
+			return nil
+		})
+		if newerInput {
+			return true
+		}
+	}
+	return false
+}
+
+func relevantDescriptors(project, engine string, targets []riderSelectedTarget) []string {
 	set := map[string]bool{}
 	uprojects, _ := filepath.Glob(filepath.Join(project, "*.uproject"))
+	if len(uprojects) == 0 {
+		set[filepath.Join(project, filepath.Base(project)+".uproject")] = true
+	}
 	for _, path := range uprojects {
 		set[path] = true
 	}
 	for _, target := range targets {
 		for _, module := range target.Modules {
 			dir, err := canonical(module.Directory)
-			if err != nil || !within(dir, project) {
+			if err != nil {
 				continue
 			}
+			boundary := ""
+			if within(dir, project) {
+				boundary = project
+			} else if within(dir, engine) {
+				boundary = engine
+			} else {
+				continue
+			}
+			pluginRoot := ""
 			for current := dir; ; current = filepath.Dir(current) {
 				plugins, _ := filepath.Glob(filepath.Join(current, "*.uplugin"))
 				for _, path := range plugins {
 					set[path] = true
 				}
-				if strings.EqualFold(current, project) {
+				if strings.EqualFold(filepath.Base(current), "Source") && !strings.EqualFold(filepath.Dir(current), project) && !strings.EqualFold(filepath.Dir(current), engine) {
+					pluginRoot = filepath.Dir(current)
+				}
+				if strings.EqualFold(current, boundary) {
 					break
+				}
+			}
+			if pluginRoot != "" {
+				descriptors, _ := filepath.Glob(filepath.Join(pluginRoot, "*.uplugin"))
+				if len(descriptors) == 0 {
+					set[filepath.Join(pluginRoot, filepath.Base(pluginRoot)+".uplugin")] = true
 				}
 			}
 		}
