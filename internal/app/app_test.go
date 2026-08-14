@@ -66,3 +66,18 @@ func TestRemoveUnknownProjectFails(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestDoctorDefaultReturnsStructuredChecks(t *testing.T) {
+	store, err := registry.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	a := New(Dependencies{Store: store, Output: &out})
+	if err := a.Run(context.Background(), cli.Command{Name: "doctor", JSON: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"checks"`) || !strings.Contains(out.String(), `"engine"`) {
+		t.Fatalf("doctor %q", out.String())
+	}
+}

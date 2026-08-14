@@ -15,11 +15,13 @@ import (
 
 	"github.com/softdaddy-o/soft-ue-index/internal/cli"
 	"github.com/softdaddy-o/soft-ue-index/internal/compdb"
+	"github.com/softdaddy-o/soft-ue-index/internal/diagnostics"
 	"github.com/softdaddy-o/soft-ue-index/internal/lsp"
 	"github.com/softdaddy-o/soft-ue-index/internal/mcpserver"
 	"github.com/softdaddy-o/soft-ue-index/internal/registry"
 	"github.com/softdaddy-o/soft-ue-index/internal/toolchain"
 	"github.com/softdaddy-o/soft-ue-index/internal/unreal"
+	uewatch "github.com/softdaddy-o/soft-ue-index/internal/watch"
 )
 
 // Dependencies allow tests and embedders to replace effects without replacing
@@ -49,6 +51,12 @@ func New(d Dependencies) *App {
 	a := &App{d: d}
 	if a.d.Generate == nil {
 		a.d.Generate = a.generateReal
+	}
+	if a.d.Doctor == nil {
+		a.d.Doctor = a.doctorReal
+	}
+	if a.d.Watch == nil {
+		a.d.Watch = a.watchReal
 	}
 	return a
 }
@@ -110,6 +118,9 @@ func (a *App) add(ctx context.Context, c cli.Command) error {
 	if err := a.save(ctx, r); err != nil {
 		return err
 	}
+	if c.JSON {
+		return a.writeJSON(p)
+	}
 	fmt.Fprintf(a.d.Output, "added %s\n", p.ID)
 	return nil
 }
@@ -154,6 +165,9 @@ func (a *App) remove(ctx context.Context, c cli.Command) error {
 	if e = a.save(ctx, r); e != nil {
 		return e
 	}
+	if c.JSON {
+		return a.writeJSON(map[string]string{"removed": c.ProjectName})
+	}
 	fmt.Fprintf(a.d.Output, "removed %s\n", c.ProjectName)
 	return nil
 }
@@ -186,23 +200,23 @@ func (a *App) generate(ctx context.Context, c cli.Command) error {
 	if e = a.save(ctx, r); e != nil {
 		return e
 	}
+	if c.JSON {
+		return a.writeJSON(p)
+	}
 	fmt.Fprintf(a.d.Output, "generated %s\n", p.ID)
 	return nil
 }
 func (a *App) doctor(ctx context.Context, asJSON bool) error {
-	if a.d.Doctor == nil {
-		if asJSON {
-			return a.writeJSON(map[string]string{"status": "not configured"})
-		}
-		fmt.Fprintln(a.d.Output, "doctor is not configured")
-		return nil
-	}
 	v, e := a.d.Doctor(ctx, a.d.Store)
 	if e != nil {
 		return e
 	}
 	if asJSON {
 		return a.writeJSON(v)
+	}
+	if report, ok := v.(diagnostics.Report); ok {
+		_, e := fmt.Fprintln(a.d.Output, diagnostics.RenderHuman(report))
+		return e
 	}
 	fmt.Fprintln(a.d.Output, "toolchain checks complete")
 	return nil
@@ -211,9 +225,6 @@ func (a *App) watch(ctx context.Context) error {
 	r, e := a.load(ctx)
 	if e != nil {
 		return e
-	}
-	if a.d.Watch == nil {
-		return errors.New("watch is not configured")
 	}
 	return a.d.Watch(ctx, r.Projects)
 }
@@ -243,6 +254,18 @@ func (hostFiles) Exists(path string) bool {
 func (hostFiles) Glob(pattern string) []string { paths, _ := filepath.Glob(pattern); return paths }
 
 func (a *App) generateReal(ctx context.Context, p registry.Project) (registry.Project, error) {
+	sdk, err := os.ReadFile(filepath.Join(p.Engine.Root, "Engine", "Config", "Windows", "Windows_SDK.json"))
+	if err != nil {
+		return p, fmt.Errorf("read Windows SDK configuration: %w", err)
+	}
+	config, err := toolchain.ParseSDKConfig(sdk)
+	if err != nil {
+		return p, err
+	}
+	selection, err := toolchain.SelectClangd(config, toolchain.DiscoverCandidates(p.Toolchain.ClangdPath, osEnvironment{}, toolchain.WindowsCandidateProvider{Environment: osEnvironment{}, FileSystem: hostFiles{}}), execRunner{})
+	if err != nil {
+		return p, err
+	}
 	dotnet, ok := toolchain.FindBundledDotnet(p.Engine.Root, hostFiles{})
 	if !ok {
 		return p, errors.New("bundled Unreal dotnet was not found")
@@ -264,6 +287,7 @@ func (a *App) generateReal(ctx context.Context, p registry.Project) (registry.Pr
 		return p, err
 	}
 	p.Generation = registry.GenerationState{CompilationDatabase: filepath.Join(cache, compdb.DatabaseName), CacheDir: cache, LastFingerprint: result.Fingerprint, LastGeneratedAt: time.Now()}
+	p.Toolchain = registry.Toolchain{ClangdPath: selection.Path, ClangdVersion: selection.Version.String()}
 	return p, nil
 }
 func projectCache(id string) (string, error) {
@@ -278,6 +302,66 @@ func projectCache(id string) (string, error) {
 		return r
 	}, id)
 	return filepath.Join(root, "soft-ue-index", "projects", safe), nil
+}
+
+func (a *App) doctorReal(ctx context.Context, store *registry.Store) (any, error) {
+	r, err := store.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	probe := diagnostics.Probe{}
+	for _, p := range r.Projects {
+		probe.Engine = probe.Engine || p.Engine.Root != ""
+		ubt := filepath.Join(p.Engine.Root, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.dll")
+		probe.UBT = probe.UBT || hostFiles{}.Exists(ubt)
+		_, dotnet := toolchain.FindBundledDotnet(p.Engine.Root, hostFiles{})
+		probe.Dotnet = probe.Dotnet || dotnet
+		if p.Toolchain.ClangdPath != "" {
+			probe.LLVM = true
+		}
+		probe.GeneratedHeaders = probe.GeneratedHeaders || hasGlob(filepath.Join(filepath.Dir(p.UProject), "Intermediate", "Build", "**", "*.generated.h"))
+		probe.ResponseFiles = probe.ResponseFiles || hasGlob(filepath.Join(filepath.Dir(p.UProject), "Intermediate", "Build", "**", "*.rsp"))
+	}
+	probe = (diagnostics.WindowsHostProbe{Environment: osEnvironment{}, FileSystem: hostFiles{}}).Apply(probe)
+	return diagnostics.Check(probe), nil
+}
+func hasGlob(pattern string) bool { matches, _ := filepath.Glob(pattern); return len(matches) > 0 }
+
+type osEnvironment struct{}
+
+func (osEnvironment) LookupEnv(k string) (string, bool) { return os.LookupEnv(k) }
+
+type watchGenerator func(context.Context, string) error
+
+func (f watchGenerator) Generate(ctx context.Context, id string) error { return f(ctx, id) }
+func (a *App) watchReal(ctx context.Context, projects []registry.Project) error {
+	coordinator := uewatch.NewCoordinator(watchGenerator(func(run context.Context, id string) error {
+		r, i, err := a.find(run, id)
+		if err != nil {
+			return err
+		}
+		p, err := a.d.Generate(run, r.Projects[i])
+		if err != nil {
+			r.Projects[i].Generation.InvalidationReason = err.Error()
+			_ = a.save(context.Background(), r)
+			return err
+		}
+		r.Projects[i] = p
+		return a.save(run, r)
+	}), 2, 500*time.Millisecond)
+	defer coordinator.Close()
+	w, err := uewatch.NewWatcher(coordinator)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	for _, p := range projects {
+		if err := w.AddProject(uewatch.ProjectRoots{ID: p.ID, ProjectRoot: filepath.Dir(p.UProject), EngineRoot: p.Engine.Root}); err != nil {
+			return err
+		}
+	}
+	<-ctx.Done()
+	return nil
 }
 
 // execRunner remains intentionally small so diagnostics commands never invoke a shell.
