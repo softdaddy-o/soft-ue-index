@@ -341,7 +341,17 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 			return RiderResult{}, err
 		}
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].File < entries[j].File })
+	sort.Slice(entries, func(i, j int) bool {
+		leftClass, rightClass := translationUnitClass(entries[i].File, project, engine), translationUnitClass(entries[j].File, project, engine)
+		if leftClass != rightClass {
+			return leftClass < rightClass
+		}
+		left, right := strings.ToLower(entries[i].File), strings.ToLower(entries[j].File)
+		if left != right {
+			return left < right
+		}
+		return entries[i].File < entries[j].File
+	})
 	if err := WriteDatabase(filepath.Join(in.StagingDir, DatabaseName), entries); err != nil {
 		return RiderResult{}, err
 	}
@@ -360,6 +370,16 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 		return RiderResult{}, fmt.Errorf("rider metadata has insufficient coverage: project=%d engine=%d", result.ProjectTranslationUnits, result.EngineTranslationUnits)
 	}
 	return result, nil
+}
+
+func translationUnitClass(file, project, engine string) int {
+	if within(file, project) {
+		return 0
+	}
+	if within(file, engine) {
+		return 1
+	}
+	return 2
 }
 
 type riderResolvedModule struct {

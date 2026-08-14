@@ -45,8 +45,22 @@ func TestSynthesizeRiderSelectsExactTargetNotUE5Decoy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(data) == 0 {
-		t.Fatal("empty db")
+	var entries []Entry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries=%d", len(entries))
+	}
+	if !within(entries[0].File, project) || !within(entries[1].File, engine) {
+		t.Fatalf("project translation units must precede lexically earlier engine paths: %#v", entries)
+	}
+	repeated, err := SynthesizeRider(RiderInput{ProjectRoot: project, EngineRoot: engine, Target: "GameEditor", TargetFile: filepath.Join(project, "Source", "GameEditor.Target.cs"), StagingDir: staging, ClangCL: "C:/llvm/bin/clang-cl.exe"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.Fingerprint != result.Fingerprint {
+		t.Fatalf("fingerprint changed across identical runs: %q != %q", repeated.Fingerprint, result.Fingerprint)
 	}
 }
 
