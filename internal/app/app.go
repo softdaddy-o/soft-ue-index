@@ -300,9 +300,24 @@ func (a *App) mcp(ctx context.Context) error {
 	if a.d.MCP != nil {
 		return a.d.MCP(ctx, a.d.Store)
 	}
+	r, err := a.load(ctx)
+	if err != nil {
+		return err
+	}
 	manager := lsp.NewManager(nil)
 	defer manager.Close()
-	return mcpserver.New(mcpserver.Dependencies{Projects: a.d.Store, Queries: lspQueries{manager: manager}}).RunStdio(ctx, "dev")
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		if err := a.watchRealWithSink(watchCtx, r.Projects, manager); err != nil && watchCtx.Err() == nil {
+			a.reportWatchError(err)
+		}
+	}()
+	err = mcpserver.New(mcpserver.Dependencies{Projects: a.d.Store, Queries: lspQueries{manager: manager}}).RunStdio(ctx, "dev")
+	stopWatch()
+	<-watchDone
+	return err
 }
 func (a *App) writeJSON(v any) error {
 	b, e := json.Marshal(v)
@@ -499,7 +514,16 @@ func (osEnvironment) LookupEnv(k string) (string, bool) { return os.LookupEnv(k)
 type watchGenerator func(context.Context, string) error
 
 func (f watchGenerator) Generate(ctx context.Context, id string) error { return f(ctx, id) }
+
+type sourceChangeSink interface {
+	SourceFileChanged(string, string) error
+}
+
 func (a *App) watchReal(ctx context.Context, projects []registry.Project) error {
+	return a.watchRealWithSink(ctx, projects, nil)
+}
+
+func (a *App) watchRealWithSink(ctx context.Context, projects []registry.Project, sink sourceChangeSink) error {
 	coordinator := uewatch.NewCoordinatorWithOptions(watchGenerator(func(run context.Context, id string) error {
 		return a.withProjectGenerationLock(run, id, func() error {
 			r, i, err := a.find(run, id)
@@ -529,7 +553,13 @@ func (a *App) watchReal(ctx context.Context, projects []registry.Project) error 
 		}
 	}})
 	defer coordinator.Close()
-	w, err := uewatch.NewWatcher(coordinator)
+	w, err := uewatch.NewWatcherWithOptions(coordinator, uewatch.WatcherOptions{SourceWrite: func(change uewatch.SourceWrite) {
+		if sink != nil {
+			if err := sink.SourceFileChanged(change.ProjectID, change.Path); err != nil {
+				a.reportWatchError(err)
+			}
+		}
+	}})
 	if err != nil {
 		return err
 	}

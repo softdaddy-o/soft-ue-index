@@ -215,6 +215,13 @@ func (f appFiles) Glob(pattern string) []string {
 
 type appRunner struct{ outputs map[string]string }
 
+type recordingSourceChanges struct{ changes chan string }
+
+func (r recordingSourceChanges) SourceFileChanged(id, path string) error {
+	r.changes <- id + ":" + path
+	return nil
+}
+
 func (r appRunner) Run(name string, _ ...string) (string, error) {
 	if output, ok := r.outputs[name]; ok {
 		return output, nil
@@ -301,13 +308,25 @@ func TestEndToEndTwoProjectsShareEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() { watchDone <- a.watchReal(watchCtx, registryBefore.Projects) }()
+	sourceChanges := recordingSourceChanges{changes: make(chan string, 1)}
+	go func() { watchDone <- a.watchRealWithSink(watchCtx, registryBefore.Projects, sourceChanges) }()
 	// Give fsnotify time to attach its recursive source watches before mutating.
 	time.Sleep(100 * time.Millisecond)
 	if err := os.WriteFile(buildA, []byte("// changed\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	mustGenerate(t, generated, "game")
+	if err := os.WriteFile(projectSymbol, []byte("void UpdatedProjectSymbol() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case change := <-sourceChanges.changes:
+		if change != "game:"+projectSymbol {
+			t.Fatalf("source change=%q", change)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("source write was not forwarded to the live index")
+	}
 	select {
 	case got := <-generated:
 		t.Fatalf("unexpected generation after one project mutation: %s", got)
