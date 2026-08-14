@@ -9,11 +9,12 @@ const (
 	defaultMaxBytes = 32 * 1024
 	// minimumResponseBytes leaves room for the SDK's newline-delimited JSON-RPC
 	// envelope as well as a useful structured tool result.
-	minimumResponseBytes     = 512
-	protocolEnvelopeBytes    = 256
-	defaultMaxRequestBytes   = 64 * 1024
-	defaultMaxRequestIDBytes = 128
-	maxRequestIDTokenBytes   = protocolEnvelopeBytes - 128
+	minimumResponseBytes      = 512
+	protocolEnvelopeBytes     = 256
+	defaultMaxRequestBytes    = 64 * 1024
+	defaultMaxRequestIDBytes  = 128
+	defaultMaxConcurrentTools = 8
+	maxRequestIDTokenBytes    = protocolEnvelopeBytes - 128
 )
 
 // Limits bound every MCP request and response so a malformed client cannot
@@ -27,9 +28,10 @@ type Limits struct {
 	MaxRequestBytes  int
 	// MaxRequestIDBytes limits the raw JSON token bytes of a string request ID,
 	// including quotes and escapes, before the SDK can echo it in a response.
-	MaxRequestIDBytes int
-	MaxCallDepth      int
-	Timeout           time.Duration
+	MaxRequestIDBytes  int
+	MaxCallDepth       int
+	MaxConcurrentTools int
+	Timeout            time.Duration
 }
 
 func (l Limits) normalized() Limits {
@@ -56,6 +58,9 @@ func (l Limits) normalized() Limits {
 	}
 	if l.MaxCallDepth <= 0 {
 		l.MaxCallDepth = 3
+	}
+	if l.MaxConcurrentTools <= 0 {
+		l.MaxConcurrentTools = defaultMaxConcurrentTools
 	}
 	if l.Timeout <= 0 {
 		l.Timeout = 15 * time.Second

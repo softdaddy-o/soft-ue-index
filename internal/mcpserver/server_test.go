@@ -24,6 +24,41 @@ func (f fakeProjects) Load(context.Context) (registry.Registry, error) {
 	return registry.Registry{Version: registry.CurrentVersion, Projects: f.projects}, nil
 }
 
+func TestToolAdmissionRejectsExcessAndReleasesPermits(t *testing.T) {
+	s := New(Dependencies{Limits: Limits{MaxConcurrentTools: 1}})
+	entered, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := admitted(s, func() (string, error) { close(entered); <-release; return "ok", nil })
+		done <- err
+	}()
+	<-entered
+	if _, _, err := admitted(s, func() (string, error) { t.Fatal("saturated call executed"); return "", nil }); err == nil || err.Error() != ErrToolBusy.Error() {
+		t.Fatalf("busy error=%v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := admitted(s, func() (string, error) { return "", errors.New("query failed") }); err == nil {
+		t.Fatal("expected mapped query error")
+	}
+	if _, _, err := admitted(s, func() (string, error) { return "ok", nil }); err != nil {
+		t.Fatalf("permit leaked after error: %v", err)
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic")
+			}
+		}()
+		_, _, _ = admitted(s, func() (string, error) { panic("boom") })
+	}()
+	if _, _, err := admitted(s, func() (string, error) { return "ok", nil }); err != nil {
+		t.Fatalf("permit leaked after panic: %v", err)
+	}
+}
+
 func TestReadSymbolSourceRejectsOutsideRootAndBoundsBytes(t *testing.T) {
 	root := t.TempDir()
 	projectFile := filepath.Join(root, "Alpha.uproject")

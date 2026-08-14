@@ -20,52 +20,49 @@ func (s *Server) MCPServer(version string) *mcp.Server {
 	mcp.AddTool(m, &mcp.Tool{Name: "list_projects", Description: "List registered Unreal projects."}, func(ctx context.Context, _ *mcp.CallToolRequest, in struct {
 		MaxItems int `json:"max_items,omitempty"`
 	}) (*mcp.CallToolResult, ListProjectsResult, error) {
-		r, e := s.ListProjects(ctx, in.MaxItems)
-		res, e := s.toolResult(r, e)
-		return res, r, e
+		return admitted(s, func() (ListProjectsResult, error) { return s.ListProjects(ctx, in.MaxItems) })
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "project_status", Description: "Get compilation database status for one explicit project."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ProjectStatusInput) (*mcp.CallToolResult, ProjectStatusResult, error) {
-		r, e := s.ProjectStatus(ctx, in)
-		res, e := s.toolResult(r, e)
-		return res, r, e
+		return admitted(s, func() (ProjectStatusResult, error) { return s.ProjectStatus(ctx, in) })
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "search_symbols", Description: "Search symbols in one explicit project."}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchSymbolsInput) (*mcp.CallToolResult, SearchSymbolsResult, error) {
-		r, e := s.SearchSymbols(ctx, in)
-		res, e := s.toolResult(r, e)
-		return res, r, e
+		return admitted(s, func() (SearchSymbolsResult, error) { return s.SearchSymbols(ctx, in) })
 	})
 	addLocations(m, "find_definition", "Find a definition.", s.FindDefinition, s)
 	addLocations(m, "find_references", "Find references.", s.FindReferences, s)
 	addLocations(m, "find_implementations", "Find implementations.", s.FindImplementations, s)
 	mcp.AddTool(m, &mcp.Tool{Name: "document_symbols", Description: "List document symbols for a project or engine source file."}, func(ctx context.Context, _ *mcp.CallToolRequest, in PathQueryInput) (*mcp.CallToolResult, DocumentSymbolsResult, error) {
-		r, e := s.DocumentSymbols(ctx, in)
-		res, e := s.toolResult(r, e)
-		return res, r, e
+		return admitted(s, func() (DocumentSymbolsResult, error) { return s.DocumentSymbols(ctx, in) })
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "hover", Description: "Get hover information at a source position."}, func(ctx context.Context, _ *mcp.CallToolRequest, in LocationQueryInput) (*mcp.CallToolResult, HoverResult, error) {
-		r, e := s.Hover(ctx, in)
-		res, e := s.toolResult(r, e)
-		return res, r, e
+		return admitted(s, func() (HoverResult, error) { return s.Hover(ctx, in) })
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "call_hierarchy", Description: "Prepare, list incoming, or list outgoing calls at a source position."}, func(ctx context.Context, _ *mcp.CallToolRequest, in CallHierarchyInput) (*mcp.CallToolResult, CallHierarchyResult, error) {
-		r, e := s.CallHierarchy(ctx, in)
-		res, e := s.toolResult(r, e)
-		return res, r, e
+		return admitted(s, func() (CallHierarchyResult, error) { return s.CallHierarchy(ctx, in) })
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "read_symbol_source", Description: "Read a line-bounded source excerpt inside the selected project or engine."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ReadSymbolSourceInput) (*mcp.CallToolResult, ReadSymbolSourceResult, error) {
-		r, e := s.ReadSymbolSource(ctx, in)
-		res, e := s.toolResult(r, e)
-		return res, r, e
+		return admitted(s, func() (ReadSymbolSourceResult, error) { return s.ReadSymbolSource(ctx, in) })
 	})
 	return m
 }
 
 func addLocations(m *mcp.Server, name, description string, f func(context.Context, LocationQueryInput) (LocationsResult, error), s *Server) {
 	mcp.AddTool(m, &mcp.Tool{Name: name, Description: description}, func(ctx context.Context, _ *mcp.CallToolRequest, in LocationQueryInput) (*mcp.CallToolResult, LocationsResult, error) {
-		r, e := f(ctx, in)
-		res, e := s.toolResult(r, e)
-		return res, r, e
+		return admitted(s, func() (LocationsResult, error) { return f(ctx, in) })
 	})
+}
+
+func admitted[T any](s *Server, run func() (T, error)) (*mcp.CallToolResult, T, error) {
+	release, err := s.admitTool()
+	if err != nil {
+		var zero T
+		result, mapped := s.toolResult(zero, err)
+		return result, zero, mapped
+	}
+	defer release()
+	value, err := run()
+	result, err := s.toolResult(value, err)
+	return result, value, err
 }
 
 // toolResult reserves a conservative 256-byte JSON-RPC envelope for a normal

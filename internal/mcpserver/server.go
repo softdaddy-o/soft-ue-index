@@ -24,6 +24,7 @@ var (
 	ErrPathForbidden   = errors.New("path is outside the selected project or engine")
 	ErrLimitExceeded   = errors.New("request exceeds configured limit")
 	ErrInvalidLimits   = errors.New("configured response limit is too small")
+	ErrToolBusy        = errors.New("too many concurrent tool calls")
 )
 
 type ProjectLoader interface {
@@ -50,18 +51,29 @@ type Dependencies struct {
 }
 
 type Server struct {
-	projects ProjectLoader
-	queries  Queries
-	openFile func(string) (io.ReadCloser, error)
-	limits   Limits
-	limitErr error
+	projects  ProjectLoader
+	queries   Queries
+	openFile  func(string) (io.ReadCloser, error)
+	limits    Limits
+	limitErr  error
+	admission chan struct{}
 }
 
 func New(d Dependencies) *Server {
 	if d.OpenFile == nil {
 		d.OpenFile = func(path string) (io.ReadCloser, error) { return os.Open(path) }
 	}
-	return &Server{projects: d.Projects, queries: d.Queries, openFile: d.OpenFile, limits: d.Limits.normalized(), limitErr: d.Limits.validate()}
+	limits := d.Limits.normalized()
+	return &Server{projects: d.Projects, queries: d.Queries, openFile: d.OpenFile, limits: limits, limitErr: d.Limits.validate(), admission: make(chan struct{}, limits.MaxConcurrentTools)}
+}
+
+func (s *Server) admitTool() (func(), error) {
+	select {
+	case s.admission <- struct{}{}:
+		return func() { <-s.admission }, nil
+	default:
+		return nil, ErrToolBusy
+	}
 }
 
 type SearchSymbolsInput struct {
@@ -549,7 +561,7 @@ func mapError(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("request timed out: %w", err)
 	}
-	if errors.Is(err, ErrProjectRequired) || errors.Is(err, ErrProjectNotFound) || errors.Is(err, ErrPathForbidden) || errors.Is(err, ErrLimitExceeded) {
+	if errors.Is(err, ErrProjectRequired) || errors.Is(err, ErrProjectNotFound) || errors.Is(err, ErrPathForbidden) || errors.Is(err, ErrLimitExceeded) || errors.Is(err, ErrToolBusy) {
 		return err
 	}
 	return errors.New("code intelligence request failed")
