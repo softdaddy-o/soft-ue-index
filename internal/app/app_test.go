@@ -240,6 +240,7 @@ func TestLSPQueriesRejectCorruptRegistryCacheBeforeFilesystemEffects(t *testing.
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			t.Fatal(err)
 		}
+	}
 	p := registry.Project{ID: "game", UProject: filepath.Join(projectRoot, "Game.uproject"), Engine: registry.Engine{Root: engineRoot}, Toolchain: registry.Toolchain{ClangdPath: "clangd.exe"}}
 	for _, cache := range []string{projectRoot, engineRoot} {
 		t.Run(filepath.Base(cache), func(t *testing.T) {

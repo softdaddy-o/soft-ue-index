@@ -744,26 +744,28 @@ func validateProjectCache(p registry.Project) error {
 		return err
 	}
 	cacheRoot = filepath.Join(cacheRoot, "soft-ue-index", "projects")
-	resolve := func(path string) string {
-		path = filepath.Clean(path)
-		if v, e := filepath.EvalSymlinks(path); e == nil {
-			return filepath.Clean(v)
+	equalClean := func(a, b string) bool {
+		a, b = filepath.Clean(a), filepath.Clean(b)
+		if runtime.GOOS == "windows" {
+			return strings.EqualFold(a, b)
 		}
-		return path
+		return a == b
 	}
-	expectedResolved, rootResolved := resolve(expected), resolve(cacheRoot)
-	rel, err := filepath.Rel(rootResolved, expectedResolved)
-	if err != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	expectedDatabase := filepath.Join(expected, compdb.DatabaseName)
+	if !equalClean(p.Generation.CacheDir, expected) || !equalClean(p.Generation.CompilationDatabase, expectedDatabase) {
+		return errors.New("project cache does not match registered project")
+	}
+	expectedResolved, err := canonicalResultPath(expected)
+	if err != nil {
+		return err
+	}
+	rootResolved, err := canonicalResultPath(cacheRoot)
+	if err != nil || !pathWithinRoot(expectedResolved, rootResolved) {
 		return errors.New("project cache escapes user cache root")
 	}
-	equal := func(a, b string) bool {
-		if runtime.GOOS == "windows" {
-			return strings.EqualFold(resolve(a), resolve(b))
-		}
-		return resolve(a) == resolve(b)
-	}
-	if !equal(p.Generation.CacheDir, expected) || !equal(p.Generation.CompilationDatabase, filepath.Join(expected, compdb.DatabaseName)) {
-		return errors.New("project cache does not match registered project")
+	databaseResolved, err := canonicalResultPath(expectedDatabase)
+	if err != nil || !pathWithinRoot(databaseResolved, expectedResolved) {
+		return errors.New("compilation database escapes project cache")
 	}
 	return nil
 }
