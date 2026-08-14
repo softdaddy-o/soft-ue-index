@@ -49,6 +49,39 @@ func (v Version) Compare(other Version) int {
 	return 0
 }
 
+// Range is an inclusive compiler version range from Windows_SDK.json.
+type Range struct {
+	Minimum Version
+	Maximum Version
+}
+
+func (r Range) String() string { return r.Minimum.String() + "-" + r.Maximum.String() }
+
+// Contains reports whether version is within the inclusive range.
+func (r Range) Contains(version Version) bool {
+	return r.Minimum.Compare(version) <= 0 && version.Compare(r.Maximum) <= 0
+}
+
+// ParseRange accepts the inclusive A-B version ranges used by PreferredClangVersions.
+func ParseRange(text string) (Range, error) {
+	parts := strings.Split(strings.TrimSpace(text), "-")
+	if len(parts) != 2 {
+		return Range{}, fmt.Errorf("invalid version range %q", text)
+	}
+	minimum, err := ParseVersion(parts[0])
+	if err != nil {
+		return Range{}, err
+	}
+	maximum, err := ParseVersion(parts[1])
+	if err != nil {
+		return Range{}, err
+	}
+	if minimum.Compare(maximum) > 0 {
+		return Range{}, fmt.Errorf("invalid version range %q: minimum exceeds maximum", text)
+	}
+	return Range{Minimum: minimum, Maximum: maximum}, nil
+}
+
 // ParseVersion accepts the numeric version forms used by UE configuration and clangd output.
 func ParseVersion(text string) (Version, error) {
 	matches := versionPattern.FindStringSubmatch(text)
@@ -70,31 +103,45 @@ func ParseVersion(text string) (Version, error) {
 
 // Config contains the clang versions requested by the engine's Windows_SDK.json.
 type Config struct {
-	Preferred Version
-	Minimum   Version
+	// Preferred is retained for callers of the earlier single-version configuration API.
+	Preferred       Version
+	PreferredRanges []Range
+	Minimum         Version
 }
 
 // ParseSDKConfig reads the clang requirements from Engine/Config/Windows/Windows_SDK.json.
 func ParseSDKConfig(contents []byte) (Config, error) {
 	var raw struct {
-		Preferred string `json:"PreferredClangVersion"`
-		Minimum   string `json:"MinimumClangVersion"`
+		Preferred       string   `json:"PreferredClangVersion"`
+		PreferredRanges []string `json:"PreferredClangVersions"`
+		Minimum         string   `json:"MinimumClangVersion"`
 	}
 	if err := json.Unmarshal(contents, &raw); err != nil {
 		return Config{}, fmt.Errorf("%w: %v", ErrMalformedSDKConfig, err)
-	}
-	preferred, err := ParseVersion(raw.Preferred)
-	if err != nil {
-		return Config{}, fmt.Errorf("%w: preferred clang version: %v", ErrMalformedSDKConfig, err)
 	}
 	minimum, err := ParseVersion(raw.Minimum)
 	if err != nil {
 		return Config{}, fmt.Errorf("%w: minimum clang version: %v", ErrMalformedSDKConfig, err)
 	}
-	if preferred.Compare(minimum) < 0 {
-		return Config{}, fmt.Errorf("%w: preferred clang version is below minimum", ErrMalformedSDKConfig)
+	rangeTexts := raw.PreferredRanges
+	if len(rangeTexts) == 0 && raw.Preferred != "" {
+		rangeTexts = []string{raw.Preferred + "-" + raw.Preferred}
 	}
-	return Config{Preferred: preferred, Minimum: minimum}, nil
+	if len(rangeTexts) == 0 {
+		return Config{}, fmt.Errorf("%w: preferred clang versions are required", ErrMalformedSDKConfig)
+	}
+	ranges := make([]Range, 0, len(rangeTexts))
+	for _, text := range rangeTexts {
+		versionRange, rangeErr := ParseRange(text)
+		if rangeErr != nil {
+			return Config{}, fmt.Errorf("%w: preferred clang range: %v", ErrMalformedSDKConfig, rangeErr)
+		}
+		if versionRange.Maximum.Compare(minimum) < 0 {
+			return Config{}, fmt.Errorf("%w: preferred clang range is below minimum", ErrMalformedSDKConfig)
+		}
+		ranges = append(ranges, versionRange)
+	}
+	return Config{Preferred: ranges[0].Minimum, PreferredRanges: ranges, Minimum: minimum}, nil
 }
 
 // Source describes where a clangd executable was discovered.
@@ -126,10 +173,15 @@ type Selection struct {
 	Version Version
 }
 
-// SelectClangd executes each candidate and selects the engine-preferred version when present.
-// If it is absent, the first candidate at or above the engine minimum wins.
+// SelectClangd executes candidates and selects the first source candidate in the highest-priority
+// engine range. A version at the minimum but outside every configured range is not compatible.
 func SelectClangd(config Config, candidates []Candidate, runner Runner) (Selection, error) {
-	compatible := make([]Selection, 0, len(candidates))
+	ranges := config.PreferredRanges
+	if len(ranges) == 0 && config.Preferred != (Version{}) {
+		ranges = []Range{{Minimum: config.Preferred, Maximum: config.Preferred}}
+	}
+	selections := make([]Selection, len(ranges))
+	found := make([]bool, len(ranges))
 	for _, candidate := range candidates {
 		output, err := runner.Run(candidate.Path, "--version")
 		if err != nil {
@@ -143,14 +195,17 @@ func SelectClangd(config Config, candidates []Candidate, runner Runner) (Selecti
 		if err != nil || version.Compare(config.Minimum) < 0 {
 			continue
 		}
-		selection := Selection{Path: candidate.Path, Source: candidate.Source, Version: version}
-		if version.Compare(config.Preferred) == 0 {
-			return selection, nil
+		for index, versionRange := range ranges {
+			if !found[index] && versionRange.Contains(version) {
+				selections[index] = Selection{Path: candidate.Path, Source: candidate.Source, Version: version}
+				found[index] = true
+			}
 		}
-		compatible = append(compatible, selection)
 	}
-	if len(compatible) != 0 {
-		return compatible[0], nil
+	for index := range selections {
+		if found[index] {
+			return selections[index], nil
+		}
 	}
 	return Selection{}, ErrCompatibleClangdNotFound
 }

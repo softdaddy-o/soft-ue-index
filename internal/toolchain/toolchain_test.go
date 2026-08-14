@@ -30,6 +30,37 @@ func TestParseSDKConfigReadsPreferredAndMinimumClangVersions(t *testing.T) {
 	}
 }
 
+func TestParseSDKConfigPreservesPreferredClangRangePriority(t *testing.T) {
+	config, err := ParseSDKConfig([]byte(`{"PreferredClangVersions":["20.1.8-20.999","20.1.0-20.1.7","19.1.0-19.999"],"MinimumClangVersion":"19.1.0"}`))
+	if err != nil {
+		t.Fatalf("ParseSDKConfig() error = %v", err)
+	}
+	want := []string{"20.1.8-20.999.0", "20.1.0-20.1.7", "19.1.0-19.999.0"}
+	if len(config.PreferredRanges) != len(want) {
+		t.Fatalf("ranges = %#v, want %d ranges", config.PreferredRanges, len(want))
+	}
+	for index, value := range want {
+		if got := config.PreferredRanges[index].String(); got != value {
+			t.Errorf("range %d = %q, want %q", index, got, value)
+		}
+	}
+}
+
+func TestParseRangeIncludesBothBoundaries(t *testing.T) {
+	rangeValue, err := ParseRange("20.1.0-20.1.7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{"20.1.0", "20.1.7"} {
+		if !rangeValue.Contains(mustVersion(t, version)) {
+			t.Errorf("range should include %s", version)
+		}
+	}
+	if rangeValue.Contains(mustVersion(t, "20.1.8")) {
+		t.Error("range should exclude 20.1.8")
+	}
+}
+
 func TestParseSDKConfigRejectsMalformedVersion(t *testing.T) {
 	_, err := ParseSDKConfig([]byte(`{"PreferredClangVersion":"eighteen","MinimumClangVersion":"16.0.6"}`))
 	if !errors.Is(err, ErrMalformedSDKConfig) {
@@ -53,8 +84,29 @@ func TestSelectClangdPrefersEnginePreferredVersionOverNewerCompatibleCandidate(t
 	}
 }
 
+func TestSelectClangdUsesEngineRangePriorityBeforeCandidateDiscoveryOrder(t *testing.T) {
+	config := Config{Minimum: mustVersion(t, "19.1.0"), PreferredRanges: []Range{
+		mustRange(t, "20.1.8-20.999"), mustRange(t, "20.1.0-20.1.7"), mustRange(t, "19.1.0-19.999"),
+	}}
+	selection, err := SelectClangd(config, []Candidate{{Path: "nineteen", Source: SourceExplicit}, {Path: "twenty", Source: SourcePath}}, fakeRunner{outputs: map[string]string{"nineteen": "clangd version 19.1.0", "twenty": "clangd version 20.1.2"}})
+	if err != nil {
+		t.Fatalf("SelectClangd() error = %v", err)
+	}
+	if got, want := selection.Path, "twenty"; got != want {
+		t.Errorf("Path = %q, want %q", got, want)
+	}
+}
+
+func TestSelectClangdRejectsVersionAboveConfiguredPreferredRanges(t *testing.T) {
+	config := Config{Minimum: mustVersion(t, "19.1.0"), PreferredRanges: []Range{mustRange(t, "19.1.0-19.999")}}
+	_, err := SelectClangd(config, []Candidate{{Path: "too-new"}}, fakeRunner{outputs: map[string]string{"too-new": "clangd version 21.0.0"}})
+	if !errors.Is(err, ErrCompatibleClangdNotFound) {
+		t.Fatalf("SelectClangd() error = %v, want ErrCompatibleClangdNotFound", err)
+	}
+}
+
 func TestSelectClangdUsesFirstCompatibleCandidateWhenPreferredIsUnavailable(t *testing.T) {
-	selection, err := SelectClangd(Config{Preferred: mustVersion(t, "18.1.8"), Minimum: mustVersion(t, "16.0.6")}, []Candidate{
+	selection, err := SelectClangd(Config{Minimum: mustVersion(t, "16.0.6"), PreferredRanges: []Range{mustRange(t, "16.0.6-19.999")}}, []Candidate{
 		{Path: "first", Source: SourceExplicit},
 		{Path: "second", Source: SourcePath},
 	}, fakeRunner{outputs: map[string]string{"first": "clangd version 17.0.0", "second": "clangd version 19.1.0"}})
@@ -117,6 +169,15 @@ func mustVersion(t *testing.T, text string) Version {
 		t.Fatal(err)
 	}
 	return version
+}
+
+func mustRange(t *testing.T, text string) Range {
+	t.Helper()
+	rangeValue, err := ParseRange(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rangeValue
 }
 
 type fakeEnvironment map[string]string
