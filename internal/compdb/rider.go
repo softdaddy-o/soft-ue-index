@@ -286,6 +286,12 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 		all = append(all, riderResolvedModule{name, d, module.riderRules})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].dir < all[j].dir })
+	allAPIDefinitions := make([]string, 0)
+	for _, module := range all {
+		allAPIDefinitions = append(allAPIDefinitions, module.rules.ApiDefinitions...)
+	}
+	sort.Strings(allAPIDefinitions)
+	rootDefinitions := unique(append(stringsFromJSON(target.EnvironmentDefinitions), allAPIDefinitions...))
 	if err := os.MkdirAll(in.StagingDir, 0700); err != nil {
 		return RiderResult{}, err
 	}
@@ -315,7 +321,7 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 			if mod == nil {
 				return nil
 			}
-			content := response(*mod, compiler, stringsFromJSON(target.EnvironmentIncludePaths), stringsFromJSON(target.EnvironmentDefinitions))
+			content := response(*mod, compiler, stringsFromJSON(target.EnvironmentIncludePaths), rootDefinitions)
 			responseDir := in.ResponseDir
 			if responseDir == "" {
 				responseDir = in.StagingDir

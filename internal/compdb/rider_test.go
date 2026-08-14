@@ -253,6 +253,55 @@ func TestSynthesizeRiderPersistsContentAddressedResponsesAndRootEnvironment(t *t
 	}
 }
 
+func TestSynthesizeRiderIncludesEveryModuleAPIDefinitionInEveryResponse(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "ProjectZ")
+	engine := filepath.Join(root, "EngineA")
+	metadataDir := RiderMetadataDir(project)
+	projectModule := filepath.Join(project, "Source", "Game")
+	engineModule := filepath.Join(engine, "Source", "Runtime", "Core")
+	for _, dir := range []string{projectModule, engineModule, metadataDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projectSource := filepath.Join(projectModule, "Game.cpp")
+	engineSource := filepath.Join(engineModule, "Core.cpp")
+	targetFile := filepath.Join(project, "Source", "GameEditor.Target.cs")
+	for _, path := range []string{projectSource, engineSource, targetFile} {
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metadata := `{"Name":"GameEditor","TargetFile":"` + filepath.ToSlash(targetFile) + `","Modules":{` +
+		`"Game":{"Directory":"` + filepath.ToSlash(projectModule) + `","Definitions":["GAME_LOCAL=1"],"ApiDefinitions":["GAME_API=__declspec(dllexport)"]},` +
+		`"Core":{"Directory":"` + filepath.ToSlash(engineModule) + `","Definitions":["CORE_LOCAL=1"],"ApiDefinitions":["CORE_API=__declspec(dllimport)"]}}}`
+	if err := os.WriteFile(filepath.Join(metadataDir, "GameEditor.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+	responseDir := filepath.Join(root, "responses")
+	if _, err := SynthesizeRider(RiderInput{ProjectRoot: project, EngineRoot: engine, Target: "GameEditor", TargetFile: targetFile, StagingDir: filepath.Join(root, "stage"), ResponseDir: responseDir, ClangCL: "clang-cl.exe"}); err != nil {
+		t.Fatal(err)
+	}
+	responses, err := os.ReadDir(responseDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(responses) != 2 {
+		t.Fatalf("responses=%d, want 2", len(responses))
+	}
+	for _, response := range responses {
+		data, err := os.ReadFile(filepath.Join(responseDir, response.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(data)
+		if !strings.Contains(text, "GAME_API=__declspec(dllexport)") || !strings.Contains(text, "CORE_API=__declspec(dllimport)") {
+			t.Fatalf("response %s is missing dependency API definitions:\n%s", response.Name(), text)
+		}
+	}
+}
+
 func TestStringsFromJSONNestedObjectsAreDeterministic(t *testing.T) {
 	raw := json.RawMessage(`{"z":{"second":"B","first":"A"},"a":["C","D"]}`)
 	want := strings.Join(stringsFromJSON(raw), ",")
