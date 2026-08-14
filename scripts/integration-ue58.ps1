@@ -79,6 +79,10 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $utf8NoBom = [Text.UTF8Encoding]::new($false)
+    if ($psi.PSObject.Properties.Name -contains 'StandardInputEncoding') { $psi.StandardInputEncoding = $utf8NoBom }
+    if ($psi.PSObject.Properties.Name -contains 'StandardOutputEncoding') { $psi.StandardOutputEncoding = $utf8NoBom }
+    if ($psi.PSObject.Properties.Name -contains 'StandardErrorEncoding') { $psi.StandardErrorEncoding = $utf8NoBom }
     $process = [Diagnostics.Process]::Start($psi)
     $stderr = $process.StandardError.ReadToEndAsync()
     try {
@@ -89,7 +93,10 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
             $remaining = [Math]::Floor(($script:Deadline - (Get-Date)).TotalSeconds)
             if ($remaining -lt 1 -or -not $read.Wait([int]$remaining * 1000)) { throw 'MCP request timed out' }
             $line = $read.Result
-            if ([string]::IsNullOrWhiteSpace($line)) { throw 'MCP server returned no response' }
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                if ($process.HasExited) { throw "MCP server exited with code $($process.ExitCode)" }
+                throw 'MCP server returned no response'
+            }
             return $line | ConvertFrom-Json
         }
         $null = Send-Request @{ jsonrpc = '2.0'; id = 1; method = 'initialize'; params = @{ protocolVersion = '2025-06-18'; capabilities = @{}; clientInfo = @{ name = 'integration-smoke'; version = '1' } } }
