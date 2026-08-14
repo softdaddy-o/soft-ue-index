@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
@@ -38,8 +39,15 @@ func (w *Watcher) AddProject(project ProjectRoots) error {
 	if project.ID == "" || project.ProjectRoot == "" {
 		return fmt.Errorf("project ID and root are required")
 	}
-	project.ProjectRoot = filepath.Clean(project.ProjectRoot)
-	project.EngineRoot = filepath.Clean(project.EngineRoot)
+	var err error
+	if project.ProjectRoot, err = canonicalRoot(project.ProjectRoot); err != nil {
+		return err
+	}
+	if project.EngineRoot != "" {
+		if project.EngineRoot, err = canonicalRoot(project.EngineRoot); err != nil {
+			return err
+		}
+	}
 	if err := w.addDir(project.ProjectRoot); err != nil {
 		return err
 	}
@@ -55,6 +63,16 @@ func (w *Watcher) AddProject(project ProjectRoots) error {
 	w.projects = append(w.projects, project)
 	w.mu.Unlock()
 	return nil
+}
+func canonicalRoot(root string) (string, error) {
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		absolute = resolved
+	}
+	return filepath.Clean(absolute), nil
 }
 func (w *Watcher) addRelevantTrees(root string) error {
 	for _, name := range []string{"Source", "Plugins", "Config"} {
@@ -106,23 +124,52 @@ func (w *Watcher) loop() {
 			if !ok {
 				return
 			}
-			if IgnoredDirectory(event.Name) {
-				continue
-			}
-			if event.Op&fsnotify.Create != 0 {
-				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					_ = w.addTree(event.Name)
-					continue
-				}
-			}
-			if RequiresCompDB(event.Name, event.Op) && w.coordinator != nil {
-				for _, id := range w.projectsFor(event.Name) {
-					w.coordinator.Invalidate(id)
-				}
-			}
+			w.handleEvent(event)
 		case <-w.native.Errors: // errors are transient; keep unrelated projects alive.
 		}
 	}
+}
+func (w *Watcher) handleEvent(event fsnotify.Event) {
+	if IgnoredDirectory(event.Name) {
+		return
+	}
+	ids := w.projectsFor(event.Name)
+	if event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
+		if info, err := os.Stat(event.Name); err == nil && info.IsDir() && w.isRelevantDirectory(event.Name) {
+			_ = w.addTree(event.Name)
+			if w.coordinator != nil {
+				for _, id := range ids {
+					w.coordinator.Invalidate(id)
+				}
+			}
+			return
+		}
+	}
+	if RequiresCompDB(event.Name, event.Op) && w.coordinator != nil {
+		for _, id := range ids {
+			w.coordinator.Invalidate(id)
+		}
+	}
+}
+func (w *Watcher) isRelevantDirectory(path string) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	for _, p := range w.projects {
+		for _, root := range []string{p.ProjectRoot, p.EngineRoot} {
+			if root == "" {
+				continue
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil || rel == ".." || filepath.IsAbs(rel) {
+				continue
+			}
+			first := strings.ToLower(strings.Split(filepath.ToSlash(rel), "/")[0])
+			if first == "source" || first == "plugins" || first == "config" {
+				return true
+			}
+		}
+	}
+	return false
 }
 func (w *Watcher) projectsFor(path string) []string {
 	w.mu.RLock()
