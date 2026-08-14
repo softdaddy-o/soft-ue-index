@@ -302,6 +302,103 @@ func TestSynthesizeRiderIncludesEveryModuleAPIDefinitionInEveryResponse(t *testi
 	}
 }
 
+func TestSynthesizeRiderIncludesSafeGeneratedCodeDirectory(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "Project")
+	engine := filepath.Join(root, "Engine")
+	projectModule := filepath.Join(project, "Source", "Game")
+	engineModule := filepath.Join(engine, "Source", "Core")
+	generated := filepath.Join(project, "Intermediate", "Build", "Inc", "Game", "UHT")
+	metadataDir := RiderMetadataDir(project)
+	for _, dir := range []string{projectModule, engineModule, generated, metadataDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targetFile := filepath.Join(project, "Source", "GameEditor.Target.cs")
+	for _, path := range []string{filepath.Join(projectModule, "Game.cpp"), filepath.Join(engineModule, "Core.cpp"), filepath.Join(generated, "Game.generated.h"), targetFile} {
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metadata := `{"Name":"GameEditor","TargetFile":"` + filepath.ToSlash(targetFile) + `","Modules":{` +
+		`"Game":{"Directory":"` + filepath.ToSlash(projectModule) + `","GeneratedCodeDirectory":"` + filepath.ToSlash(generated) + `","Definitions":["GAME_LOCAL=1"]},` +
+		`"Core":{"Directory":"` + filepath.ToSlash(engineModule) + `"}}}`
+	if err := os.WriteFile(filepath.Join(metadataDir, "GameEditor.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+	responses := filepath.Join(root, "responses")
+	result, err := SynthesizeRider(RiderInput{ProjectRoot: project, EngineRoot: engine, Target: "GameEditor", TargetFile: targetFile, StagingDir: filepath.Join(root, "stage"), ResponseDir: responses, ClangCL: "clang-cl.exe"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProjectTranslationUnits != 1 || result.EngineTranslationUnits != 1 {
+		t.Fatalf("generated directory affected source coverage: %+v", result)
+	}
+	files, err := os.ReadDir(responses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, file := range files {
+		data, err := os.ReadFile(filepath.Join(responses, file.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "GAME_LOCAL=1") {
+			found = strings.Contains(string(data), filepath.Clean(generated))
+		}
+	}
+	if !found {
+		t.Fatal("project module response omitted GeneratedCodeDirectory")
+	}
+}
+
+func TestSynthesizeRiderRejectsEscapingGeneratedCodeDirectory(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "Project")
+	engine := filepath.Join(root, "Engine")
+	projectModule := filepath.Join(project, "Source", "Game")
+	engineModule := filepath.Join(engine, "Source", "Core")
+	outside := filepath.Join(root, "OutsideGenerated")
+	metadataDir := RiderMetadataDir(project)
+	for _, dir := range []string{projectModule, engineModule, outside, metadataDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targetFile := filepath.Join(project, "Source", "GameEditor.Target.cs")
+	for _, path := range []string{filepath.Join(projectModule, "Game.cpp"), filepath.Join(engineModule, "Core.cpp"), targetFile} {
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metadata := `{"Name":"GameEditor","TargetFile":"` + filepath.ToSlash(targetFile) + `","Modules":{` +
+		`"Game":{"Directory":"` + filepath.ToSlash(projectModule) + `","GeneratedCodeDirectory":"` + filepath.ToSlash(outside) + `"},` +
+		`"Core":{"Directory":"` + filepath.ToSlash(engineModule) + `"}}}`
+	if err := os.WriteFile(filepath.Join(metadataDir, "GameEditor.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SynthesizeRider(RiderInput{ProjectRoot: project, EngineRoot: engine, Target: "GameEditor", TargetFile: targetFile, StagingDir: filepath.Join(root, "stage"), ClangCL: "clang-cl.exe"}); err == nil {
+		t.Fatal("escaping GeneratedCodeDirectory was accepted")
+	}
+	link := filepath.Join(project, "Intermediate", "GeneratedLink")
+	if err := os.MkdirAll(filepath.Dir(link), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, link); err != nil {
+		t.Logf("symlink escape check skipped: %v", err)
+		return
+	}
+	metadata = strings.Replace(metadata, filepath.ToSlash(outside), filepath.ToSlash(link), 1)
+	if err := os.WriteFile(filepath.Join(metadataDir, "GameEditor.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SynthesizeRider(RiderInput{ProjectRoot: project, EngineRoot: engine, Target: "GameEditor", TargetFile: targetFile, StagingDir: filepath.Join(root, "stage-link"), ClangCL: "clang-cl.exe"}); err == nil {
+		t.Fatal("symlinked GeneratedCodeDirectory escape was accepted")
+	}
+}
+
 func TestStringsFromJSONNestedObjectsAreDeterministic(t *testing.T) {
 	raw := json.RawMessage(`{"z":{"second":"B","first":"A"},"a":["C","D"]}`)
 	want := strings.Join(stringsFromJSON(raw), ",")

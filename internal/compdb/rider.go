@@ -283,7 +283,19 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 		if e != nil || (!within(d, project) && !within(d, engine)) {
 			return RiderResult{}, fmt.Errorf("rider module %q escapes project and engine roots", name)
 		}
-		all = append(all, riderResolvedModule{name, d, module.riderRules})
+		generated := ""
+		if module.GeneratedCodeDirectory != "" {
+			generated = module.GeneratedCodeDirectory
+			if !filepath.IsAbs(generated) {
+				generated = filepath.Join(d, generated)
+			}
+			info, statErr := os.Stat(generated)
+			generated, e = canonical(generated)
+			if statErr != nil || e != nil || !info.IsDir() || (!within(generated, project) && !within(generated, engine)) {
+				return RiderResult{}, fmt.Errorf("rider module %q GeneratedCodeDirectory escapes project and engine roots", name)
+			}
+		}
+		all = append(all, riderResolvedModule{name: name, dir: d, generatedDir: generated, rules: module.riderRules})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].dir < all[j].dir })
 	allAPIDefinitions := make([]string, 0)
@@ -389,8 +401,8 @@ func translationUnitClass(file, project, engine string) int {
 }
 
 type riderResolvedModule struct {
-	name, dir string
-	rules     riderRules
+	name, dir, generatedDir string
+	rules                   riderRules
 }
 
 func deepestModule(file string, mods []riderResolvedModule) *riderResolvedModule {
@@ -445,6 +457,9 @@ func selectRiderTarget(dir, name, targetFile, projectRoot string) (riderSelected
 func response(m riderResolvedModule, compiler string, rootIncludes, rootDefinitions []string) string {
 	_ = compiler
 	inc := unique(append(append(append(append(append(append(append(append([]string{}, rootIncludes...), m.rules.PublicIncludePaths...), m.rules.PrivateIncludePaths...), m.rules.IncludePaths...), m.rules.PublicSystemIncludePaths...), m.rules.SystemIncludePaths...), m.rules.InternalIncludePaths...), m.rules.LegacyPublicIncludePaths...))
+	if m.generatedDir != "" {
+		inc = unique(append(inc, m.generatedDir))
+	}
 	defs := unique(append(append(append(append(append(append([]string{}, rootDefinitions...), m.rules.Definitions...), m.rules.PublicDefinitions...), m.rules.PrivateDefinitions...), m.rules.ProjectDefinitions...), m.rules.ApiDefinitions...))
 	var a = []string{"/nologo", "/TP", "/std:c++20", "--target=x86_64-pc-windows-msvc", "/utf-8", "/Zc:__cplusplus", "/permissive-"}
 	for _, x := range inc {
