@@ -13,24 +13,31 @@ import (
 
 // ProjectRoots contains roots relevant to one project. Engine roots are shared safely.
 type ProjectRoots struct{ ID, ProjectRoot, EngineRoot string }
+type SourceWrite struct{ ProjectID, Path string }
+type WatcherOptions struct{ SourceWrite func(SourceWrite) }
 
 // Watcher owns one fsnotify watcher and translates events into coordinated invalidations.
 type Watcher struct {
-	native      *fsnotify.Watcher
-	coordinator *Coordinator
-	dirs        sync.Map
-	done        chan struct{}
-	once        sync.Once
-	mu          sync.RWMutex
-	projects    []ProjectRoots
+	native        *fsnotify.Watcher
+	coordinator   *Coordinator
+	onSourceWrite func(SourceWrite)
+	dirs          sync.Map
+	done          chan struct{}
+	once          sync.Once
+	mu            sync.RWMutex
+	projects      []ProjectRoots
 }
 
 func NewWatcher(coordinator *Coordinator) (*Watcher, error) {
+	return NewWatcherWithOptions(coordinator, WatcherOptions{})
+}
+
+func NewWatcherWithOptions(coordinator *Coordinator, options WatcherOptions) (*Watcher, error) {
 	n, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
-	w := &Watcher{native: n, coordinator: coordinator, done: make(chan struct{})}
+	w := &Watcher{native: n, coordinator: coordinator, onSourceWrite: options.SourceWrite, done: make(chan struct{})}
 	go w.loop()
 	return w, nil
 }
@@ -157,6 +164,12 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	if RequiresCompDB(event.Name, event.Op) && w.coordinator != nil {
 		for _, id := range ids {
 			w.coordinator.Invalidate(id)
+		}
+		return
+	}
+	if event.Op&fsnotify.Write != 0 && isSourceFile(filepath.Base(event.Name)) && w.onSourceWrite != nil {
+		for _, id := range ids {
+			w.onSourceWrite(SourceWrite{ProjectID: id, Path: event.Name})
 		}
 	}
 }

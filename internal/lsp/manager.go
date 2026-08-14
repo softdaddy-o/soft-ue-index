@@ -33,6 +33,17 @@ type Process interface {
 type ProcessFactory interface {
 	Start(context.Context, string, []string, string) (Process, error)
 }
+type onceWaitProcess struct {
+	Process
+	once sync.Once
+	err  error
+}
+
+func (p *onceWaitProcess) Wait() error {
+	p.once.Do(func() { p.err = p.Process.Wait() })
+	return p.err
+}
+
 type ExecFactory struct{}
 type execProcess struct {
 	*exec.Cmd
@@ -436,7 +447,11 @@ func (m *Manager) start(ctx context.Context, cfg ProjectConfig) (Process, error)
 		return nil, err
 	}
 	args := []string{"--compile-commands-dir=" + cfg.CacheDir, "--background-index", "--j=" + itoa(cfg.Threads), "--log=error"}
-	return m.factory.Start(ctx, cfg.Clangd, args, filepath.Join(cfg.CacheDir, "clangd.log"))
+	p, err := m.factory.Start(ctx, cfg.Clangd, args, filepath.Join(cfg.CacheDir, "clangd.log"))
+	if err != nil {
+		return nil, err
+	}
+	return &onceWaitProcess{Process: p}, nil
 }
 func itoa(i int) string { return fmt.Sprintf("%d", i) }
 func backoff(f int) time.Duration {
@@ -476,6 +491,27 @@ func (m *Manager) Release(id string) {
 		m.scheduleIdleLocked(id, s)
 	}
 }
+
+// SourceFileChanged forwards an ordinary source write to an existing project
+// session without starting clangd solely for a filesystem notification.
+func (m *Manager) SourceFileChanged(id, path string) error {
+	m.mu.Lock()
+	s := m.sessions[id]
+	var client *Client
+	if s != nil {
+		client = s.client
+	}
+	m.mu.Unlock()
+	if client == nil {
+		return nil
+	}
+	seed, err := readIndexSeed(path, maxIndexSeedBytes)
+	if err != nil {
+		return err
+	}
+	return client.SourceFileChanged(pathURI(seed.Path), string(seed.Text))
+}
+
 func (m *Manager) stop(id string, s *session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

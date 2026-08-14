@@ -14,6 +14,95 @@ import (
 	"time"
 )
 
+func TestSourceWriteChangesOpenDocumentWithMonotonicVersions(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{})
+	defer c.Close()
+	uri := "file:///game/Source/Foo.cpp"
+	messages := make(chan wireMessage, 3)
+	go func() {
+		r := bufio.NewReader(b)
+		for range 3 {
+			body, _ := readFrame(r, 4096)
+			var message wireMessage
+			_ = json.Unmarshal(body, &message)
+			messages <- message
+		}
+	}()
+	if err := c.DidOpen(uri, "cpp", "old"); err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"new", "newest"} {
+		if err := c.SourceFileChanged(uri, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-messages // didOpen
+	for i, wantText := range []string{"new", "newest"} {
+		wantVersion := i + 2
+		message := <-messages
+		if message.Method != "textDocument/didChange" {
+			t.Fatalf("method=%s", message.Method)
+		}
+		var params struct {
+			TextDocument struct {
+				URI     string `json:"uri"`
+				Version int    `json:"version"`
+			} `json:"textDocument"`
+			ContentChanges []struct {
+				Text string `json:"text"`
+			} `json:"contentChanges"`
+		}
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			t.Fatal(err)
+		}
+		if params.TextDocument.URI != uri || params.TextDocument.Version != wantVersion || len(params.ContentChanges) != 1 || params.ContentChanges[0].Text != wantText {
+			t.Fatalf("didChange=%+v", params)
+		}
+	}
+}
+
+func TestSourceWriteNotifiesWatchedFileWhenDocumentIsClosed(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{})
+	defer c.Close()
+	uri := "file:///game/Source/Foo.cpp"
+	done := make(chan wireMessage, 1)
+	go func() {
+		body, _ := readFrame(bufio.NewReader(b), 4096)
+		var message wireMessage
+		_ = json.Unmarshal(body, &message)
+		done <- message
+	}()
+	if err := c.SourceFileChanged(uri, "new"); err != nil {
+		t.Fatal(err)
+	}
+	message := <-done
+	if message.Method != "workspace/didChangeWatchedFiles" || !strings.Contains(string(message.Params), uri) || !strings.Contains(string(message.Params), `"type":2`) {
+		t.Fatalf("message=%+v params=%s", message, message.Params)
+	}
+}
+
+func TestTerminateDoesNotCloseDetachedResponseChannel(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{})
+	response := make(chan wireMessage, 1)
+	c.mu.Lock()
+	c.pending[1] = response
+	c.mu.Unlock()
+	c.terminate()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("late response panicked after termination: %v", recovered)
+		}
+	}()
+	response <- wireMessage{}
+	c.Close()
+}
+
 func TestDocumentRequestOpensFileOnceBeforeConcurrentDefinitions(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()

@@ -46,7 +46,7 @@ type Client struct {
 	wg        sync.WaitGroup
 	requests  chan wireMessage
 	openMu    sync.Mutex
-	opened    map[string]struct{}
+	opened    map[string]int
 }
 
 func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Client {
@@ -56,7 +56,7 @@ func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Clien
 	if options.RequestTimeout <= 0 {
 		options.RequestTimeout = 15 * time.Second
 	}
-	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), opened: make(map[string]struct{})}
+	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), opened: make(map[string]int)}
 	c.wg.Add(2)
 	go c.readLoop()
 	go c.requestLoop()
@@ -137,17 +137,8 @@ func (c *Client) terminate() {
 		c.closed = true
 		close(c.done)
 	}
-	for id, ch := range c.pending {
+	for id := range c.pending {
 		delete(c.pending, id)
-		close(ch)
-	}
-}
-func (c *Client) failAll(err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id, ch := range c.pending {
-		delete(c.pending, id)
-		close(ch)
 	}
 }
 func (c *Client) send(value any) error {
@@ -480,7 +471,7 @@ func (c *Client) DidOpen(uri, languageID, text string) error {
 	if err := c.Notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": languageID, "version": 1, "text": text}}); err != nil {
 		return err
 	}
-	c.opened[uri] = struct{}{}
+	c.opened[uri] = 1
 	return nil
 }
 func (c *Client) DidClose(uri string) error {
@@ -490,6 +481,26 @@ func (c *Client) DidClose(uri string) error {
 		return err
 	}
 	delete(c.opened, uri)
+	return nil
+}
+
+// SourceFileChanged refreshes an open document's in-memory AST. Closed files
+// are delegated to clangd's background index through the watched-files event.
+func (c *Client) SourceFileChanged(uri, text string) error {
+	c.openMu.Lock()
+	defer c.openMu.Unlock()
+	version, open := c.opened[uri]
+	if !open {
+		return c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": []map[string]any{{"uri": uri, "type": 2}}})
+	}
+	version++
+	if err := c.Notify("textDocument/didChange", map[string]any{
+		"textDocument":   map[string]any{"uri": uri, "version": version},
+		"contentChanges": []map[string]string{{"text": text}},
+	}); err != nil {
+		return err
+	}
+	c.opened[uri] = version
 	return nil
 }
 
@@ -535,6 +546,6 @@ func (c *Client) ensureDocumentOpen(uri string) error {
 	if err := c.Notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": "cpp", "version": 1, "text": string(b)}}); err != nil {
 		return err
 	}
-	c.opened[uri] = struct{}{}
+	c.opened[uri] = 1
 	return nil
 }

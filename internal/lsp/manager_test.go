@@ -9,20 +9,23 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type fakeProcess struct {
-	conn net.Conn
-	done chan struct{}
-	once sync.Once
+	conn  net.Conn
+	done  chan struct{}
+	once  sync.Once
+	waits atomic.Int32
 }
 
 func (p *fakeProcess) Stdin() io.WriteCloser { return p.conn }
 func (p *fakeProcess) Stdout() io.ReadCloser { return p.conn }
-func (p *fakeProcess) Wait() error           { <-p.done; return nil }
+func (p *fakeProcess) Wait() error           { p.waits.Add(1); <-p.done; return nil }
 func (p *fakeProcess) Kill() error {
 	p.once.Do(func() { close(p.done); _ = p.conn.Close() })
 	return nil
@@ -123,6 +126,22 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	m.mu.Unlock()
 	if ok {
 		t.Fatal("idle session remains")
+	}
+}
+
+func TestManagerWaitsForProcessExactlyOnceOnClose(t *testing.T) {
+	f := &fakeFactory{}
+	m := NewManager(f)
+	if _, err := m.Client(context.Background(), ProjectConfig{ID: "game", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///game"}); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	p := f.last
+	f.mu.Unlock()
+	m.Close()
+	time.Sleep(20 * time.Millisecond)
+	if got := p.waits.Load(); got != 1 {
+		t.Fatalf("Wait calls=%d, want 1", got)
 	}
 }
 
@@ -257,6 +276,51 @@ func TestManagerWaitsForSeedDocumentSymbolsBeforePublishing(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("startup did not complete after documentSymbol response")
+	}
+}
+
+func TestManagerSourceWriteRefreshesOnlyMatchingLiveSession(t *testing.T) {
+	f := &fakeFactory{}
+	m := NewManager(f)
+	defer m.Close()
+	root, cache := t.TempDir(), t.TempDir()
+	source := filepath.Join(root, "Seed.cpp")
+	if err := os.WriteFile(source, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal([]map[string]string{{"directory": root, "file": source, "command": "clang-cl Seed.cpp"}})
+	db := filepath.Join(cache, "compile_commands.json")
+	if err := os.WriteFile(db, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Client(context.Background(), ProjectConfig{ID: "game", Clangd: "fake", CacheDir: cache, CompilationDatabase: db, RootURI: fileURIForTest(root)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SourceFileChanged("other", source); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	before := len(f.methods)
+	f.mu.Unlock()
+	if err := m.SourceFileChanged("game", source); err != nil {
+		t.Fatal(err)
+	}
+	var messages []wireMessage
+	deadline := time.Now().Add(time.Second)
+	for {
+		f.mu.Lock()
+		messages = append([]wireMessage(nil), f.methods...)
+		f.mu.Unlock()
+		if len(messages) > before || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if len(messages) != before+1 || messages[len(messages)-1].Method != "textDocument/didChange" || !strings.Contains(string(messages[len(messages)-1].Params), `"text":"new"`) {
+		t.Fatalf("messages=%v", messages[before:])
 	}
 }
 

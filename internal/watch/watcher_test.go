@@ -28,6 +28,41 @@ func TestAddProjectPreservesEmptyEngineRoot(t *testing.T) {
 	}
 }
 
+func TestOrdinarySourceWriteNotifiesMatchingProjectWithoutRegeneration(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "Source")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sourceDir, "Foo.cpp")
+	changes := make(chan SourceWrite, 1)
+	results := make(chan Result, 1)
+	c := NewCoordinatorWithOptions(nil, 1, 0, CoordinatorOptions{Result: func(result Result) { results <- result }})
+	defer c.Close()
+	w, err := NewWatcherWithOptions(c, WatcherOptions{SourceWrite: func(change SourceWrite) { changes <- change }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.AddProject(ProjectRoots{ID: "game", ProjectRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Write})
+	select {
+	case change := <-changes:
+		if change.ProjectID != "game" || change.Path != path {
+			t.Fatalf("change=%+v", change)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ordinary source write was ignored")
+	}
+	select {
+	case <-results:
+		t.Fatal("ordinary source write regenerated compilation database")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
 func TestCreatedOrMovedInRelevantDirectoryAttachesAndInvalidates(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "Source", "Populated")
