@@ -287,8 +287,13 @@ func stringsFromJSON(raw json.RawMessage) []string {
 				visit(e)
 			}
 		case map[string]any:
-			for _, e := range x {
-				visit(e)
+			keys := make([]string, 0, len(x))
+			for key := range x {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				visit(x[key])
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package compdb
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,5 +110,18 @@ func TestSynthesizeRiderPersistsContentAddressedResponsesAndRootEnvironment(t *t
 	}
 	if !strings.Contains(string(data), "GLOBAL=1") || !strings.Contains(string(data), "SDK Includes") {
 		t.Fatalf("root env absent: %s", data)
+	}
+}
+
+func TestStringsFromJSONNestedObjectsAreDeterministic(t *testing.T) {
+	raw := json.RawMessage(`{"z":{"second":"B","first":"A"},"a":["C","D"]}`)
+	want := strings.Join(stringsFromJSON(raw), ",")
+	for range 50 {
+		if got := strings.Join(stringsFromJSON(raw), ","); got != want {
+			t.Fatalf("nondeterministic: %q != %q", got, want)
+		}
+	}
+	if want != "C,D,A,B" {
+		t.Fatalf("order=%q", want)
 	}
 }
