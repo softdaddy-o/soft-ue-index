@@ -3,6 +3,8 @@ param(
     [Parameter(Mandatory = $true)] [string] $UProject,
     [Parameter(Mandatory = $true)] [string] $ProjectSymbol,
     [Parameter(Mandatory = $true)] [string] $EngineSymbol,
+    [string] $Engine,
+    [string] $Clangd,
     [string] $Executable = 'soft-ue-index.exe'
 )
 
@@ -69,6 +71,17 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
 
 if (-not (Test-Path -LiteralPath $UProject -PathType Leaf)) { throw "UProject was not found" }
 if (-not (Get-Command $Executable -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath $Executable -PathType Leaf)) { throw "Executable was not found: $Executable" }
+if ($Engine) {
+    $versionPath = Join-Path $Engine 'Engine/Build/Build.version'
+    if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) { throw 'Engine is not a valid Unreal root' }
+    $version = Get-Content -Raw -LiteralPath $versionPath | ConvertFrom-Json
+    if ($version.MajorVersion -ne 5 -or $version.MinorVersion -ne 8) { throw 'Engine is not Unreal Engine 5.8' }
+}
+if ($Clangd) {
+    if (-not (Test-Path -LiteralPath $Clangd -PathType Leaf)) { throw 'clangd executable was not found' }
+    $null = & $Clangd --version 2>&1
+    if ($LASTEXITCODE -ne 0) { throw 'clangd version check failed' }
+}
 
 $start = Get-Date
 $projects = (& $Executable list --json | ConvertFrom-Json)
@@ -79,7 +92,10 @@ if (-not $project) {
     $project = $projects | Where-Object { $_.uproject -eq (Resolve-Path -LiteralPath $UProject).Path } | Select-Object -First 1
 }
 if (-not $project) { throw 'Registered project was not found' }
+if ($Engine -and $project.engine.root -ne (Resolve-Path -LiteralPath $Engine).Path) { throw 'Registered engine does not match the supplied engine' }
 Invoke-Tool @('doctor', '--json')
+$project = (& $Executable status $project.id --json | ConvertFrom-Json)
+if ($Clangd -and $project.toolchain.clangdPath -ne (Resolve-Path -LiteralPath $Clangd).Path) { throw 'Doctor did not select the supplied compatible clangd' }
 Invoke-Tool @('generate', $project.id)
 
 $database = $project.generation.compilationDatabase

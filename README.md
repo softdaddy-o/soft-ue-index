@@ -78,10 +78,10 @@ The server provides `list_projects`, `project_status`, `search_symbols`, `find_d
 The repository includes a non-destructive PowerShell check. It calls `doctor`, registers and generates one project, verifies project and engine translation-unit coverage, and makes bounded MCP queries. It does not build or edit the project.
 
 ```powershell
-./scripts/integration-ue58.ps1 -UProject ./MyGame/MyGame.uproject -ProjectSymbol MyGameType -EngineSymbol EngineType
+./scripts/integration-ue58.ps1 -UProject ./MyGame/MyGame.uproject -Engine ./UE_5.8 -Clangd ./LLVM/bin/clangd.exe -ProjectSymbol MyGameType -EngineSymbol EngineType
 ```
 
-`-ProjectSymbol` and `-EngineSymbol` are required: the check proves that each query resolves within the expected project or engine root, then requests a definition and bounded references for both. Engine selection comes from the project's Unreal association; `doctor` selects a compatible clangd.
+`-ProjectSymbol` and `-EngineSymbol` are required: the check proves that each query resolves within the expected project or engine root, then requests a definition and bounded references for both. `-Engine` and `-Clangd` are optional expected values; when supplied, the check validates an Unreal 5.8 engine root and verifies that the project association and `doctor` selected exactly those values.
 
 ## Troubleshooting
 
