@@ -28,9 +28,15 @@ jobs:
           CC=gcc go test -race ./...
       - name: Package
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
         run: |
+          if ($env:RELEASE_VERSION -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "Release tag must be a stable vSemVer tag."
+          }
           New-Item -ItemType Directory -Force dist/package | Out-Null
-          go build -trimpath -ldflags "-s -w -X github.com/softdaddy-o/soft-ue-index/internal/app.Version=${{ github.ref_name }}" -o dist/package/soft-ue-index.exe ./cmd/soft-ue-index
+          $ldflags = "-s -w -X github.com/softdaddy-o/soft-ue-index/internal/app.Version=$env:RELEASE_VERSION"
+          go build -trimpath -ldflags $ldflags -o dist/package/soft-ue-index.exe ./cmd/soft-ue-index
           Copy-Item README.md, LICENSE dist/package/
           Compress-Archive -Path dist/package/* -DestinationPath "dist/soft-ue-index-windows-amd64.zip"
           $hash = (Get-FileHash "dist/soft-ue-index-windows-amd64.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
