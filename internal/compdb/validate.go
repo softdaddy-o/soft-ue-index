@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -84,8 +85,8 @@ func Validate(path, projectRoot, engineRoot string) (ValidationResult, error) {
 	if err != nil || token != json.Delim('[') {
 		return ValidationResult{}, errors.New("compilation database must be a JSON array")
 	}
-	hash := sha256.New()
 	result := ValidationResult{}
+	normalizedEntries := make([]string, 0)
 	for decoder.More() {
 		var entry Entry
 		if err := decoder.Decode(&entry); err != nil {
@@ -100,7 +101,7 @@ func Validate(path, projectRoot, engineRoot string) (ValidationResult, error) {
 		} else if scope == 2 {
 			result.EngineTranslationUnits++
 		}
-		_, _ = io.WriteString(hash, normalized+"\n")
+		normalizedEntries = append(normalizedEntries, normalized)
 	}
 	if _, err := decoder.Token(); err != nil {
 		return ValidationResult{}, fmt.Errorf("finish database: %w", err)
@@ -114,6 +115,11 @@ func Validate(path, projectRoot, engineRoot string) (ValidationResult, error) {
 	}
 	if result.ProjectTranslationUnits == 0 || result.EngineTranslationUnits == 0 {
 		return ValidationResult{}, fmt.Errorf("insufficient coverage: project=%d engine=%d", result.ProjectTranslationUnits, result.EngineTranslationUnits)
+	}
+	sort.Strings(normalizedEntries)
+	hash := sha256.New()
+	for _, normalized := range normalizedEntries {
+		_, _ = io.WriteString(hash, normalized+"\n")
 	}
 	result.Fingerprint = hex.EncodeToString(hash.Sum(nil))
 	return result, nil
@@ -135,6 +141,12 @@ func validateEntry(entry Entry, projectRoot, engineRoot string) (string, int, er
 	if err != nil {
 		return "", 0, err
 	}
+	if err := requireRegularFile(source, "translation unit"); err != nil {
+		return "", 0, err
+	}
+	if !supportedTranslationUnit(source) {
+		return "", 0, fmt.Errorf("unsupported translation unit extension: %q", source)
+	}
 	args := entry.Arguments
 	if len(args) == 0 {
 		args = splitCommand(entry.Command)
@@ -146,8 +158,8 @@ func validateEntry(entry Entry, projectRoot, engineRoot string) (string, int, er
 	if !filepath.IsAbs(compiler) {
 		compiler = filepath.Join(directory, compiler)
 	}
-	if _, err := os.Stat(compiler); err != nil {
-		return "", 0, fmt.Errorf("compiler %q: %w", compiler, err)
+	if err := requireRegularFile(compiler, "compiler"); err != nil {
+		return "", 0, err
 	}
 	for _, arg := range args[1:] {
 		if strings.HasPrefix(arg, "@") {
@@ -168,6 +180,26 @@ func validateEntry(entry Entry, projectRoot, engineRoot string) (string, int, er
 		scope = 2
 	}
 	return filepath.ToSlash(source) + "\x00" + strings.Join(args, "\x00"), scope, nil
+}
+
+func requireRegularFile(path, kind string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("%s %q: %w", kind, path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s %q is not a regular file", kind, path)
+	}
+	return nil
+}
+
+func supportedTranslationUnit(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".c", ".cc", ".cpp", ".cxx", ".m", ".mm":
+		return true
+	default:
+		return false
+	}
 }
 func canonical(path string) (string, error) {
 	absolute, err := filepath.Abs(path)

@@ -85,6 +85,58 @@ func TestValidateFullCoveragePromotesAndFingerprints(t *testing.T) {
 	}
 }
 
+func TestFingerprintDoesNotDependOnEntryOrder(t *testing.T) {
+	env := newValidationEnv(t)
+	path := filepath.Join(env.staging, DatabaseName)
+	writeDatabase(t, env.staging, []Entry{env.projectEntry, env.engineEntry})
+	first, err := Validate(path, env.projectRoot, env.engineRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDatabase(t, env.staging, []Entry{env.engineEntry, env.projectEntry})
+	second, err := Validate(path, env.projectRoot, env.engineRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Fingerprint != second.Fingerprint {
+		t.Fatalf("fingerprints differ: %q != %q", first.Fingerprint, second.Fingerprint)
+	}
+}
+
+func TestValidateMissingSourcePreservesOldDatabase(t *testing.T) {
+	env := newValidationEnv(t)
+	env.projectEntry.File = filepath.Join(env.projectRoot, "Source", "Missing.cpp")
+	writeDatabase(t, env.staging, []Entry{env.projectEntry, env.engineEntry})
+	if _, err := ValidateAndPromote(ValidationInput{StagingDir: env.staging, DestinationDir: env.destination, ProjectRoot: env.projectRoot, EngineRoot: env.engineRoot}); err == nil {
+		t.Fatal("expected missing source error")
+	}
+	assertOldDatabase(t, env.destination)
+}
+
+func TestValidateCompilerDirectoryPreservesOldDatabase(t *testing.T) {
+	env := newValidationEnv(t)
+	env.projectEntry.Arguments[0] = filepath.Dir(env.compiler)
+	writeDatabase(t, env.staging, []Entry{env.projectEntry, env.engineEntry})
+	if _, err := ValidateAndPromote(ValidationInput{StagingDir: env.staging, DestinationDir: env.destination, ProjectRoot: env.projectRoot, EngineRoot: env.engineRoot}); err == nil {
+		t.Fatal("expected compiler regular-file error")
+	}
+	assertOldDatabase(t, env.destination)
+}
+
+func TestValidateUnsupportedTranslationUnitPreservesOldDatabase(t *testing.T) {
+	env := newValidationEnv(t)
+	unsupported := filepath.Join(env.projectRoot, "Source", "Notes.txt")
+	if err := os.WriteFile(unsupported, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env.projectEntry.File = unsupported
+	writeDatabase(t, env.staging, []Entry{env.projectEntry, env.engineEntry})
+	if _, err := ValidateAndPromote(ValidationInput{StagingDir: env.staging, DestinationDir: env.destination, ProjectRoot: env.projectRoot, EngineRoot: env.engineRoot}); err == nil {
+		t.Fatal("expected unsupported translation unit error")
+	}
+	assertOldDatabase(t, env.destination)
+}
+
 func TestPromotionFailurePreservesOldDatabase(t *testing.T) {
 	env := newValidationEnv(t)
 	writeDatabase(t, env.staging, []Entry{env.projectEntry, env.engineEntry})

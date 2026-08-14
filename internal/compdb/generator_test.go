@@ -21,7 +21,7 @@ func TestBuildGenerateCommand(t *testing.T) {
 	if got.Executable != filepath.Join(root, "dotnet.exe") {
 		t.Fatalf("executable = %q", got.Executable)
 	}
-	want := []string{ubt, "-Mode=GenerateClangDatabase", "GameEditor", "Development", "Win64", "-Compiler=Clang", "-NoExecCodeGenActions"}
+	want := []string{ubt, "-Mode=GenerateClangDatabase", "GameEditor", "Win64", "Development", "-Compiler=Clang", "-NoExecCodeGenActions"}
 	assertContainsInOrder(t, got.Args, want...)
 	assertContainsInOrder(t, got.Args, "-Project="+filepath.Join(root, "Game.uproject"), "-OutputDir="+filepath.Join(root, "staging"), "-OutputFilename=compile_commands.json")
 }
