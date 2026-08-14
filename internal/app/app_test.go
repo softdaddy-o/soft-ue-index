@@ -89,6 +89,78 @@ func TestDoctorDefaultReturnsStructuredChecks(t *testing.T) {
 	}
 }
 
+func TestDoctorDiscoversCompatibleClangdBeforeGenerationAndRejectsStaleRegistryPath(t *testing.T) {
+	env := testutil.NewFakeUE58(t)
+	testutil.WriteFile(t, filepath.Join(env.EngineRoot, "Engine", "Config", "Windows", "Windows_SDK.json"), `{"PreferredClangVersions":["20.1.0-20.999"],"MinimumClangVersion":"20.1.0"}`)
+	store, err := registry.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := registry.Project{ID: "game", Name: "Game", UProject: env.UProject, Engine: registry.Engine{Root: env.EngineRoot}, Toolchain: registry.Toolchain{ClangdPath: "stale-clangd.exe"}}
+	if err := store.Save(context.Background(), registry.Registry{Version: registry.CurrentVersion, Projects: []registry.Project{project}}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	a := New(Dependencies{
+		Store:       store,
+		Output:      &out,
+		Environment: appEnvironment{"LLVM_PATH": "C:/llvm"},
+		Files:       appFiles{files: map[string]bool{"C:/llvm/clangd.exe": true}},
+		Runner:      appRunner{outputs: map[string]string{"C:/llvm/clangd.exe": "clangd version 20.1.8"}},
+	})
+	if err := a.Run(context.Background(), cli.Command{Name: "doctor", JSON: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"code":"llvm","summary":"LLVM / clangd","detail":"A compatible clangd was found."`) {
+		t.Fatalf("doctor did not execute discovered clangd: %s", out.String())
+	}
+	got, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Projects[0].Toolchain.ClangdPath != filepath.FromSlash("C:/llvm/clangd.exe") {
+		t.Fatalf("stale clangd was not replaced: %#v", got.Projects[0].Toolchain)
+	}
+}
+
+func TestDoctorFindsNestedUnrealBuildArtifacts(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteFile(t, filepath.Join(root, "Intermediate", "Build", "Win64", "Game", "Inc", "Nested.generated.h"), "// generated\n")
+	testutil.WriteFile(t, filepath.Join(root, "Intermediate", "Build", "Win64", "Game", "Compile.rsp"), "// response\n")
+	if !hasBuildArtifact(root, ".generated.h") || !hasBuildArtifact(root, ".rsp") {
+		t.Fatal("nested Unreal build artifacts were not found")
+	}
+	if hasBuildArtifact(t.TempDir(), ".rsp") {
+		t.Fatal("missing build artifacts reported as present")
+	}
+}
+
+type appEnvironment map[string]string
+
+func (e appEnvironment) LookupEnv(name string) (string, bool) { value, ok := e[name]; return value, ok }
+
+type appFiles struct{ files map[string]bool }
+
+func (f appFiles) Exists(path string) bool { return f.files[path] }
+func (f appFiles) Glob(pattern string) []string {
+	paths := []string{}
+	for path := range f.files {
+		if matched, _ := filepath.Match(pattern, path); matched {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+type appRunner struct{ outputs map[string]string }
+
+func (r appRunner) Run(name string, _ ...string) (string, error) {
+	if output, ok := r.outputs[name]; ok {
+		return output, nil
+	}
+	return "", fmt.Errorf("not executable: %s", name)
+}
+
 // TestEndToEndTwoProjectsShareEngine exercises the real application routing
 // around injectable external effects. The filesystem watcher is deliberately
 // real: a Build.cs write must regenerate only its owning project.

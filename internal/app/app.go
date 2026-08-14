@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,6 +35,10 @@ type Dependencies struct {
 	Doctor   func(context.Context, *registry.Store) (any, error)
 	Watch    func(context.Context, []registry.Project) error
 	MCP      func(context.Context, *registry.Store) error
+	// Environment, Files, and Runner keep doctor discovery independently testable.
+	Environment toolchain.Environment
+	Files       toolchain.FileSystem
+	Runner      toolchain.Runner
 }
 
 type App struct{ d Dependencies }
@@ -47,6 +52,15 @@ func New(d Dependencies) *App {
 	}
 	if d.Store == nil {
 		d.Store, _ = registry.NewStore("")
+	}
+	if d.Environment == nil {
+		d.Environment = osEnvironment{}
+	}
+	if d.Files == nil {
+		d.Files = hostFiles{}
+	}
+	if d.Runner == nil {
+		d.Runner = execRunner{}
 	}
 	a := &App{d: d}
 	if a.d.Generate == nil {
@@ -262,7 +276,7 @@ func (a *App) generateReal(ctx context.Context, p registry.Project) (registry.Pr
 	if err != nil {
 		return p, err
 	}
-	selection, err := toolchain.SelectClangd(config, toolchain.DiscoverCandidates(p.Toolchain.ClangdPath, osEnvironment{}, toolchain.WindowsCandidateProvider{Environment: osEnvironment{}, FileSystem: hostFiles{}}), execRunner{})
+	selection, err := toolchain.SelectClangd(config, toolchain.DiscoverCandidates(p.Toolchain.ClangdPath, a.d.Environment, toolchain.WindowsCandidateProvider{Environment: a.d.Environment, FileSystem: a.d.Files}), a.d.Runner)
 	if err != nil {
 		return p, err
 	}
@@ -310,22 +324,80 @@ func (a *App) doctorReal(ctx context.Context, store *registry.Store) (any, error
 		return nil, err
 	}
 	probe := diagnostics.Probe{}
-	for _, p := range r.Projects {
+	changed := false
+	for i := range r.Projects {
+		p := &r.Projects[i]
 		probe.Engine = probe.Engine || p.Engine.Root != ""
 		ubt := filepath.Join(p.Engine.Root, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.dll")
-		probe.UBT = probe.UBT || hostFiles{}.Exists(ubt)
-		_, dotnet := toolchain.FindBundledDotnet(p.Engine.Root, hostFiles{})
+		probe.UBT = probe.UBT || a.d.Files.Exists(ubt)
+		_, dotnet := toolchain.FindBundledDotnet(p.Engine.Root, a.d.Files)
 		probe.Dotnet = probe.Dotnet || dotnet
-		if p.Toolchain.ClangdPath != "" {
-			probe.LLVM = true
+		configPath := filepath.Join(p.Engine.Root, "Engine", "Config", "Windows", "Windows_SDK.json")
+		configData, configErr := os.ReadFile(configPath)
+		if configErr == nil {
+			config, parseErr := toolchain.ParseSDKConfig(configData)
+			if parseErr == nil {
+				selection, selectErr := toolchain.SelectClangd(config, toolchain.DiscoverCandidates(p.Toolchain.ClangdPath, a.d.Environment, toolchain.WindowsCandidateProvider{Environment: a.d.Environment, FileSystem: a.d.Files}), a.d.Runner)
+				if selectErr == nil {
+					probe.LLVM = true
+					if p.Toolchain.ClangdPath != selection.Path || p.Toolchain.ClangdVersion != selection.Version.String() {
+						p.Toolchain.ClangdPath = selection.Path
+						p.Toolchain.ClangdVersion = selection.Version.String()
+						changed = true
+					}
+				}
+			}
 		}
-		probe.GeneratedHeaders = probe.GeneratedHeaders || hasGlob(filepath.Join(filepath.Dir(p.UProject), "Intermediate", "Build", "**", "*.generated.h"))
-		probe.ResponseFiles = probe.ResponseFiles || hasGlob(filepath.Join(filepath.Dir(p.UProject), "Intermediate", "Build", "**", "*.rsp"))
+		projectRoot := filepath.Dir(p.UProject)
+		probe.GeneratedHeaders = probe.GeneratedHeaders || hasBuildArtifact(projectRoot, ".generated.h")
+		probe.ResponseFiles = probe.ResponseFiles || hasBuildArtifact(projectRoot, ".rsp")
 	}
-	probe = (diagnostics.WindowsHostProbe{Environment: osEnvironment{}, FileSystem: hostFiles{}}).Apply(probe)
+	if changed {
+		if err := store.Save(ctx, r); err != nil {
+			return nil, err
+		}
+	}
+	probe = (diagnostics.WindowsHostProbe{Environment: a.d.Environment, FileSystem: a.d.Files}).Apply(probe)
 	return diagnostics.Check(probe), nil
 }
-func hasGlob(pattern string) bool { matches, _ := filepath.Glob(pattern); return len(matches) > 0 }
+
+const maxDoctorBuildEntries = 10_000
+const maxDoctorBuildDepth = 10
+
+// hasBuildArtifact scans the Unreal Intermediate/Build tree with fixed bounds.
+// Access errors are non-fatal: doctor reports the artifact missing instead of
+// failing the entire multi-project diagnosis on one inaccessible directory.
+func hasBuildArtifact(projectRoot, suffix string) bool {
+	root := filepath.Join(projectRoot, "Intermediate", "Build")
+	entries := 0
+	found := false
+	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || found {
+			if entry != nil && entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		entries++
+		if entries > maxDoctorBuildEntries {
+			return fs.SkipAll
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		depth := strings.Count(filepath.ToSlash(relative), "/")
+		if entry.IsDir() && depth >= maxDoctorBuildDepth {
+			return filepath.SkipDir
+		}
+		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), strings.ToLower(suffix)) {
+			found = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return found
+}
 
 type osEnvironment struct{}
 
