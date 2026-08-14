@@ -10,6 +10,9 @@ import (
 
 var ErrRequestFrameTooLarge = errors.New("MCP request frame exceeds configured limit")
 
+const maxMethodNameBytes = 128
+const maxToolNameBytes = 128
+
 // boundedJSONReader validates newline-delimited JSON-RPC before the SDK sees
 // it. In particular, it refuses large string IDs because JSON-RPC responses
 // normally echo an ID and could otherwise exceed the response cap.
@@ -60,11 +63,21 @@ func (r *boundedJSONReader) Read(dst []byte) (int, error) {
 
 func validateRequestID(line []byte, maxStringID int) error {
 	var request struct {
-		ID json.RawMessage `json:"id"`
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
 	}
-	if err := json.Unmarshal(line, &request); err != nil || len(request.ID) == 0 {
+	if err := json.Unmarshal(line, &request); err != nil {
 		// Let the SDK handle ordinary malformed JSON-RPC requests; the frame is
 		// still bounded and cannot trigger a reflected oversized ID.
+		return nil
+	}
+	if len(request.Method) > maxMethodNameBytes || len(request.Params.Name) > maxToolNameBytes {
+		return ErrRequestFrameTooLarge
+	}
+	if len(request.ID) == 0 {
 		return nil
 	}
 	var id string
