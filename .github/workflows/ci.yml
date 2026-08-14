@@ -20,6 +20,7 @@ jobs:
       - uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2.30.0
         with:
           msystem: MINGW64
+          path-type: inherit
           install: mingw-w64-x86_64-gcc
       - name: Verify formatting
         shell: pwsh
@@ -31,11 +32,8 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test with race detector
-        shell: pwsh
-        run: |
-          $env:CGO_ENABLED = '1'
-          $env:CC = 'C:\msys64\mingw64\bin\gcc.exe'
-          go test -race ./...
+        shell: msys2 {0}
+        run: CC=gcc go test -race ./...
       - name: Build Windows x64 binary
         shell: pwsh
         run: |
