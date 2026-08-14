@@ -107,3 +107,51 @@ func TestDiscoverAcceptsForwardSlashInput(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDiscoverRejectsNonUProjectJSON(t *testing.T) {
+	env := testutil.NewFakeUE58(t)
+	nonProject := filepath.Join(env.Root, "Game", "Game.json")
+	testutil.WriteFile(t, nonProject, `{"EngineAssociation":"UE_5.8"}`)
+	if _, err := Discover(ProjectRequest{UProject: nonProject, EngineRoot: env.EngineRoot}); err == nil {
+		t.Fatal("expected non-.uproject input to be rejected")
+	}
+}
+
+func TestDiscoverAcceptsCaseInsensitiveUProjectExtension(t *testing.T) {
+	env := testutil.NewFakeUE58(t)
+	upper := filepath.Join(env.Root, "Game", "Game.UPROJECT")
+	if err := os.Rename(env.UProject, upper); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Discover(ProjectRequest{UProject: upper, EngineRoot: env.EngineRoot}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDiscoverIgnoresDirectoriesMatchingEditorTargetPattern(t *testing.T) {
+	env := testutil.NewFakeUE58(t)
+	if err := os.Remove(filepath.Join(env.Root, "Game", "Source", "GameEditor.Target.cs")); err != nil {
+		t.Fatal(err)
+	}
+	matchingDirectory := filepath.Join(env.Root, "Game", "Source", "DirectoryEditor.Target.cs")
+	if err := os.Mkdir(matchingDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Discover(ProjectRequest{UProject: env.UProject, EngineRoot: env.EngineRoot})
+	if !errors.Is(err, ErrEditorTargetNotFound) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestValidateUnrealBuildToolPreservesStatFailure(t *testing.T) {
+	cause := errors.New("synthetic stat failure")
+	err := validateUnrealBuildTool("UnrealBuildTool.dll", func(string) (os.FileInfo, error) {
+		return nil, cause
+	})
+	if !errors.Is(err, cause) {
+		t.Fatalf("expected original cause, got %v", err)
+	}
+	if errors.Is(err, ErrUnrealBuildToolNotFound) {
+		t.Fatalf("unexpected missing-file classification: %v", err)
+	}
+}

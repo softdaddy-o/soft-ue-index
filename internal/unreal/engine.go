@@ -67,11 +67,24 @@ func discoverEngine(root string) (Engine, error) {
 		return Engine{}, fmt.Errorf("%w: %d.%d", ErrUnsupportedVersion, version.Major, version.Minor)
 	}
 	ubt := filepath.Join(normalizedRoot, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.dll")
-	info, err := os.Stat(ubt)
-	if err != nil || info.IsDir() {
-		return Engine{}, fmt.Errorf("%w: %s", ErrUnrealBuildToolNotFound, ubt)
+	if err := validateUnrealBuildTool(ubt, os.Stat); err != nil {
+		return Engine{}, err
 	}
 	return Engine{Root: normalizedRoot, Version: version, UnrealBuildToolPath: ubt}, nil
+}
+
+func validateUnrealBuildTool(path string, stat func(string) (os.FileInfo, error)) error {
+	info, err := stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %s: %w", ErrUnrealBuildToolNotFound, path, err)
+		}
+		return fmt.Errorf("inspect UnrealBuildTool.dll %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: %s is not a regular file", ErrUnrealBuildToolNotFound, path)
+	}
+	return nil
 }
 
 func normalizePath(path string) (string, error) {

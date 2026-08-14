@@ -42,6 +42,9 @@ func Discover(request ProjectRequest) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
+	if !strings.EqualFold(filepath.Ext(uprojectPath), ".uproject") {
+		return Project{}, fmt.Errorf("project path must have a .uproject extension: %s", uprojectPath)
+	}
 	contents, err := os.ReadFile(uprojectPath)
 	if err != nil {
 		return Project{}, fmt.Errorf("read .uproject: %w", err)
@@ -81,6 +84,20 @@ func discoverEditorTarget(uprojectPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("find editor targets: %w", err)
 	}
+	regularFiles := matches[:0]
+	for _, match := range matches {
+		info, statErr := os.Stat(match)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			return "", fmt.Errorf("inspect editor target %q: %w", match, statErr)
+		}
+		if info.Mode().IsRegular() {
+			regularFiles = append(regularFiles, match)
+		}
+	}
+	matches = regularFiles
 	exact := filepath.Join(filepath.Dir(uprojectPath), "Source", projectName+"Editor.Target.cs")
 	for _, match := range matches {
 		if strings.EqualFold(filepath.Clean(match), filepath.Clean(exact)) {
