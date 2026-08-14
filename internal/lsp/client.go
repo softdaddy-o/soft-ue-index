@@ -73,6 +73,10 @@ func (c *Client) readLoop() {
 			}
 			continue
 		}
+		if m.Method != "" && len(m.ID) != 0 {
+			go c.respondServerRequest(m)
+			continue
+		}
 		var id uint64
 		if json.Unmarshal(m.ID, &id) != nil {
 			continue
@@ -87,6 +91,18 @@ func (c *Client) readLoop() {
 			}
 		}
 	}
+}
+func (c *Client) respondServerRequest(m wireMessage) {
+	if m.Method == "workspace/configuration" {
+		var p struct {
+			Items []json.RawMessage `json:"items"`
+		}
+		_ = json.Unmarshal(m.Params, &p)
+		result := make([]any, len(p.Items))
+		_ = c.send(wireMessage{JSONRPC: "2.0", ID: m.ID, Result: mustJSON(result)})
+		return
+	}
+	_ = c.send(wireMessage{JSONRPC: "2.0", ID: m.ID, Error: &rpcError{Code: -32601, Message: "Method not found"}})
 }
 func (c *Client) terminate() {
 	c.mu.Lock()

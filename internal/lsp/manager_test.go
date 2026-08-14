@@ -226,3 +226,23 @@ func TestManagerAcceptsCompilationDatabaseFileAndRejectsMismatch(t *testing.T) {
 		t.Fatal("expected mismatch rejection")
 	}
 }
+func TestCallerCancellationDoesNotOwnSharedProcess(t *testing.T) {
+	f := &fakeFactory{}
+	m := NewManager(f)
+	defer m.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cfg := ProjectConfig{ID: "owned", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"}
+	if _, err := m.Client(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if _, err := m.Client(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	n := f.n
+	f.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("caller cancellation restarted process: %d", n)
+	}
+}

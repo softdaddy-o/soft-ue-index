@@ -116,3 +116,33 @@ func TestHoverUnion(t *testing.T) {
 		t.Fatalf("%#v %v", h, err)
 	}
 }
+func TestClientRepliesToServerConfigurationRequest(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{})
+	defer c.Close()
+	done := make(chan error, 1)
+	go func() {
+		r := bufio.NewReader(b)
+		body, _ := readFrame(r, 1024)
+		var q wireMessage
+		_ = json.Unmarshal(body, &q)
+		_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: mustJSON(77), Method: "workspace/configuration", Params: mustJSON(map[string]any{"items": []any{map[string]any{}}})}))
+		body, _ = readFrame(r, 1024)
+		var reply wireMessage
+		_ = json.Unmarshal(body, &reply)
+		if string(reply.ID) != "77" {
+			done <- errors.New("bad server reply")
+			return
+		}
+		_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: q.ID, Result: mustJSON([]any{})}))
+		done <- nil
+	}()
+	var out []Symbol
+	if err := c.WorkspaceSymbol(context.Background(), "x", &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

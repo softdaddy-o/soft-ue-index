@@ -26,14 +26,24 @@ type execProcess struct {
 	*exec.Cmd
 	in  io.WriteCloser
 	out io.ReadCloser
+	log io.Closer
 }
 
 func (p *execProcess) Stdin() io.WriteCloser { return p.in }
 func (p *execProcess) Stdout() io.ReadCloser { return p.out }
 func (p *execProcess) Kill() error           { return p.Process.Kill() }
+func (p *execProcess) Wait() error {
+	err := p.Cmd.Wait()
+	if p.log != nil {
+		_ = p.log.Close()
+		p.log = nil
+	}
+	return err
+}
 func (ExecFactory) Start(ctx context.Context, path string, args []string, logPath string) (Process, error) {
 	cmd := exec.CommandContext(ctx, path, args...)
 	var err error
+	var logFile io.Closer
 	if logPath != "" {
 		if err = os.MkdirAll(filepath.Dir(logPath), 0700); err != nil {
 			return nil, err
@@ -43,6 +53,7 @@ func (ExecFactory) Start(ctx context.Context, path string, args []string, logPat
 			return nil, e
 		}
 		cmd.Stderr = f
+		logFile = f
 	}
 	in, e := cmd.StdinPipe()
 	if e != nil {
@@ -55,7 +66,7 @@ func (ExecFactory) Start(ctx context.Context, path string, args []string, logPat
 	if e = cmd.Start(); e != nil {
 		return nil, e
 	}
-	return &execProcess{cmd, in, out}, nil
+	return &execProcess{Cmd: cmd, in: in, out: out, log: logFile}, nil
 }
 
 type ProjectConfig struct {
@@ -82,6 +93,7 @@ type session struct {
 	failures  int
 	nextStart time.Time
 	starting  chan struct{}
+	cancel    context.CancelFunc
 }
 
 func NewManager(factory ProcessFactory) *Manager {
@@ -144,7 +156,9 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 		s.starting = make(chan struct{})
 		wait := s.starting
 		m.mu.Unlock()
-		p, err := m.start(ctx, cfg)
+		sessionCtx, cancel := context.WithCancel(context.Background())
+		s.cancel = cancel
+		p, err := m.start(sessionCtx, cfg)
 		m.mu.Lock()
 		if err == nil {
 			s.process = p
@@ -160,7 +174,12 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 			s.nextStart = m.now().Add(backoff(s.failures))
 			if p != nil {
 				_ = p.Kill()
+				_ = p.Wait()
 			}
+			if s.client != nil {
+				s.client.Close()
+			}
+			cancel()
 			s.client = nil
 			s.process = nil
 		}
@@ -216,6 +235,10 @@ func (m *Manager) watch(id string, s *session, p Process) {
 	}
 	s.client = nil
 	s.process = nil
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
 	s.failures++
 	s.nextStart = m.now().Add(backoff(s.failures))
 }
@@ -244,6 +267,9 @@ func (m *Manager) stop(id string, s *session) {
 	if s.process != nil {
 		_ = s.process.Kill()
 	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	delete(m.sessions, id)
 }
 func (m *Manager) Close() {
@@ -266,6 +292,9 @@ func (m *Manager) Close() {
 		}
 		if s.process != nil {
 			_ = s.process.Kill()
+		}
+		if s.cancel != nil {
+			s.cancel()
 		}
 	}
 }
