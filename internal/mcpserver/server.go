@@ -424,6 +424,8 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	if err != nil {
 		return ReadSymbolSourceResult{}, err
 	}
+	ctx, cancel := context.WithTimeout(ctx, s.limits.Timeout)
+	defer cancel()
 	file, err := s.openFile(path)
 	if err != nil {
 		return ReadSymbolSourceResult{}, mapError(err)

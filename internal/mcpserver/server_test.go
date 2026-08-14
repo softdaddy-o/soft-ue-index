@@ -226,17 +226,15 @@ func TestReadSymbolSourceStreamsWithoutReadingWholeFile(t *testing.T) {
 	}
 }
 
-func TestReadSymbolSourceCancellationClosesBlockedReader(t *testing.T) {
+func TestReadSymbolSourceServerTimeoutClosesBlockedReader(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "S.cpp")
 	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
 		t.Fatal(err)
 	}
 	r := &blockingReader{closed: make(chan struct{})}
-	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}, OpenFile: func(string) (io.ReadCloser, error) { return r, nil }})
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	_, err := s.ReadSymbolSource(ctx, ReadSymbolSourceInput{ProjectID: "p", Path: path, StartLine: 1, EndLine: 1})
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}, OpenFile: func(string) (io.ReadCloser, error) { return r, nil }, Limits: Limits{Timeout: 20 * time.Millisecond}})
+	_, err := s.ReadSymbolSource(context.Background(), ReadSymbolSourceInput{ProjectID: "p", Path: path, StartLine: 1, EndLine: 1})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("cancel error: %v", err)
 	}
