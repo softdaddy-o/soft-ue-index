@@ -114,6 +114,58 @@ func TestOrdinarySourceWriteNotifiesMatchingProjectWithoutRegeneration(t *testin
 	}
 }
 
+func TestAtomicSourceReplacementAndRemovalNotifyAndInvalidate(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "Source")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sourceDir, "Foo.cpp")
+	changes := make(chan SourceWrite, 4)
+	results := make(chan Result, 4)
+	c := NewCoordinatorWithOptions(watcherNoopGenerator{}, 1, 0, CoordinatorOptions{Result: func(result Result) { results <- result }})
+	defer c.Close()
+	w, err := NewWatcherWithOptions(c, WatcherOptions{SourceWrite: func(change SourceWrite) { changes <- change }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.AddProject(ProjectRoots{ID: "game", ProjectRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Create})
+	if got := <-changes; got.Path != path || got.Removed {
+		t.Fatalf("create change=%+v", got)
+	}
+	if got := <-results; got.ProjectID != "game" {
+		t.Fatal(got)
+	}
+	for len(changes) > 0 {
+		<-changes
+	}
+	for len(results) > 0 {
+		<-results
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Rename})
+	for {
+		got := <-changes
+		if got.Path == path && got.Removed {
+			break
+		}
+	}
+	if got := <-results; got.ProjectID != "game" {
+		t.Fatal(got)
+	}
+}
+
 func TestUnrealInstallEngineTreesAreWatchedAndClassified(t *testing.T) {
 	project, install := t.TempDir(), t.TempDir()
 	engineSource := filepath.Join(install, "Engine", "Source", "Runtime", "Core")

@@ -558,6 +558,7 @@ func (f watchGenerator) Generate(ctx context.Context, id string) error { return 
 
 type sourceChangeSink interface {
 	SourceFileChanged(string, string) error
+	SourceFileRemoved(string, string) error
 }
 
 func (a *App) watchReal(ctx context.Context, projects []registry.Project) error {
@@ -596,7 +597,13 @@ func (a *App) watchRealWithSink(ctx context.Context, projects []registry.Project
 	defer coordinator.Close()
 	w, err := uewatch.NewWatcherWithOptions(coordinator, uewatch.WatcherOptions{SourceWrite: func(change uewatch.SourceWrite) {
 		if sink != nil {
-			if err := sink.SourceFileChanged(change.ProjectID, change.Path); err != nil {
+			var err error
+			if change.Removed {
+				err = sink.SourceFileRemoved(change.ProjectID, change.Path)
+			} else {
+				err = sink.SourceFileChanged(change.ProjectID, change.Path)
+			}
+			if err != nil {
 				a.reportWatchError(err)
 			}
 		}

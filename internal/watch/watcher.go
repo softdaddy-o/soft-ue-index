@@ -13,7 +13,10 @@ import (
 
 // ProjectRoots contains roots relevant to one project. Engine roots are shared safely.
 type ProjectRoots struct{ ID, ProjectRoot, EngineRoot string }
-type SourceWrite struct{ ProjectID, Path string }
+type SourceWrite struct {
+	ProjectID, Path string
+	Removed         bool
+}
 type WatcherOptions struct{ SourceWrite func(SourceWrite) }
 
 // Watcher owns one fsnotify watcher and translates events into coordinated invalidations.
@@ -174,16 +177,21 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		}
 		return
 	}
+	if isSourceFile(filepath.Base(event.Name)) && event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 && w.onSourceWrite != nil {
+		removed := false
+		if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+			_, err := os.Stat(event.Name)
+			removed = os.IsNotExist(err)
+		}
+		for _, id := range ids {
+			w.onSourceWrite(SourceWrite{ProjectID: id, Path: event.Name, Removed: removed})
+		}
+	}
 	if RequiresCompDB(event.Name, event.Op) && w.coordinator != nil {
 		for _, id := range ids {
 			w.coordinator.Invalidate(id)
 		}
 		return
-	}
-	if event.Op&fsnotify.Write != 0 && isSourceFile(filepath.Base(event.Name)) && w.onSourceWrite != nil {
-		for _, id := range ids {
-			w.onSourceWrite(SourceWrite{ProjectID: id, Path: event.Name})
-		}
 	}
 }
 func (w *Watcher) fail(err error) {

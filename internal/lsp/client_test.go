@@ -85,6 +85,38 @@ func TestSourceWriteNotifiesWatchedFileWhenDocumentIsClosed(t *testing.T) {
 	}
 }
 
+func TestSourceRemovalClosesOpenDocumentAndNotifiesDeletion(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{})
+	defer c.Close()
+	uri := "file:///game/Source/Foo.cpp"
+	messages := make(chan wireMessage, 3)
+	go func() {
+		r := bufio.NewReader(b)
+		for range 3 {
+			body, _ := readFrame(r, 4096)
+			var message wireMessage
+			_ = json.Unmarshal(body, &message)
+			messages <- message
+		}
+	}()
+	if err := c.DidOpen(uri, "cpp", "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SourceFileRemoved(uri); err != nil {
+		t.Fatal(err)
+	}
+	<-messages
+	closeMessage, watchedMessage := <-messages, <-messages
+	if closeMessage.Method != "textDocument/didClose" {
+		t.Fatalf("first removal message=%s", closeMessage.Method)
+	}
+	if watchedMessage.Method != "workspace/didChangeWatchedFiles" || !strings.Contains(string(watchedMessage.Params), `"type":3`) {
+		t.Fatalf("watched message=%+v params=%s", watchedMessage, watchedMessage.Params)
+	}
+}
+
 func TestTerminateDoesNotCloseDetachedResponseChannel(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()

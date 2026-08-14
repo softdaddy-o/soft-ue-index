@@ -512,6 +512,21 @@ func (m *Manager) SourceFileChanged(id, path string) error {
 	return client.SourceFileChanged(pathURI(seed.Path), string(seed.Text))
 }
 
+// SourceFileRemoved forwards a deletion only to an already-running session.
+func (m *Manager) SourceFileRemoved(id, path string) error {
+	m.mu.Lock()
+	s := m.sessions[id]
+	var client *Client
+	if s != nil {
+		client = s.client
+	}
+	m.mu.Unlock()
+	if client == nil {
+		return nil
+	}
+	return client.SourceFileRemoved(pathURI(path))
+}
+
 func (m *Manager) stop(id string, s *session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

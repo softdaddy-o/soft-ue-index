@@ -553,6 +553,20 @@ func (c *Client) SourceFileChanged(uri, text string) error {
 	return nil
 }
 
+// SourceFileRemoved forgets any open in-memory document before telling clangd
+// that the backing file disappeared.
+func (c *Client) SourceFileRemoved(uri string) error {
+	c.openMu.Lock()
+	defer c.openMu.Unlock()
+	if _, open := c.opened[uri]; open {
+		if err := c.Notify("textDocument/didClose", map[string]any{"textDocument": map[string]string{"uri": uri}}); err != nil {
+			return err
+		}
+		delete(c.opened, uri)
+	}
+	return c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": []map[string]any{{"uri": uri, "type": 3}}})
+}
+
 func (c *Client) ensureDocumentOpen(uri string) error {
 	c.openMu.Lock()
 	defer c.openMu.Unlock()

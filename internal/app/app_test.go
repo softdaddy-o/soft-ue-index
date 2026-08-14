@@ -302,6 +302,10 @@ func (r recordingSourceChanges) SourceFileChanged(id, path string) error {
 	r.changes <- id + ":" + path
 	return nil
 }
+func (r recordingSourceChanges) SourceFileRemoved(id, path string) error {
+	r.changes <- id + ":removed:" + path
+	return nil
+}
 
 func (r appRunner) Run(name string, _ ...string) (string, error) {
 	if output, ok := r.outputs[name]; ok {
