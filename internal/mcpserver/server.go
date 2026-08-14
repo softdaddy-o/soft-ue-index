@@ -2,9 +2,11 @@
 package mcpserver
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,28 +33,28 @@ type Queries interface {
 	Locations(context.Context, registry.Project, string, TextPosition, int) ([]lsp.Location, error)
 	DocumentSymbols(context.Context, registry.Project, string, int) ([]lsp.DocumentSymbol, error)
 	Hover(context.Context, registry.Project, TextPosition) (*lsp.HoverResult, error)
-	CallHierarchy(context.Context, registry.Project, string, TextPosition, int) (any, error)
+	CallHierarchy(context.Context, registry.Project, string, TextPosition, int) ([]lsp.CallHierarchyItem, error)
 }
 
 type Dependencies struct {
 	Projects ProjectLoader
 	Queries  Queries
-	ReadFile func(string) ([]byte, error)
+	OpenFile func(string) (io.ReadCloser, error)
 	Limits   Limits
 }
 
 type Server struct {
 	projects ProjectLoader
 	queries  Queries
-	readFile func(string) ([]byte, error)
+	openFile func(string) (io.ReadCloser, error)
 	limits   Limits
 }
 
 func New(d Dependencies) *Server {
-	if d.ReadFile == nil {
-		d.ReadFile = os.ReadFile
+	if d.OpenFile == nil {
+		d.OpenFile = func(path string) (io.ReadCloser, error) { return os.Open(path) }
 	}
-	return &Server{projects: d.Projects, queries: d.Queries, readFile: d.ReadFile, limits: d.Limits.normalized()}
+	return &Server{projects: d.Projects, queries: d.Queries, openFile: d.OpenFile, limits: d.Limits.normalized()}
 }
 
 type SearchSymbolsInput struct {
@@ -88,6 +90,8 @@ func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (Sear
 		result.Items = result.Items[:max]
 		result.Truncated = true
 	}
+	result.Items, result.Truncated = s.filterSymbols(p, result.Items, result.Truncated)
+	result.Items, result.Truncated = trimSymbols(result.Items, s.limits.MaxResponseBytes, result.Truncated)
 	return result, nil
 }
 
@@ -116,15 +120,23 @@ type PathQueryInput struct {
 	Path      string `json:"path"`
 	MaxItems  int    `json:"max_items,omitempty"`
 }
+type DocumentSymbol struct {
+	Name           string    `json:"name"`
+	Kind           int       `json:"kind"`
+	Range          lsp.Range `json:"range"`
+	SelectionRange lsp.Range `json:"selection_range"`
+}
 type DocumentSymbolsResult struct {
-	Items     []lsp.DocumentSymbol `json:"items"`
-	Truncated bool                 `json:"truncated"`
+	Items     []DocumentSymbol `json:"items"`
+	Truncated bool             `json:"truncated"`
 }
 type HoverResult struct {
-	Item *lsp.HoverResult `json:"item,omitempty"`
+	Item      *lsp.HoverResult `json:"item,omitempty"`
+	Truncated bool             `json:"truncated"`
 }
 type CallHierarchyResult struct {
-	Item any `json:"item"`
+	Items     []lsp.CallHierarchyItem `json:"items"`
+	Truncated bool                    `json:"truncated"`
 }
 
 func (s *Server) locations(ctx context.Context, kind string, in LocationQueryInput) (LocationsResult, error) {
@@ -150,6 +162,8 @@ func (s *Server) locations(ctx context.Context, kind string, in LocationQueryInp
 		r.Items = r.Items[:max]
 		r.Truncated = true
 	}
+	r.Items, r.Truncated = s.filterLocations(p, r.Items, r.Truncated)
+	r.Items, r.Truncated = trimLocations(r.Items, s.limits.MaxResponseBytes, r.Truncated)
 	return r, nil
 }
 func (s *Server) FindDefinition(ctx context.Context, in LocationQueryInput) (LocationsResult, error) {
@@ -180,11 +194,12 @@ func (s *Server) DocumentSymbols(ctx context.Context, in PathQueryInput) (Docume
 	if err != nil {
 		return DocumentSymbolsResult{}, mapError(err)
 	}
-	r := DocumentSymbolsResult{Items: items}
+	r := DocumentSymbolsResult{Items: flattenSymbols(items)}
 	if len(r.Items) > max {
 		r.Items = r.Items[:max]
 		r.Truncated = true
 	}
+	r.Items, r.Truncated = trimDocumentSymbols(r.Items, s.limits.MaxResponseBytes, r.Truncated)
 	return r, nil
 }
 func (s *Server) Hover(ctx context.Context, in LocationQueryInput) (HoverResult, error) {
@@ -201,7 +216,15 @@ func (s *Server) Hover(ctx context.Context, in LocationQueryInput) (HoverResult,
 	ctx, cancel := context.WithTimeout(ctx, s.limits.Timeout)
 	defer cancel()
 	v, err := s.queries.Hover(ctx, p, in.Position)
-	return HoverResult{Item: v}, mapError(err)
+	if err != nil {
+		return HoverResult{}, mapError(err)
+	}
+	r := HoverResult{Item: v}
+	if v != nil && len(v.Contents.Value) > s.limits.MaxResponseBytes {
+		v.Contents.Value = v.Contents.Value[:s.limits.MaxResponseBytes]
+		r.Truncated = true
+	}
+	return r, nil
 }
 func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (CallHierarchyResult, error) {
 	p, err := s.project(ctx, in.ProjectID)
@@ -223,8 +246,17 @@ func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (Call
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.limits.Timeout)
 	defer cancel()
-	v, err := s.queries.CallHierarchy(ctx, p, kind, in.Position, s.itemLimit(in.MaxItems))
-	return CallHierarchyResult{Item: v}, mapError(err)
+	v, err := s.queries.CallHierarchy(ctx, p, kind, in.Position, s.itemLimit(in.MaxItems)+1)
+	if err != nil {
+		return CallHierarchyResult{}, mapError(err)
+	}
+	r := CallHierarchyResult{Items: v}
+	if len(r.Items) > s.itemLimit(in.MaxItems) {
+		r.Items = r.Items[:s.itemLimit(in.MaxItems)]
+		r.Truncated = true
+	}
+	r.Items, r.Truncated = s.filterCalls(p, r.Items, r.Truncated)
+	return r, nil
 }
 func (s *Server) validatePosition(p registry.Project, v TextPosition) error {
 	if v.Line < 0 || v.Character < 0 {
@@ -320,7 +352,7 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	if err != nil {
 		return ReadSymbolSourceResult{}, err
 	}
-	contents, err := s.readFile(path)
+	file, err := s.openFile(path)
 	if err != nil {
 		return ReadSymbolSourceResult{}, mapError(err)
 	}
@@ -328,18 +360,56 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	if in.MaxBytes > 0 && in.MaxBytes < limit {
 		limit = in.MaxBytes
 	}
-	lines := strings.Split(string(contents), "\n")
-	if in.StartLine > len(lines) {
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	// A fixed scanner ceiling bounds a single hostile line independently of the
+	// caller's output budget. Long lines are reported as a bounded read error.
+	scanner.Buffer(make([]byte, 4096), 64*1024)
+	line := 0
+	end := in.StartLine - 1
+	var b strings.Builder
+	truncated := false
+	for scanner.Scan() {
+		line++
+		if line < in.StartLine {
+			continue
+		}
+		if line > in.EndLine {
+			break
+		}
+		part := scanner.Text()
+		need := len(part)
+		if end >= in.StartLine {
+			need++
+		}
+		if b.Len()+need > limit {
+			remaining := limit - b.Len()
+			if end >= in.StartLine && remaining > 0 {
+				b.WriteByte('\n')
+				remaining--
+			}
+			if remaining > 0 {
+				b.WriteString(part[:min(remaining, len(part))])
+			}
+			truncated = true
+			break
+		}
+		if end >= in.StartLine {
+			b.WriteByte('\n')
+		}
+		b.WriteString(part)
+		end = line
+		if line == in.EndLine {
+			return ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated}, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return ReadSymbolSourceResult{}, mapError(err)
+	}
+	if line < in.StartLine {
 		return ReadSymbolSourceResult{}, errors.New("start_line is outside the file")
 	}
-	end := min(in.EndLine, len(lines))
-	text := strings.Join(lines[in.StartLine-1:end], "\n")
-	truncated := false
-	if len(text) > limit {
-		text = text[:limit]
-		truncated = true
-	}
-	return ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: text, Truncated: truncated}, nil
+	return ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated}, nil
 }
 
 func (s *Server) project(ctx context.Context, id string) (registry.Project, error) {
@@ -402,4 +472,97 @@ func safePath(path string, roots ...string) (string, error) {
 		}
 	}
 	return "", ErrPathForbidden
+}
+
+func (s *Server) allowed(p registry.Project, uri string) bool {
+	path := strings.TrimPrefix(uri, "file://")
+	_, err := safePath(path, filepath.Dir(p.UProject), p.Engine.Root)
+	return err == nil
+}
+func (s *Server) filterSymbols(p registry.Project, in []lsp.Symbol, truncated bool) ([]lsp.Symbol, bool) {
+	out := in[:0]
+	for _, v := range in {
+		if v.Location.URI == "" || s.allowed(p, v.Location.URI) {
+			out = append(out, v)
+		} else {
+			truncated = true
+		}
+	}
+	return out, truncated
+}
+func (s *Server) filterLocations(p registry.Project, in []lsp.Location, truncated bool) ([]lsp.Location, bool) {
+	out := in[:0]
+	for _, v := range in {
+		if s.allowed(p, v.URI) {
+			out = append(out, v)
+		} else {
+			truncated = true
+		}
+	}
+	return out, truncated
+}
+func (s *Server) filterCalls(p registry.Project, in []lsp.CallHierarchyItem, truncated bool) ([]lsp.CallHierarchyItem, bool) {
+	out := in[:0]
+	for _, v := range in {
+		if s.allowed(p, v.URI) {
+			out = append(out, v)
+		} else {
+			truncated = true
+		}
+	}
+	return out, truncated
+}
+func flattenSymbols(in []lsp.DocumentSymbol) []DocumentSymbol {
+	out := make([]DocumentSymbol, 0)
+	var walk func([]lsp.DocumentSymbol)
+	walk = func(xs []lsp.DocumentSymbol) {
+		for _, v := range xs {
+			out = append(out, DocumentSymbol{Name: v.Name, Kind: v.Kind, Range: v.Range, SelectionRange: v.SelectionRange})
+			walk(v.Children)
+		}
+	}
+	walk(in)
+	return out
+}
+func trimSymbols(in []lsp.Symbol, max int, tr bool) ([]lsp.Symbol, bool) {
+	out := make([]lsp.Symbol, 0, len(in))
+	used := 0
+	for _, v := range in {
+		n := len(v.Name) + len(v.ContainerName) + 128
+		if used+n > max {
+			tr = true
+			break
+		}
+		out = append(out, v)
+		used += n
+	}
+	return out, tr
+}
+func trimLocations(in []lsp.Location, max int, tr bool) ([]lsp.Location, bool) {
+	out := make([]lsp.Location, 0, len(in))
+	used := 0
+	for _, v := range in {
+		n := len(v.URI) + 96
+		if used+n > max {
+			tr = true
+			break
+		}
+		out = append(out, v)
+		used += n
+	}
+	return out, tr
+}
+func trimDocumentSymbols(in []DocumentSymbol, max int, tr bool) ([]DocumentSymbol, bool) {
+	out := make([]DocumentSymbol, 0, len(in))
+	used := 0
+	for _, v := range in {
+		n := len(v.Name) + 96
+		if used+n > max {
+			tr = true
+			break
+		}
+		out = append(out, v)
+		used += n
+	}
+	return out, tr
 }

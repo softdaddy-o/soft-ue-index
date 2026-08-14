@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -92,7 +93,7 @@ func (f *fakeQueries) DocumentSymbols(context.Context, registry.Project, string,
 func (f *fakeQueries) Hover(context.Context, registry.Project, TextPosition) (*lsp.HoverResult, error) {
 	return nil, f.err
 }
-func (f *fakeQueries) CallHierarchy(context.Context, registry.Project, string, TextPosition, int) (any, error) {
+func (f *fakeQueries) CallHierarchy(context.Context, registry.Project, string, TextPosition, int) ([]lsp.CallHierarchyItem, error) {
 	return nil, f.err
 }
 
@@ -149,5 +150,55 @@ func TestOfficialSDKRegistersAllReadOnlyTools(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Fatalf("missing SDK tools: %v", want)
+	}
+}
+
+func TestSemanticResultsExcludeOtherProjectPaths(t *testing.T) {
+	root := t.TempDir()
+	other := t.TempDir()
+	project := registry.Project{ID: "alpha", UProject: filepath.Join(root, "A.uproject")}
+	inside := filepath.Join(root, "Source.cpp")
+	outside := filepath.Join(other, "Other.cpp")
+	if err := os.WriteFile(inside, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Dependencies{})
+	got, tr := s.filterLocations(project, []lsp.Location{{URI: "file://" + inside}, {URI: "file://" + outside}}, false)
+	if len(got) != 1 || got[0].URI != "file://"+inside || !tr {
+		t.Fatalf("unsafe results leaked: %#v %v", got, tr)
+	}
+}
+
+type countedReader struct {
+	data  []byte
+	reads int
+}
+
+func (r *countedReader) Read(p []byte) (int, error) {
+	r.reads++
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+func TestReadSymbolSourceStreamsWithoutReadingWholeFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "S.cpp")
+	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r := &countedReader{data: append([]byte("first\n"), make([]byte, 1<<20)...)}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}, OpenFile: func(string) (io.ReadCloser, error) { return io.NopCloser(r), nil }, Limits: Limits{MaxSourceBytes: 32}})
+	got, err := s.ReadSymbolSource(context.Background(), ReadSymbolSourceInput{ProjectID: "p", Path: path, StartLine: 1, EndLine: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "first" || r.reads > 2 {
+		t.Fatalf("reader was not bounded: %#v reads=%d", got, r.reads)
 	}
 }

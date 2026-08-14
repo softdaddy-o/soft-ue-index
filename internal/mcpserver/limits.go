@@ -12,11 +12,12 @@ const (
 // Limits bound every MCP request and response so a malformed client cannot
 // turn code intelligence into an unbounded local-file or memory operation.
 type Limits struct {
-	MaxItems       int
-	MaxQueryBytes  int
-	MaxPathBytes   int
-	MaxSourceBytes int
-	Timeout        time.Duration
+	MaxItems         int
+	MaxQueryBytes    int
+	MaxPathBytes     int
+	MaxSourceBytes   int
+	MaxResponseBytes int
+	Timeout          time.Duration
 }
 
 func (l Limits) normalized() Limits {
@@ -31,6 +32,9 @@ func (l Limits) normalized() Limits {
 	}
 	if l.MaxSourceBytes <= 0 {
 		l.MaxSourceBytes = defaultMaxBytes
+	}
+	if l.MaxResponseBytes <= 0 {
+		l.MaxResponseBytes = defaultMaxBytes
 	}
 	if l.Timeout <= 0 {
 		l.Timeout = 15 * time.Second
