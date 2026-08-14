@@ -1,20 +1,28 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)] [string] $UProject,
-    [string] $Engine,
-    [string] $Clangd,
-    [string[]] $Symbol = @(),
+    [Parameter(Mandatory = $true)] [string] $ProjectSymbol,
+    [Parameter(Mandatory = $true)] [string] $EngineSymbol,
     [string] $Executable = 'soft-ue-index.exe'
 )
 
 $ErrorActionPreference = 'Stop'
 
 function Invoke-Tool([string[]] $Arguments) {
-    & $Executable @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "soft-ue-index failed: $Arguments" }
+    $null = & $Executable @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "soft-ue-index failed with exit code $LASTEXITCODE" }
 }
 
-function Invoke-McpSmoke([string] $ProjectID, [string[]] $Symbols) {
+function Convert-FileUriToPath([string] $Uri) {
+    return ([Uri]$Uri).LocalPath
+}
+
+function Assert-UnderRoot([string] $Uri, [string] $Root, [string] $Kind) {
+    $path = Convert-FileUriToPath $Uri
+    if (-not $path.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) { throw "MCP $Kind result was outside its expected source root" }
+}
+
+function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $EngineRoot, [string] $ProjectQuery, [string] $EngineQuery) {
     $psi = [Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $Executable
     $psi.ArgumentList.Add('mcp')
@@ -37,9 +45,20 @@ function Invoke-McpSmoke([string] $ProjectID, [string[]] $Symbols) {
         $projects = Send-Request @{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = @{ name = 'list_projects'; arguments = @{ max_items = 20 } } }
         if (-not $projects.result) { throw 'MCP list_projects did not return a result' }
         $id = 3
-        foreach ($name in $Symbols) {
-            $response = Send-Request @{ jsonrpc = '2.0'; id = $id; method = 'tools/call'; params = @{ name = 'search_symbols'; arguments = @{ project_id = $ProjectID; query = $name; max_items = 10 } } }
-            if (-not $response.result) { throw "MCP search_symbols failed for supplied symbol" }
+        foreach ($case in @(@{ Query = $ProjectQuery; Root = $ProjectRoot; Kind = 'project' }, @{ Query = $EngineQuery; Root = $EngineRoot; Kind = 'engine' })) {
+            $response = Send-Request @{ jsonrpc = '2.0'; id = $id; method = 'tools/call'; params = @{ name = 'search_symbols'; arguments = @{ project_id = $ProjectID; query = $case.Query; max_items = 10 } } }
+            $items = @($response.result.structuredContent.items)
+            if ($items.Count -eq 0) { throw "MCP search_symbols returned no $($case.Kind) result" }
+            $symbol = $items | Where-Object { (Convert-FileUriToPath $_.location.uri).StartsWith($case.Root, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            if (-not $symbol) { throw "MCP search_symbols did not return a $($case.Kind) source result" }
+            Assert-UnderRoot $symbol.location.uri $case.Root $case.Kind
+            $position = @{ path = (Convert-FileUriToPath $symbol.location.uri); line = $symbol.location.range.start.line; character = $symbol.location.range.start.character }
+            $definition = Send-Request @{ jsonrpc = '2.0'; id = ($id + 100); method = 'tools/call'; params = @{ name = 'find_definition'; arguments = @{ project_id = $ProjectID; position = $position; max_items = 10 } } }
+            $definitions = @($definition.result.structuredContent.items)
+            if ($definitions.Count -eq 0) { throw "MCP find_definition returned no $($case.Kind) result" }
+            Assert-UnderRoot $definitions[0].uri $case.Root $case.Kind
+            $references = Send-Request @{ jsonrpc = '2.0'; id = ($id + 200); method = 'tools/call'; params = @{ name = 'find_references'; arguments = @{ project_id = $ProjectID; position = $position; max_items = 10 } } }
+            if (-not $references.result) { throw "MCP find_references failed for $($case.Kind) symbol" }
             $id++
         }
     } finally {
@@ -50,12 +69,6 @@ function Invoke-McpSmoke([string] $ProjectID, [string[]] $Symbols) {
 
 if (-not (Test-Path -LiteralPath $UProject -PathType Leaf)) { throw "UProject was not found" }
 if (-not (Get-Command $Executable -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath $Executable -PathType Leaf)) { throw "Executable was not found: $Executable" }
-if ($Engine -and -not (Test-Path -LiteralPath $Engine -PathType Container)) { throw 'Engine directory was not found' }
-if ($Clangd) {
-    if (-not (Test-Path -LiteralPath $Clangd -PathType Leaf)) { throw 'clangd executable was not found' }
-    & $Clangd --version | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'clangd version check failed' }
-}
 
 $start = Get-Date
 $projects = (& $Executable list --json | ConvertFrom-Json)
@@ -66,7 +79,6 @@ if (-not $project) {
     $project = $projects | Where-Object { $_.uproject -eq (Resolve-Path -LiteralPath $UProject).Path } | Select-Object -First 1
 }
 if (-not $project) { throw 'Registered project was not found' }
-if ($Engine -and $project.engine.root -ne (Resolve-Path -LiteralPath $Engine).Path) { throw 'Registered engine does not match -Engine' }
 Invoke-Tool @('doctor', '--json')
 Invoke-Tool @('generate', $project.id)
 
@@ -80,6 +92,6 @@ $engineRoot = $project.engine.root
 $projectCount = @($entries | Where-Object { $_.file.StartsWith($projectRoot, [StringComparison]::OrdinalIgnoreCase) }).Count
 $engineCount = @($entries | Where-Object { $_.file.StartsWith($engineRoot, [StringComparison]::OrdinalIgnoreCase) }).Count
 if ($projectCount -eq 0 -or $engineCount -eq 0) { throw 'Compilation database does not cover both project and engine translation units' }
-Invoke-McpSmoke $project.id $Symbol
+Invoke-McpSmoke $project.id $projectRoot $engineRoot $ProjectSymbol $EngineSymbol
 $elapsed = [Math]::Round(((Get-Date) - $start).TotalSeconds, 2)
 Write-Output ("integration passed: project_tus={0}; engine_tus={1}; seconds={2}" -f $projectCount, $engineCount, $elapsed)

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch] $SkipRace)
 
 $ErrorActionPreference = 'Stop'
 $files = Get-ChildItem -Recurse -Filter *.go | ForEach-Object FullName
@@ -10,7 +10,13 @@ if ($unformatted) {
 }
 go vet ./...
 if ($LASTEXITCODE -ne 0) { throw 'go vet failed' }
-go test ./...
+if (-not $SkipRace) {
+    go test -race ./...
+    if ($LASTEXITCODE -ne 0) { throw 'go test -race failed; install a Windows C compiler or rerun with -SkipRace for a local non-race check' }
+} else {
+    Write-Warning 'Race detector explicitly skipped.'
+    go test ./...
+}
 if ($LASTEXITCODE -ne 0) { throw 'go test failed' }
 go build -trimpath ./cmd/soft-ue-index
 if ($LASTEXITCODE -ne 0) { throw 'go build failed' }
