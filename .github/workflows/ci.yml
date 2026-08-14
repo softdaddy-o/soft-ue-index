@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Verify formatting
+        shell: pwsh
+        run: |
+          $unformatted = & gofmt -l (Get-ChildItem -Recurse -Filter *.go | ForEach-Object FullName)
+          if ($unformatted) { $unformatted; throw 'gofmt reported unformatted files' }
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Build Windows x64 binary
+        shell: pwsh
+        run: |
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go build -trimpath -o dist/soft-ue-index.exe ./cmd/soft-ue-index

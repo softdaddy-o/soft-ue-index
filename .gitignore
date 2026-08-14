@@ -1,0 +1,17 @@
+# Local executables and Go build outputs
+soft-ue-index
+soft-ue-index.exe
+*.test
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated Unreal/indexing data (kept outside the repository by default)
+compile_commands.json
+Intermediate/
+Binaries/
+Saved/
+.soft-ue-index/

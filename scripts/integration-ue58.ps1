@@ -1,0 +1,85 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)] [string] $UProject,
+    [string] $Engine,
+    [string] $Clangd,
+    [string[]] $Symbol = @(),
+    [string] $Executable = 'soft-ue-index.exe'
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Invoke-Tool([string[]] $Arguments) {
+    & $Executable @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "soft-ue-index failed: $Arguments" }
+}
+
+function Invoke-McpSmoke([string] $ProjectID, [string[]] $Symbols) {
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Executable
+    $psi.ArgumentList.Add('mcp')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::Start($psi)
+    try {
+        function Send-Request([hashtable] $Request) {
+            $process.StandardInput.WriteLine(($Request | ConvertTo-Json -Compress -Depth 10))
+            $process.StandardInput.Flush()
+            $line = $process.StandardOutput.ReadLine()
+            if ([string]::IsNullOrWhiteSpace($line)) { throw 'MCP server returned no response' }
+            return $line | ConvertFrom-Json
+        }
+        $null = Send-Request @{ jsonrpc = '2.0'; id = 1; method = 'initialize'; params = @{ protocolVersion = '2025-06-18'; capabilities = @{}; clientInfo = @{ name = 'integration-smoke'; version = '1' } } }
+        $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
+        $process.StandardInput.Flush()
+        $projects = Send-Request @{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = @{ name = 'list_projects'; arguments = @{ max_items = 20 } } }
+        if (-not $projects.result) { throw 'MCP list_projects did not return a result' }
+        $id = 3
+        foreach ($name in $Symbols) {
+            $response = Send-Request @{ jsonrpc = '2.0'; id = $id; method = 'tools/call'; params = @{ name = 'search_symbols'; arguments = @{ project_id = $ProjectID; query = $name; max_items = 10 } } }
+            if (-not $response.result) { throw "MCP search_symbols failed for supplied symbol" }
+            $id++
+        }
+    } finally {
+        if (-not $process.HasExited) { $process.Kill($true) }
+        $process.Dispose()
+    }
+}
+
+if (-not (Test-Path -LiteralPath $UProject -PathType Leaf)) { throw "UProject was not found" }
+if (-not (Get-Command $Executable -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath $Executable -PathType Leaf)) { throw "Executable was not found: $Executable" }
+if ($Engine -and -not (Test-Path -LiteralPath $Engine -PathType Container)) { throw 'Engine directory was not found' }
+if ($Clangd) {
+    if (-not (Test-Path -LiteralPath $Clangd -PathType Leaf)) { throw 'clangd executable was not found' }
+    & $Clangd --version | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'clangd version check failed' }
+}
+
+$start = Get-Date
+$projects = (& $Executable list --json | ConvertFrom-Json)
+$project = $projects | Where-Object { $_.uproject -eq (Resolve-Path -LiteralPath $UProject).Path } | Select-Object -First 1
+if (-not $project) {
+    Invoke-Tool @('add', $UProject)
+    $projects = (& $Executable list --json | ConvertFrom-Json)
+    $project = $projects | Where-Object { $_.uproject -eq (Resolve-Path -LiteralPath $UProject).Path } | Select-Object -First 1
+}
+if (-not $project) { throw 'Registered project was not found' }
+if ($Engine -and $project.engine.root -ne (Resolve-Path -LiteralPath $Engine).Path) { throw 'Registered engine does not match -Engine' }
+Invoke-Tool @('doctor', '--json')
+Invoke-Tool @('generate', $project.id)
+
+$database = $project.generation.compilationDatabase
+$project = (& $Executable status $project.id --json | ConvertFrom-Json)
+$database = $project.generation.compilationDatabase
+if (-not (Test-Path -LiteralPath $database -PathType Leaf)) { throw 'Compilation database was not generated' }
+$entries = Get-Content -Raw -LiteralPath $database | ConvertFrom-Json
+$projectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $UProject)).Path
+$engineRoot = $project.engine.root
+$projectCount = @($entries | Where-Object { $_.file.StartsWith($projectRoot, [StringComparison]::OrdinalIgnoreCase) }).Count
+$engineCount = @($entries | Where-Object { $_.file.StartsWith($engineRoot, [StringComparison]::OrdinalIgnoreCase) }).Count
+if ($projectCount -eq 0 -or $engineCount -eq 0) { throw 'Compilation database does not cover both project and engine translation units' }
+Invoke-McpSmoke $project.id $Symbol
+$elapsed = [Math]::Round(((Get-Date) - $start).TotalSeconds, 2)
+Write-Output ("integration passed: project_tus={0}; engine_tus={1}; seconds={2}" -f $projectCount, $engineCount, $elapsed)
