@@ -151,7 +151,7 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 			if err := waitForStartup(ctx, wait); err != nil {
 				return nil, err
 			}
-			return m.startupResult(cfg.ID, s)
+			return m.startupResult(ctx, cfg.ID, s)
 		}
 		if s.starting != nil {
 			wait := s.starting
@@ -159,7 +159,7 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 			if err := waitForStartup(ctx, wait); err != nil {
 				return nil, err
 			}
-			return m.startupResult(cfg.ID, s)
+			return m.startupResult(ctx, cfg.ID, s)
 		}
 		if !s.nextStart.IsZero() && m.now().Before(s.nextStart) {
 			m.mu.Unlock()
@@ -176,7 +176,7 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 		if err := waitForStartup(ctx, wait); err != nil {
 			return nil, err
 		}
-		return m.startupResult(cfg.ID, s)
+		return m.startupResult(ctx, cfg.ID, s)
 	}
 }
 
@@ -189,9 +189,12 @@ func waitForStartup(ctx context.Context, wait <-chan struct{}) error {
 	}
 }
 
-func (m *Manager) startupResult(id string, s *session) (*Client, error) {
+func (m *Manager) startupResult(ctx context.Context, id string, s *session) (*Client, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if m.closed || m.sessions[id] != s {
 		return nil, ErrClosed
 	}
@@ -210,6 +213,10 @@ func (m *Manager) startupResult(id string, s *session) (*Client, error) {
 }
 
 func (m *Manager) startSession(id string, s *session, sessionCtx context.Context) {
+	if err := sessionCtx.Err(); err != nil {
+		_, _ = m.finishStartup(id, s, nil, nil, err)
+		return
+	}
 	p, err := m.start(sessionCtx, s.config)
 	if err != nil {
 		_, _ = m.finishStartup(id, s, nil, nil, err)
@@ -258,10 +265,17 @@ func (m *Manager) finishStartup(id string, s *session, p Process, client *Client
 	s.client = client
 	s.startErr = nil
 	s.refs = 0
+	m.scheduleIdleLocked(id, s)
 	finishStartupLocked(s)
 	m.mu.Unlock()
 	go m.watch(id, s, p)
 	return client, nil
+}
+
+func (m *Manager) scheduleIdleLocked(id string, s *session) {
+	if s.timer == nil {
+		s.timer = time.AfterFunc(s.config.IdleTimeout, func() { m.stop(id, s) })
+	}
 }
 
 func finishStartupLocked(s *session) {
@@ -341,7 +355,7 @@ func (m *Manager) Release(id string) {
 	}
 	s.refs--
 	if s.refs == 0 {
-		s.timer = time.AfterFunc(s.config.IdleTimeout, func() { m.stop(id, s) })
+		m.scheduleIdleLocked(id, s)
 	}
 }
 func (m *Manager) stop(id string, s *session) {
@@ -351,7 +365,6 @@ func (m *Manager) stop(id string, s *session) {
 		return
 	}
 	if s.client != nil {
-		_ = s.client.Shutdown(context.Background())
 		s.client.Close()
 	}
 	if s.process != nil {

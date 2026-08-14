@@ -39,9 +39,19 @@ type slowFactory struct {
 	ready chan struct{}
 }
 
-func (f *slowFactory) Start(_ context.Context, path string, args []string, log string) (Process, error) {
-	<-f.ready
-	return f.base.Start(context.Background(), path, args, log)
+func (f *slowFactory) Start(ctx context.Context, path string, args []string, log string) (Process, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-f.ready:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.base.Start(ctx, path, args, log)
 }
 
 func (f *fakeFactory) Start(_ context.Context, _ string, args []string, _ string) (Process, error) {
@@ -246,15 +256,20 @@ func TestCallerCancellationDoesNotOwnSharedProcess(t *testing.T) {
 	}
 }
 func TestCloseDuringStartupReturnsClosedAndKillsProcess(t *testing.T) {
-	f := &slowFactory{ready: make(chan struct{})}
+	f := &silentInitializeFactory{started: make(chan struct{})}
 	m := NewManager(f)
 	cfg := ProjectConfig{ID: "race", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"}
 	result := make(chan error, 1)
 	go func() { _, e := m.Client(context.Background(), cfg); result <- e }()
+	select {
+	case <-f.started:
+	case <-time.After(time.Second):
+		t.Fatal("startup did not begin")
+	}
 	deadline := time.Now().Add(time.Second)
 	for {
 		m.mu.Lock()
-		started := m.sessions["race"] != nil && m.sessions["race"].starting != nil
+		started := m.sessions["race"] != nil && m.sessions["race"].process != nil
 		m.mu.Unlock()
 		if started {
 			break
@@ -265,17 +280,56 @@ func TestCloseDuringStartupReturnsClosedAndKillsProcess(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	m.Close()
-	close(f.ready)
 	if e := <-result; e != ErrClosed {
 		t.Fatalf("got %v", e)
 	}
-	f.base.mu.Lock()
-	p := f.base.last
-	f.base.mu.Unlock()
+	f.mu.Lock()
+	p := f.process
+	f.mu.Unlock()
 	select {
 	case <-p.done:
 	case <-time.After(time.Second):
 		t.Fatal("detached process")
+	}
+}
+
+func TestCloseBeforeFactoryStartsDoesNotCreateProcess(t *testing.T) {
+	f := &slowFactory{ready: make(chan struct{})}
+	m := NewManager(f)
+	result := make(chan error, 1)
+	go func() {
+		_, err := m.Client(context.Background(), ProjectConfig{ID: "before", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"})
+		result <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.mu.Lock()
+		started := m.sessions["before"] != nil && m.sessions["before"].starting != nil
+		m.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("startup did not begin")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.Close()
+	select {
+	case err := <-result:
+		if err != ErrClosed {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Client did not return")
+	}
+	close(f.ready)
+	time.Sleep(10 * time.Millisecond)
+	f.base.mu.Lock()
+	p := f.base.last
+	f.base.mu.Unlock()
+	if p != nil {
+		t.Fatal("factory created a process after Close")
 	}
 }
 func TestCloseWakesAllStartupWaiters(t *testing.T) {
@@ -423,6 +477,63 @@ func TestFirstCallerCancellationDoesNotOwnSharedStartup(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Close did not kill shared process")
 	}
+}
+
+func TestCanceledStartupSchedulesIdleShutdownAndClaimCancelsIt(t *testing.T) {
+	newManager := func(f *gatedInitializeFactory) *Manager {
+		return NewManagerWithClock(f, func() time.Time { return time.Unix(100, 0) })
+	}
+	t.Run("unclaimed startup stops after idle timeout", func(t *testing.T) {
+		f := &gatedInitializeFactory{started: make(chan struct{}), respond: make(chan struct{})}
+		m := newManager(f)
+		defer m.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_, _ = m.Client(ctx, ProjectConfig{ID: "idle", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x", IdleTimeout: 30 * time.Millisecond})
+		<-f.started
+		close(f.respond)
+		f.mu.Lock()
+		p := f.process
+		f.mu.Unlock()
+		select {
+		case <-p.done:
+		case <-time.After(time.Second):
+			t.Fatal("unclaimed startup was not stopped after idle timeout")
+		}
+	})
+	t.Run("claim before idle timeout keeps session alive", func(t *testing.T) {
+		f := &gatedInitializeFactory{started: make(chan struct{}), respond: make(chan struct{})}
+		m := newManager(f)
+		defer m.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_, _ = m.Client(ctx, ProjectConfig{ID: "claim", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x", IdleTimeout: 80 * time.Millisecond})
+		<-f.started
+		result := make(chan error, 1)
+		go func() {
+			_, err := m.Client(context.Background(), ProjectConfig{ID: "claim", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x", IdleTimeout: 80 * time.Millisecond})
+			result <- err
+		}()
+		close(f.respond)
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		p := f.process
+		f.mu.Unlock()
+		time.Sleep(120 * time.Millisecond)
+		select {
+		case <-p.done:
+			t.Fatal("claim did not cancel the pending idle shutdown")
+		default:
+		}
+		m.Release("claim")
+		select {
+		case <-p.done:
+		case <-time.After(time.Second):
+			t.Fatal("released session was not stopped")
+		}
+	})
 }
 
 func TestExecFactoryClosesLogOnStartFailure(t *testing.T) {
