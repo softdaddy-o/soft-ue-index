@@ -568,6 +568,49 @@ func TestStdioRejectsOversizedMalformedArgumentsForEveryTool(t *testing.T) {
 	}
 }
 
+func TestInitializedStdioRejectsBatchBeforeSDKDispatch(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestMCPStdioHelperProcess", "--")
+	cmd.Env = append(os.Environ(), "SOFT_UE_INDEX_MCP_HELPER=1")
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	encoder := json.NewEncoder(in)
+	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": "2026-07-28", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "test", "version": "test"}}}); err != nil {
+		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(out)
+	if !scanner.Scan() {
+		t.Fatalf("initialize response: %v", scanner.Err())
+	}
+	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"}); err != nil {
+		t.Fatal(err)
+	}
+	batch := `[{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_projects","arguments":{}}},{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_projects","arguments":{"max_items":"wrong"}}}]` + "\n"
+	_, _ = io.WriteString(in, batch)
+	_ = in.Close()
+	if scanner.Scan() {
+		t.Fatalf("batch reached SDK: %q", scanner.Bytes())
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not fail closed for batch")
+	}
+}
+
 func TestStdioIngressRejectsOversizedFramesAndStringIDs(t *testing.T) {
 	for _, input := range []string{
 		`{"jsonrpc":"2.0","id":"` + strings.Repeat("i", defaultMaxRequestIDBytes+1) + `","method":"tools/call","params":{}}` + "\n",

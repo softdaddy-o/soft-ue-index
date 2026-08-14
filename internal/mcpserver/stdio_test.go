@@ -73,3 +73,11 @@ func TestBoundedReaderRejectsMalformedToolFloodBeforeDispatch(t *testing.T) {
 		t.Fatalf("malformed ingress spawned goroutines: delta=%d", delta)
 	}
 }
+
+func TestBoundedReaderRejectsJSONRPCBatchBeforeDispatch(t *testing.T) {
+	batch := `[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}]` + "\n"
+	reader := newBoundedJSONReader(strings.NewReader(batch), 4096, 128)
+	if _, err := io.ReadAll(reader); !errors.Is(err, ErrRequestFrameTooLarge) {
+		t.Fatalf("batch error=%v", err)
+	}
+}

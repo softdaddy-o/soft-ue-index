@@ -64,6 +64,12 @@ func (r *boundedJSONReader) Read(dst []byte) (int, error) {
 }
 
 func validateRequestID(line []byte, maxStringID int) error {
+	trimmed := bytes.TrimSpace(line)
+	// The MVP supports one JSON-RPC request per newline frame. Reject batches
+	// before the SDK can fan them out into independent asynchronous handlers.
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		return ErrRequestFrameTooLarge
+	}
 	var request struct {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
