@@ -31,8 +31,11 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test with race detector
-        shell: msys2 {0}
-        run: CC=gcc go test -race ./...
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = '1'
+          $env:CC = 'C:\msys64\mingw64\bin\gcc.exe'
+          go test -race ./...
       - name: Build Windows x64 binary
         shell: pwsh
         run: |
