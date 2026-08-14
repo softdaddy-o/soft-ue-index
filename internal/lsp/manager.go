@@ -68,6 +68,7 @@ type ProjectConfig struct {
 }
 type Manager struct {
 	factory  ProcessFactory
+	now      func() time.Time
 	mu       sync.Mutex
 	sessions map[string]*session
 	closed   bool
@@ -84,10 +85,18 @@ type session struct {
 }
 
 func NewManager(factory ProcessFactory) *Manager {
+	return NewManagerWithClock(factory, time.Now)
+}
+
+// NewManagerWithClock injects time for deterministic restart-backoff tests.
+func NewManagerWithClock(factory ProcessFactory, now func() time.Time) *Manager {
 	if factory == nil {
 		factory = ExecFactory{}
 	}
-	return &Manager{factory: factory, sessions: map[string]*session{}}
+	if now == nil {
+		now = time.Now
+	}
+	return &Manager{factory: factory, now: now, sessions: map[string]*session{}}
 }
 func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error) {
 	if cfg.Threads < 1 {
@@ -127,7 +136,7 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 			s = &session{}
 			m.sessions[cfg.ID] = s
 		}
-		if !s.nextStart.IsZero() && time.Now().Before(s.nextStart) {
+		if !s.nextStart.IsZero() && m.now().Before(s.nextStart) {
 			m.mu.Unlock()
 			return nil, errors.New("clangd restart is backing off")
 		}
@@ -148,7 +157,7 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 		}
 		if err != nil {
 			s.failures++
-			s.nextStart = time.Now().Add(backoff(s.failures))
+			s.nextStart = m.now().Add(backoff(s.failures))
 			if p != nil {
 				_ = p.Kill()
 			}
@@ -192,7 +201,7 @@ func (m *Manager) watch(id string, s *session, p Process) {
 	s.client = nil
 	s.process = nil
 	s.failures++
-	s.nextStart = time.Now().Add(backoff(s.failures))
+	s.nextStart = m.now().Add(backoff(s.failures))
 }
 func (m *Manager) Release(id string) {
 	m.mu.Lock()

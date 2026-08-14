@@ -31,6 +31,19 @@ type fakeFactory struct {
 	mu sync.Mutex
 	n  int
 }
+type slowFactory struct {
+	base  fakeFactory
+	ready chan struct{}
+}
+
+func (f *slowFactory) Start(ctx context.Context, path string, args []string, log string) (Process, error) {
+	select {
+	case <-f.ready:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return f.base.Start(ctx, path, args, log)
+}
 
 func (f *fakeFactory) Start(_ context.Context, _ string, _ []string, _ string) (Process, error) {
 	f.mu.Lock()
@@ -107,5 +120,82 @@ func TestManagerCreatesIsolatedPersistentShardRoots(t *testing.T) {
 	}
 	if filepath.Join(base, "a") == filepath.Join(base, "b") {
 		t.Fatal("not isolated")
+	}
+}
+
+func TestManagerCrashBackoffAndRestart(t *testing.T) {
+	f := &fakeFactory{}
+	now := time.Unix(100, 0)
+	m := NewManagerWithClock(f, func() time.Time { return now })
+	defer m.Close()
+	cfg := ProjectConfig{ID: "game", Clangd: "fake", CompilationDatabase: t.TempDir(), CacheDir: t.TempDir(), RootURI: "file:///game"}
+	_, err := m.Client(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	p := m.sessions["game"].process
+	m.mu.Unlock()
+	_ = p.Kill()
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.mu.Lock()
+		s := m.sessions["game"]
+		failed := s.client == nil
+		delay := s.nextStart.Sub(now)
+		m.mu.Unlock()
+		if failed {
+			if delay != time.Second {
+				t.Fatalf("delay=%v", delay)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("crash not observed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err = m.Client(context.Background(), cfg); err == nil {
+		t.Fatal("expected restart backoff")
+	}
+	now = now.Add(time.Second)
+	if _, err := m.Client(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	starts := f.n
+	f.mu.Unlock()
+	if starts != 2 {
+		t.Fatalf("starts=%d", starts)
+	}
+}
+
+func TestManagerSharesSimultaneousStartup(t *testing.T) {
+	f := &slowFactory{ready: make(chan struct{})}
+	m := NewManager(f)
+	defer m.Close()
+	cfg := ProjectConfig{ID: "same", Clangd: "fake", CompilationDatabase: t.TempDir(), CacheDir: t.TempDir(), RootURI: "file:///same"}
+	out := make(chan *Client, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { c, e := m.Client(context.Background(), cfg); out <- c; errs <- e }()
+	}
+	time.Sleep(10 * time.Millisecond)
+	close(f.ready)
+	var clients []*Client
+	for range 2 {
+		if e := <-errs; e != nil {
+			t.Fatal(e)
+		}
+		clients = append(clients, <-out)
+	}
+	if clients[0] != clients[1] {
+		t.Fatal("startup was not shared")
+	}
+	f.base.mu.Lock()
+	n := f.base.n
+	f.base.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("starts=%d", n)
 	}
 }
