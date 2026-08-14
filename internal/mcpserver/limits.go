@@ -63,7 +63,7 @@ func (l Limits) normalized() Limits {
 		l.MaxConcurrentTools = defaultMaxConcurrentTools
 	}
 	if l.Timeout <= 0 {
-		l.Timeout = 15 * time.Second
+		l.Timeout = 30 * time.Second
 	}
 	return l
 }
