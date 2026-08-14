@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,10 +18,11 @@ type boundedJSONReader struct {
 	maxFrame    int
 	maxStringID int
 	pending     []byte
+	firstFrame  bool
 }
 
 func newBoundedJSONReader(r io.Reader, maxFrame, maxStringID int) *boundedJSONReader {
-	return &boundedJSONReader{reader: bufio.NewReaderSize(r, maxFrame+1), maxFrame: maxFrame, maxStringID: maxStringID}
+	return &boundedJSONReader{reader: bufio.NewReaderSize(r, maxFrame+1), maxFrame: maxFrame, maxStringID: maxStringID, firstFrame: true}
 }
 
 func (r *boundedJSONReader) Read(dst []byte) (int, error) {
@@ -32,6 +34,17 @@ func (r *boundedJSONReader) Read(dst []byte) (int, error) {
 		if len(line) == 0 {
 			return 0, err
 		}
+		bom := []byte{0xef, 0xbb, 0xbf}
+		hasBOM := bytes.Contains(line, bom)
+		if hasBOM {
+			if !r.firstFrame || !bytes.HasPrefix(line, bom) {
+				return 0, ErrRequestFrameTooLarge
+			}
+			// The raw frame length, including BOM, was checked above. Strip only
+			// the single stream-leading BOM before JSON and ID validation.
+			line = line[len(bom):]
+		}
+		r.firstFrame = false
 		if validateRequestID(line, r.maxStringID) != nil {
 			return 0, ErrRequestFrameTooLarge
 		}
