@@ -223,31 +223,56 @@ func (a *App) generate(ctx context.Context, c cli.Command) error {
 	if e != nil {
 		return e
 	}
-	p := r.Projects[i]
-	if c.EngineScope != "" {
-		p, e = a.d.GenerateScoped(ctx, r.Projects[i], c.EngineScope == "full")
-	} else {
-		p, e = a.d.Generate(ctx, r.Projects[i])
-	}
+	projectID := r.Projects[i].ID
+	e = a.withProjectGenerationLock(ctx, projectID, func() error {
+		latest, index, err := a.find(ctx, projectID)
+		if err != nil {
+			return err
+		}
+		p := latest.Projects[index]
+		if c.EngineScope != "" {
+			p, err = a.d.GenerateScoped(ctx, p, c.EngineScope == "full")
+		} else {
+			p, err = a.d.Generate(ctx, p)
+		}
+		if err != nil {
+			return err
+		}
+		return a.d.Store.Update(ctx, func(reg *registry.Registry) error {
+			for j := range reg.Projects {
+				if reg.Projects[j].ID == projectID {
+					reg.Projects[j] = p
+					return nil
+				}
+			}
+			return fmt.Errorf("project not found: %s", projectID)
+		})
+	})
 	if e != nil {
 		return e
 	}
-	if e = a.d.Store.Update(ctx, func(latest *registry.Registry) error {
-		for j := range latest.Projects {
-			if latest.Projects[j].ID == r.Projects[i].ID {
-				latest.Projects[j] = p
-				return nil
-			}
-		}
-		return fmt.Errorf("project not found: %s", c.ProjectName)
-	}); e != nil {
-		return e
-	}
 	if c.JSON {
-		return a.writeJSON(p)
+		latest, index, err := a.find(ctx, projectID)
+		if err != nil {
+			return err
+		}
+		return a.writeJSON(latest.Projects[index])
 	}
-	fmt.Fprintf(a.d.Output, "generated %s\n", p.ID)
+	fmt.Fprintf(a.d.Output, "generated %s\n", projectID)
 	return nil
+}
+
+func (a *App) withProjectGenerationLock(ctx context.Context, id string, run func() error) error {
+	cache, err := projectCache(id)
+	if err != nil {
+		return err
+	}
+	release, err := registry.AcquireFileLock(ctx, filepath.Join(cache, "generation.lock"))
+	if err != nil {
+		return err
+	}
+	defer release()
+	return run()
 }
 func (a *App) doctor(ctx context.Context, asJSON bool) error {
 	v, e := a.d.Doctor(ctx, a.d.Store)
@@ -476,25 +501,27 @@ type watchGenerator func(context.Context, string) error
 func (f watchGenerator) Generate(ctx context.Context, id string) error { return f(ctx, id) }
 func (a *App) watchReal(ctx context.Context, projects []registry.Project) error {
 	coordinator := uewatch.NewCoordinatorWithOptions(watchGenerator(func(run context.Context, id string) error {
-		r, i, err := a.find(run, id)
-		if err != nil {
-			return err
-		}
-		p, err := a.d.Generate(run, r.Projects[i])
-		if err != nil {
-			if persistErr := a.persistWatchFailure(id, err); persistErr != nil {
-				return errors.Join(err, persistErr)
+		return a.withProjectGenerationLock(run, id, func() error {
+			r, i, err := a.find(run, id)
+			if err != nil {
+				return err
 			}
-			return err
-		}
-		return a.d.Store.Update(run, func(latest *registry.Registry) error {
-			for j := range latest.Projects {
-				if latest.Projects[j].ID == id {
-					latest.Projects[j] = p
-					return nil
+			p, err := a.d.Generate(run, r.Projects[i])
+			if err != nil {
+				if persistErr := a.persistWatchFailure(id, err); persistErr != nil {
+					return errors.Join(err, persistErr)
 				}
+				return err
 			}
-			return fmt.Errorf("project not found: %s", id)
+			return a.d.Store.Update(run, func(latest *registry.Registry) error {
+				for j := range latest.Projects {
+					if latest.Projects[j].ID == id {
+						latest.Projects[j] = p
+						return nil
+					}
+				}
+				return fmt.Errorf("project not found: %s", id)
+			})
 		})
 	}), 2, 500*time.Millisecond, uewatch.CoordinatorOptions{Result: func(result uewatch.Result) {
 		if result.Err != nil {

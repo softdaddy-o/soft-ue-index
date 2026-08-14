@@ -5,8 +5,48 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
+
+func TestConcurrentPromotionsUseUniqueTemporaryFiles(t *testing.T) {
+	env := newValidationEnv(t)
+	writeDatabase(t, env.staging, []Entry{env.projectEntry, env.engineEntry})
+	var wg sync.WaitGroup
+	var promoteMu sync.Mutex
+	sources := make(chan string, 2)
+	errs := make(chan error, 2)
+	promote := func(source, destination string) error {
+		sources <- source
+		promoteMu.Lock()
+		defer promoteMu.Unlock()
+		_ = os.Remove(destination)
+		return os.Rename(source, destination)
+	}
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := ValidateAndPromote(ValidationInput{StagingDir: env.staging, DestinationDir: env.destination, ProjectRoot: env.projectRoot, EngineRoot: env.engineRoot, Promote: promote})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, second := <-sources, <-sources
+	if first == second {
+		t.Fatalf("shared promotion temporary: %s", first)
+	}
+	matches, err := filepath.Glob(filepath.Join(env.destination, "."+DatabaseName+"-*.new"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("temporary files=%v err=%v", matches, err)
+	}
+}
 
 func TestWriteDatabaseUsesSpecificationKeyCasing(t *testing.T) {
 	dir := t.TempDir()

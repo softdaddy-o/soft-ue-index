@@ -392,6 +392,39 @@ func TestWatchRealKeepsHealthyProjectWhenAnotherCannotBeWatched(t *testing.T) {
 	}
 }
 
+func TestProjectGenerationLockSerializesAppInstances(t *testing.T) {
+	id := fmt.Sprintf("lock-test-%d", time.Now().UnixNano())
+	a, b := New(Dependencies{}), New(Dependencies{})
+	entered, releaseFirst := make(chan struct{}), make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- a.withProjectGenerationLock(context.Background(), id, func() error { close(entered); <-releaseFirst; return nil })
+	}()
+	<-entered
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- b.withProjectGenerationLock(context.Background(), id, func() error { close(secondEntered); return nil })
+	}()
+	select {
+	case <-secondEntered:
+		t.Fatal("second app bypassed project lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second app did not acquire project lock")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func mustGenerate(t *testing.T, generated <-chan string, want string) {
 	t.Helper()
 	select {

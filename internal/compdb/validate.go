@@ -52,7 +52,16 @@ func ValidateAndPromote(input ValidationInput) (ValidationResult, error) {
 	if err := os.MkdirAll(input.DestinationDir, 0o700); err != nil {
 		return ValidationResult{}, fmt.Errorf("create destination: %w", err)
 	}
-	temporary := filepath.Join(input.DestinationDir, "."+DatabaseName+".new")
+	tempFile, err := os.CreateTemp(input.DestinationDir, "."+DatabaseName+"-*.new")
+	if err != nil {
+		return ValidationResult{}, fmt.Errorf("create promotion temporary: %w", err)
+	}
+	temporary := tempFile.Name()
+	if err := tempFile.Close(); err != nil {
+		_ = os.Remove(temporary)
+		return ValidationResult{}, err
+	}
+	defer os.Remove(temporary)
 	if err := copyFile(staged, temporary); err != nil {
 		return ValidationResult{}, fmt.Errorf("stage promotion: %w", err)
 	}
