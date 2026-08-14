@@ -250,7 +250,12 @@ func (m *Manager) startSession(id string, s *session, sessionCtx context.Context
 		var seed indexSeed
 		seed, err = selectIndexSeed(s.config.CompilationDatabase, s.config.RootURI, maxIndexSeedBytes)
 		if err == nil {
-			err = client.Notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": pathURI(seed.Path), "languageId": "cpp", "version": 1, "text": string(seed.Text)}})
+			uri := pathURI(seed.Path)
+			err = client.DidOpen(uri, "cpp", string(seed.Text))
+			if err == nil {
+				var ready any
+				err = client.DocumentSymbol(sessionCtx, uri, &ready)
+			}
 		} else if errors.Is(err, errNoIndexSeed) {
 			err = nil
 		}
