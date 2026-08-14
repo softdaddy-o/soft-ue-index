@@ -9,7 +9,7 @@
 - LLVM/clangd compatible with the engine's `Windows_SDK.json` requirements. `doctor` finds LLVM from the normal installation locations, `LLVM_PATH`, and `PATH`.
 - Rider project metadata or generated project files/build artifacts sufficient for UnrealBuildTool to produce a clang compilation database.
 
-The program uses Unreal's bundled .NET runtime and UnrealBuildTool. It does not modify the `.uproject`, engine, source files, or build settings.
+The program does not edit the `.uproject`, source files, engine source, or build settings. Rider-based generation is read-only. When Rider metadata is unavailable, the UnrealBuildTool fallback may refresh generated files under the project's or engine's `Intermediate` directories as part of its normal project analysis.
 
 ## Install
 
