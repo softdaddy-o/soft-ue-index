@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/softdaddy-o/soft-ue-index/internal/lsp"
@@ -86,6 +87,74 @@ func TestReadSymbolSourceRejectsOutsideRootAndBoundsBytes(t *testing.T) {
 	}
 }
 
+func TestHoverAndSourceRespectSerializedResultBudget(t *testing.T) {
+	root := t.TempDir()
+	projectFile := filepath.Join(root, "Alpha.uproject")
+	if err := os.WriteFile(projectFile, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, "Source.cpp")
+	if err := os.WriteFile(source, []byte(strings.Repeat("x", 4096)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	q := &fakeQueries{hover: &lsp.HoverResult{Contents: lsp.MarkupContent{Value: strings.Repeat("x", 4096)}}}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: projectFile}}}, Queries: q, Limits: Limits{MaxResponseBytes: 512, MaxSourceBytes: 4096}})
+
+	hover, err := s.Hover(context.Background(), LocationQueryInput{ProjectID: "alpha", Position: TextPosition{Path: source}})
+	if err != nil || !hover.Truncated {
+		t.Fatalf("hover result=%#v err=%v", hover, err)
+	}
+	assertJSONSizeAtMost(t, hover, s.outputLimit())
+
+	excerpt, err := s.ReadSymbolSource(context.Background(), ReadSymbolSourceInput{ProjectID: "alpha", Path: source, StartLine: 1, EndLine: 1})
+	if err != nil || !excerpt.Truncated {
+		t.Fatalf("source result=%#v err=%v", excerpt, err)
+	}
+	assertJSONSizeAtMost(t, excerpt, s.outputLimit())
+}
+
+func TestFitTextPreservesUTF8AcrossEscapedContent(t *testing.T) {
+	text := strings.Repeat("한글\\\"\n", 100)
+	result, err := fitText(96, text, func(value string, truncated bool) struct {
+		Text      string `json:"text"`
+		Truncated bool   `json:"truncated"`
+	} {
+		return struct {
+			Text      string `json:"text"`
+			Truncated bool   `json:"truncated"`
+		}{value, truncated}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Truncated || !utf8.ValidString(result.Text) || !strings.HasPrefix(text, result.Text) {
+		t.Fatalf("invalid truncation: %#v", result)
+	}
+	assertJSONSizeAtMost(t, result, 96)
+}
+
+func assertJSONSizeAtMost(t *testing.T, value any, limit int) {
+	t.Helper()
+	wire, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) > limit {
+		t.Fatalf("serialized result bytes=%d, limit=%d", len(wire), limit)
+	}
+	response, err := json.Marshal(struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      int    `json:"id"`
+		Result  any    `json:"result"`
+	}{JSONRPC: "2.0", ID: 1, Result: value})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response) > limit+protocolEnvelopeBytes {
+		t.Fatalf("serialized JSON-RPC response bytes=%d, cap=%d", len(response), limit+protocolEnvelopeBytes)
+	}
+}
+
 func TestSearchSymbolsMapsTimeout(t *testing.T) {
 	root := t.TempDir()
 	q := &slowQueries{fakeQueries: fakeQueries{}, wait: 50 * time.Millisecond}
@@ -113,6 +182,7 @@ func (f *slowQueries) Symbols(ctx context.Context, p registry.Project, q string,
 type fakeQueries struct {
 	seenID  string
 	symbols []lsp.Symbol
+	hover   *lsp.HoverResult
 	err     error
 }
 
@@ -130,7 +200,7 @@ func (f *fakeQueries) DocumentSymbols(context.Context, registry.Project, string,
 	return nil, f.err
 }
 func (f *fakeQueries) Hover(context.Context, registry.Project, TextPosition) (*lsp.HoverResult, error) {
-	return nil, f.err
+	return f.hover, f.err
 }
 func (f *fakeQueries) PrepareCallHierarchy(context.Context, registry.Project, TextPosition) ([]lsp.CallHierarchyItem, error) {
 	return nil, f.err

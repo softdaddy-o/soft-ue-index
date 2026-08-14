@@ -216,7 +216,7 @@ func (a *App) status(ctx context.Context, c cli.Command) error {
 		return a.writeJSON(p)
 	}
 	ready := "not generated"
-	if p.Generation.CompilationDatabase != "" {
+	if p.Ready() {
 		ready = "ready"
 	}
 	fmt.Fprintf(a.d.Output, "%s: %s\n", p.ID, ready)

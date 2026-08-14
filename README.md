@@ -77,6 +77,8 @@ The server provides `list_projects`, `project_status`, `search_symbols`, `find_d
 
 The first query starts clangd lazily and opens one safe project translation unit to trigger background indexing. Project symbols and engine declarations included by that unit become available first. A cold Unreal Engine index can continue filling in the background; later sessions reuse persistent shards from the project's per-user cache. Source or build-rule changes handled by `watch` update only the affected work instead of rebuilding the entire index from scratch.
 
+Restart the MCP server after adding or removing registered projects so its project watcher set is refreshed.
+
 ## Local UE 5.8 integration check
 
 The repository includes a non-destructive PowerShell check. It calls `doctor`, registers and generates one project, verifies project and engine translation-unit coverage, and makes bounded MCP queries. It does not build or edit the project.

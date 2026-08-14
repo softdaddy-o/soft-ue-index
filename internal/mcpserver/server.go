@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/softdaddy-o/soft-ue-index/internal/lsp"
 	"github.com/softdaddy-o/soft-ue-index/internal/registry"
@@ -250,11 +251,14 @@ func (s *Server) Hover(ctx context.Context, in LocationQueryInput) (HoverResult,
 		return HoverResult{}, mapError(err)
 	}
 	r := HoverResult{Item: v}
-	if v != nil && len(v.Contents.Value) > s.outputLimit() {
-		v.Contents.Value = v.Contents.Value[:s.outputLimit()]
-		r.Truncated = true
+	if v == nil {
+		return bounded(s.outputLimit(), r)
 	}
-	return bounded(s.outputLimit(), r)
+	return fitText(s.outputLimit(), v.Contents.Value, func(text string, truncated bool) HoverResult {
+		copy := *v
+		copy.Contents.Value = text
+		return HoverResult{Item: &copy, Truncated: truncated}
+	})
 }
 func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (CallHierarchyResult, error) {
 	p, err := s.project(ctx, in.ProjectID)
@@ -387,7 +391,7 @@ func (s *Server) ListProjects(ctx context.Context, maxItems int) (ListProjectsRe
 			out.Truncated = true
 			break
 		}
-		out.Items = append(out.Items, ProjectSummary{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Generation.CompilationDatabase != ""})
+		out.Items = append(out.Items, ProjectSummary{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Ready()})
 	}
 	return bounded(s.outputLimit(), out)
 }
@@ -408,7 +412,7 @@ func (s *Server) ProjectStatus(ctx context.Context, in ProjectStatusInput) (Proj
 	if err != nil {
 		return ProjectStatusResult{}, err
 	}
-	return bounded(s.outputLimit(), ProjectStatusResult{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Generation.CompilationDatabase != "", LastFingerprint: p.Generation.LastFingerprint})
+	return bounded(s.outputLimit(), ProjectStatusResult{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Ready(), LastFingerprint: p.Generation.LastFingerprint})
 }
 
 type ReadSymbolSourceInput struct {
@@ -511,7 +515,7 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 		b.WriteString(part)
 		end = line
 		if line == in.EndLine {
-			return bounded(s.outputLimit(), ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated})
+			return fitSourceResult(s.outputLimit(), path, in.StartLine, end, b.String(), truncated)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -523,7 +527,38 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	if line < in.StartLine {
 		return ReadSymbolSourceResult{}, errors.New("start_line is outside the file")
 	}
-	return bounded(s.outputLimit(), ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated})
+	return fitSourceResult(s.outputLimit(), path, in.StartLine, end, b.String(), truncated)
+}
+
+func fitSourceResult(limit int, path string, start, end int, source string, truncated bool) (ReadSymbolSourceResult, error) {
+	return fitText(limit, source, func(text string, shortened bool) ReadSymbolSourceResult {
+		return ReadSymbolSourceResult{Path: path, StartLine: start, EndLine: end, Text: text, Truncated: truncated || shortened}
+	})
+}
+
+func fitText[T any](limit int, text string, build func(string, bool) T) (T, error) {
+	text = strings.ToValidUTF8(text, "\uFFFD")
+	full := build(text, false)
+	if wire, err := json.Marshal(full); err == nil && len(wire) <= limit {
+		return full, nil
+	}
+	boundaries := make([]int, 0, utf8.RuneCountInString(text)+1)
+	for index := range text {
+		boundaries = append(boundaries, index)
+	}
+	boundaries = append(boundaries, len(text))
+	low, high := 0, len(boundaries)-1
+	for low < high {
+		mid := low + (high-low+1)/2
+		candidate := build(text[:boundaries[mid]], true)
+		wire, err := json.Marshal(candidate)
+		if err == nil && len(wire) <= limit {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	return bounded(limit, build(text[:boundaries[low]], true))
 }
 
 func (s *Server) project(ctx context.Context, id string) (registry.Project, error) {

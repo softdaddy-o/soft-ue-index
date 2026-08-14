@@ -12,6 +12,33 @@ import (
 	"time"
 )
 
+func TestProjectReadyRequiresUsableCompilationDatabase(t *testing.T) {
+	cache := t.TempDir()
+	db := filepath.Join(cache, "compile_commands.json")
+	p := Project{Generation: GenerationState{CacheDir: cache, CompilationDatabase: db}}
+	if p.Ready() {
+		t.Fatal("missing database reported ready")
+	}
+	if err := os.WriteFile(db, []byte("not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if p.Ready() {
+		t.Fatal("invalid database reported ready")
+	}
+	if err := os.WriteFile(db, []byte(`[{"directory":"C:/project","file":"Foo.cpp","command":"clang Foo.cpp"}]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !p.Ready() {
+		t.Fatal("valid database reported not ready")
+	}
+	if err := os.WriteFile(db, []byte(`[{"directory":"C:/project","file":"Foo.cpp","command":"clang Foo.cpp"} garbage`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if p.Ready() {
+		t.Fatal("database malformed after opening array reported ready")
+	}
+}
+
 func TestStoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	s := mustStore(t, dir)

@@ -2,12 +2,60 @@
 package registry
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
+
+// Ready reports whether the generated compilation database is present and has
+// the expected JSON shape. Entries are decoded one at a time, so even a large
+// Unreal database is validated with bounded memory and without regeneration.
+func (p Project) Ready() bool {
+	if p.Generation.CacheDir == "" || p.Generation.CompilationDatabase == "" {
+		return false
+	}
+	cache, err := os.Stat(p.Generation.CacheDir)
+	if err != nil || !cache.IsDir() {
+		return false
+	}
+	db, err := os.Open(p.Generation.CompilationDatabase)
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+	info, err := db.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return false
+	}
+	decoder := json.NewDecoder(db)
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('[') {
+		return false
+	}
+	entries := 0
+	for decoder.More() {
+		var entry struct {
+			Directory string   `json:"directory"`
+			File      string   `json:"file"`
+			Command   string   `json:"command"`
+			Arguments []string `json:"arguments"`
+		}
+		if decoder.Decode(&entry) != nil || entry.Directory == "" || entry.File == "" || (entry.Command == "" && len(entry.Arguments) == 0) {
+			return false
+		}
+		entries++
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim(']') || entries == 0 {
+		return false
+	}
+	var trailing any
+	return decoder.Decode(&trailing) == io.EOF
+}
 
 const CurrentVersion = 1
 
