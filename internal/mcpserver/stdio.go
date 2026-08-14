@@ -55,6 +55,9 @@ func validateRequestID(line []byte, maxStringID int) error {
 		return nil
 	}
 	var id string
+	if len(request.ID) > maxStringID {
+		return ErrRequestFrameTooLarge
+	}
 	if json.Unmarshal(request.ID, &id) == nil && len(id) > maxStringID {
 		return ErrRequestFrameTooLarge
 	}

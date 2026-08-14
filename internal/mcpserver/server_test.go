@@ -355,7 +355,7 @@ func TestOfficialSDKStdioCallToolFramesRespectResponseCap(t *testing.T) {
 				t.Fatal(err)
 			}
 			write(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
-			requestID := strings.Repeat("i", defaultMaxRequestIDBytes)
+			requestID := strings.Repeat("\x00", (defaultMaxRequestIDBytes-2)/6)
 			write(map[string]any{"jsonrpc": "2.0", "id": requestID, "method": "tools/call", "params": map[string]any{"name": "search_symbols", "arguments": map[string]any{"project_id": "p", "query": "x"}}})
 			for scanner.Scan() {
 				line := append([]byte(nil), scanner.Bytes()...)
@@ -388,6 +388,7 @@ func TestOfficialSDKStdioCallToolFramesRespectResponseCap(t *testing.T) {
 func TestStdioIngressRejectsOversizedFramesAndStringIDs(t *testing.T) {
 	for _, input := range []string{
 		`{"jsonrpc":"2.0","id":"` + strings.Repeat("i", defaultMaxRequestIDBytes+1) + `","method":"tools/call","params":{}}` + "\n",
+		`{"jsonrpc":"2.0","id":"` + strings.Repeat(`\u0000`, (defaultMaxRequestIDBytes-2)/6+1) + `","method":"tools/call","params":{}}` + "\n",
 		`{"jsonrpc":"2.0","method":"tools/call","params":"` + strings.Repeat("x", defaultMaxRequestBytes) + `"}` + "\n",
 	} {
 		t.Run("reject", func(t *testing.T) {
