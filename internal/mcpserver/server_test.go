@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -200,5 +201,37 @@ func TestReadSymbolSourceStreamsWithoutReadingWholeFile(t *testing.T) {
 	}
 	if got.Text != "first" || r.reads > 2 {
 		t.Fatalf("reader was not bounded: %#v reads=%d", got, r.reads)
+	}
+}
+
+func TestResponseFamiliesRespectSerializedByteCap(t *testing.T) {
+	limit := 64
+	values := []any{SearchSymbolsResult{Items: []lsp.Symbol{{Name: string(make([]byte, 200))}}, Truncated: true}, LocationsResult{Items: []lsp.Location{{URI: string(make([]byte, 200))}}, Truncated: true}, DocumentSymbolsResult{Items: []DocumentSymbol{{Name: string(make([]byte, 200))}}, Truncated: true}, HoverResult{Item: &lsp.HoverResult{Contents: lsp.MarkupContent{Value: string(make([]byte, 200))}}, Truncated: true}, CallHierarchyResult{Items: []lsp.CallHierarchyItem{{Name: string(make([]byte, 200))}}, Truncated: true}}
+	for _, v := range values {
+		if _, err := bounded(limit, v); !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("oversize %T: %v", v, err)
+		}
+		b, _ := json.Marshal(struct {
+			Truncated bool `json:"truncated"`
+		}{true})
+		if len(b) > limit {
+			t.Fatal("test envelope is not bounded")
+		}
+	}
+}
+
+func TestSafePathRejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	target := filepath.Join(outside, "secret.cpp")
+	if err := os.WriteFile(target, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "escape.cpp")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := safePath(link, root); !errors.Is(err, ErrPathForbidden) {
+		t.Fatalf("symlink escape: %v", err)
 	}
 }

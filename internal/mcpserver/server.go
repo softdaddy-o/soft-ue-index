@@ -4,6 +4,7 @@ package mcpserver
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -92,7 +93,7 @@ func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (Sear
 	}
 	result.Items, result.Truncated = s.filterSymbols(p, result.Items, result.Truncated)
 	result.Items, result.Truncated = trimSymbols(result.Items, s.limits.MaxResponseBytes, result.Truncated)
-	return result, nil
+	return bounded(s.limits.MaxResponseBytes, result)
 }
 
 type TextPosition struct {
@@ -164,7 +165,7 @@ func (s *Server) locations(ctx context.Context, kind string, in LocationQueryInp
 	}
 	r.Items, r.Truncated = s.filterLocations(p, r.Items, r.Truncated)
 	r.Items, r.Truncated = trimLocations(r.Items, s.limits.MaxResponseBytes, r.Truncated)
-	return r, nil
+	return bounded(s.limits.MaxResponseBytes, r)
 }
 func (s *Server) FindDefinition(ctx context.Context, in LocationQueryInput) (LocationsResult, error) {
 	return s.locations(ctx, "definition", in)
@@ -200,7 +201,7 @@ func (s *Server) DocumentSymbols(ctx context.Context, in PathQueryInput) (Docume
 		r.Truncated = true
 	}
 	r.Items, r.Truncated = trimDocumentSymbols(r.Items, s.limits.MaxResponseBytes, r.Truncated)
-	return r, nil
+	return bounded(s.limits.MaxResponseBytes, r)
 }
 func (s *Server) Hover(ctx context.Context, in LocationQueryInput) (HoverResult, error) {
 	p, err := s.project(ctx, in.ProjectID)
@@ -224,7 +225,7 @@ func (s *Server) Hover(ctx context.Context, in LocationQueryInput) (HoverResult,
 		v.Contents.Value = v.Contents.Value[:s.limits.MaxResponseBytes]
 		r.Truncated = true
 	}
-	return r, nil
+	return bounded(s.limits.MaxResponseBytes, r)
 }
 func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (CallHierarchyResult, error) {
 	p, err := s.project(ctx, in.ProjectID)
@@ -256,7 +257,7 @@ func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (Call
 		r.Truncated = true
 	}
 	r.Items, r.Truncated = s.filterCalls(p, r.Items, r.Truncated)
-	return r, nil
+	return bounded(s.limits.MaxResponseBytes, r)
 }
 func (s *Server) validatePosition(p registry.Project, v TextPosition) error {
 	if v.Line < 0 || v.Character < 0 {
@@ -300,7 +301,7 @@ func (s *Server) ListProjects(ctx context.Context, maxItems int) (ListProjectsRe
 		}
 		out.Items = append(out.Items, ProjectSummary{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Generation.CompilationDatabase != ""})
 	}
-	return out, nil
+	return bounded(s.limits.MaxResponseBytes, out)
 }
 
 type ProjectStatusInput struct {
@@ -319,7 +320,7 @@ func (s *Server) ProjectStatus(ctx context.Context, in ProjectStatusInput) (Proj
 	if err != nil {
 		return ProjectStatusResult{}, err
 	}
-	return ProjectStatusResult{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Generation.CompilationDatabase != "", LastFingerprint: p.Generation.LastFingerprint}, nil
+	return bounded(s.limits.MaxResponseBytes, ProjectStatusResult{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Generation.CompilationDatabase != "", LastFingerprint: p.Generation.LastFingerprint})
 }
 
 type ReadSymbolSourceInput struct {
@@ -400,7 +401,7 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 		b.WriteString(part)
 		end = line
 		if line == in.EndLine {
-			return ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated}, nil
+			return bounded(s.limits.MaxResponseBytes, ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated})
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -409,7 +410,7 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	if line < in.StartLine {
 		return ReadSymbolSourceResult{}, errors.New("start_line is outside the file")
 	}
-	return ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated}, nil
+	return bounded(s.limits.MaxResponseBytes, ReadSymbolSourceResult{Path: path, StartLine: in.StartLine, EndLine: end, Text: b.String(), Truncated: truncated})
 }
 
 func (s *Server) project(ctx context.Context, id string) (registry.Project, error) {
@@ -441,6 +442,17 @@ func mapError(err error) error {
 		return fmt.Errorf("request timed out: %w", err)
 	}
 	return err
+}
+
+func bounded[T any](limit int, value T) (T, error) {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return value, err
+	}
+	if len(b) > limit {
+		return value, ErrLimitExceeded
+	}
+	return value, nil
 }
 func min(a, b int) int {
 	if a < b {
