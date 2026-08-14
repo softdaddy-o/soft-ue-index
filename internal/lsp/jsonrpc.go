@@ -12,6 +12,7 @@ import (
 )
 
 const defaultMaxMessageBytes = 8 << 20
+const defaultMaxHeaderBytes = 32 << 10
 
 var ErrMessageTooLarge = errors.New("LSP message exceeds size limit")
 
@@ -48,10 +49,15 @@ func readFrame(r *bufio.Reader, max int) ([]byte, error) {
 		max = defaultMaxMessageBytes
 	}
 	length := -1
+	headerBytes := 0
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
 			return nil, err
+		}
+		headerBytes += len(line)
+		if headerBytes > defaultMaxHeaderBytes || len(line) > 8<<10 {
+			return nil, ErrMessageTooLarge
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {

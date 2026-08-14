@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -83,5 +85,27 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	m.mu.Unlock()
 	if ok {
 		t.Fatal("idle session remains")
+	}
+}
+
+func TestManagerCreatesIsolatedPersistentShardRoots(t *testing.T) {
+	f := &fakeFactory{}
+	m := NewManager(f)
+	defer m.Close()
+	base := t.TempDir()
+	for _, id := range []string{"a", "b"} {
+		dir := filepath.Join(base, id)
+		c, e := m.Client(context.Background(), ProjectConfig{ID: id, Clangd: "fake", CompilationDatabase: dir, CacheDir: filepath.Join(base, "logs", id), RootURI: "file:///x"})
+		if e != nil {
+			t.Fatal(e)
+		}
+		m.Release(id)
+		if _, e = os.Stat(filepath.Join(dir, ".cache", "clangd", "index")); e != nil {
+			t.Fatal(e)
+		}
+		_ = c
+	}
+	if filepath.Join(base, "a") == filepath.Join(base, "b") {
+		t.Fatal("not isolated")
 	}
 }

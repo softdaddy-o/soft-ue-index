@@ -191,6 +191,58 @@ type Position struct {
 	Line      int `json:"line"`
 	Character int `json:"character"`
 }
+
+// Location and the result types below normalize clangd's LSP unions for callers.
+type Range struct {
+	Start Position `json:"start"`
+	End   Position `json:"end"`
+}
+type Location struct {
+	URI   string `json:"uri"`
+	Range Range  `json:"range"`
+}
+type Symbol struct {
+	Name          string   `json:"name"`
+	Kind          int      `json:"kind"`
+	Location      Location `json:"location"`
+	ContainerName string   `json:"containerName,omitempty"`
+}
+type DocumentSymbol struct {
+	Name           string           `json:"name"`
+	Kind           int              `json:"kind"`
+	Range          Range            `json:"range"`
+	SelectionRange Range            `json:"selectionRange"`
+	Children       []DocumentSymbol `json:"children,omitempty"`
+}
+type MarkupContent struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
+}
+type HoverResult struct {
+	Contents MarkupContent `json:"contents"`
+	Range    *Range        `json:"range,omitempty"`
+}
+type CallHierarchyItem struct {
+	Name           string `json:"name"`
+	Kind           int    `json:"kind"`
+	URI            string `json:"uri"`
+	Range          Range  `json:"range"`
+	SelectionRange Range  `json:"selectionRange"`
+}
+type CallHierarchyCall struct {
+	From       *CallHierarchyItem `json:"from,omitempty"`
+	To         *CallHierarchyItem `json:"to,omitempty"`
+	FromRanges []Range            `json:"fromRanges,omitempty"`
+}
+type Limits struct{ MaxItems int }
+
+func limit[T any](l Limits, items []T) []T {
+	if l.MaxItems > 0 && len(items) > l.MaxItems {
+		return items[:l.MaxItems]
+	}
+	return items
+}
+
 type TextDocumentPosition struct {
 	URI      string   `json:"uri"`
 	Position Position `json:"position"`
@@ -198,6 +250,44 @@ type TextDocumentPosition struct {
 
 func (c *Client) WorkspaceSymbol(ctx context.Context, query string, out any) error {
 	return c.Call(ctx, "workspace/symbol", map[string]any{"query": query}, out)
+}
+func (c *Client) WorkspaceSymbols(ctx context.Context, query string, limits Limits) ([]Symbol, error) {
+	var out []Symbol
+	err := c.WorkspaceSymbol(ctx, query, &out)
+	return limit(limits, out), err
+}
+func (c *Client) Definitions(ctx context.Context, p TextDocumentPosition, limits Limits) ([]Location, error) {
+	var out []Location
+	err := c.Definition(ctx, p, &out)
+	return limit(limits, out), err
+}
+func (c *Client) ReferenceLocations(ctx context.Context, p TextDocumentPosition, limits Limits) ([]Location, error) {
+	var out []Location
+	err := c.References(ctx, p, &out)
+	return limit(limits, out), err
+}
+func (c *Client) Implementations(ctx context.Context, p TextDocumentPosition, limits Limits) ([]Location, error) {
+	var out []Location
+	err := c.Implementation(ctx, p, &out)
+	return limit(limits, out), err
+}
+func (c *Client) DocumentSymbols(ctx context.Context, uri string, limits Limits) ([]DocumentSymbol, error) {
+	var out []DocumentSymbol
+	err := c.DocumentSymbol(ctx, uri, &out)
+	return limit(limits, out), err
+}
+func (c *Client) HoverResult(ctx context.Context, p TextDocumentPosition) (*HoverResult, error) {
+	var out HoverResult
+	err := c.Hover(ctx, p, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+func (c *Client) CallHierarchy(ctx context.Context, p TextDocumentPosition, limits Limits) ([]CallHierarchyItem, error) {
+	var out []CallHierarchyItem
+	err := c.PrepareCallHierarchy(ctx, p, &out)
+	return limit(limits, out), err
 }
 func (c *Client) Definition(ctx context.Context, p TextDocumentPosition, out any) error {
 	return c.Call(ctx, "textDocument/definition", map[string]any{"textDocument": map[string]string{"uri": p.URI}, "position": p.Position}, out)

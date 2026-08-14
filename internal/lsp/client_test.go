@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -78,5 +80,18 @@ func TestClientRejectsOversizedFrame(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	if err := c.Call(context.Background(), "x", nil, nil); err == nil {
 		t.Fatal("expected closed")
+	}
+}
+
+func TestReadFrameRejectsOversizedHeader(t *testing.T) {
+	_, err := readFrame(bufio.NewReader(strings.NewReader("X: "+strings.Repeat("a", 9000)+"\r\n")), 1024)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("got %v", err)
+	}
+}
+func TestLimitsTruncateTypedResults(t *testing.T) {
+	got := limit(Limits{MaxItems: 1}, []Symbol{{Name: "a"}, {Name: "b"}})
+	if len(got) != 1 || got[0].Name != "a" {
+		t.Fatalf("%#v", got)
 	}
 }
