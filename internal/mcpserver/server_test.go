@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -233,5 +234,53 @@ func TestSafePathRejectsSymlinkEscape(t *testing.T) {
 	}
 	if _, err := safePath(link, root); !errors.Is(err, ErrPathForbidden) {
 		t.Fatalf("symlink escape: %v", err)
+	}
+}
+
+func TestTwoProjectsRouteToTheirOwnBackendConfiguration(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	q := &fakeQueries{symbols: []lsp.Symbol{{Name: "ok"}}}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "a", UProject: filepath.Join(a, "A.uproject")}, {ID: "b", UProject: filepath.Join(b, "B.uproject")}}}, Queries: q})
+	if _, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "a", Query: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if q.seenID != "a" {
+		t.Fatalf("project A routed to %q", q.seenID)
+	}
+	if _, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "b", Query: "B"}); err != nil {
+		t.Fatal(err)
+	}
+	if q.seenID != "b" {
+		t.Fatalf("project B routed to %q", q.seenID)
+	}
+}
+
+func TestMCPStdioHelperProcess(t *testing.T) {
+	if os.Getenv("SOFT_UE_INDEX_MCP_HELPER") != "1" {
+		return
+	}
+	if err := New(Dependencies{Projects: fakeProjects{}}).RunStdio(context.Background(), "test"); err != nil {
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func TestOfficialSDKCommandTransportKeepsStdoutProtocolClean(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.Command(os.Args[0], "-test.run=TestMCPStdioHelperProcess", "--")
+	cmd.Env = append(os.Environ(), "SOFT_UE_INDEX_MCP_HELPER=1")
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "test"}, nil)
+	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	listed, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("stdout was not a clean MCP stream: %v", err)
+	}
+	if len(listed.Tools) != 10 {
+		t.Fatalf("want 10 tools, got %d", len(listed.Tools))
 	}
 }
