@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/softdaddy-o/soft-ue-index/internal/app"
 	"github.com/softdaddy-o/soft-ue-index/internal/cli"
 )
 
@@ -19,6 +23,11 @@ func main() {
 }
 
 func run(args []string) error {
-	_, err := cli.Parse(args)
-	return err
+	command, err := cli.Parse(args)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return app.New(app.Dependencies{}).Run(ctx, command)
 }
