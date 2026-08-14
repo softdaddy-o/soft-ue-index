@@ -157,6 +157,35 @@ func TestParallelLoadAndSaveKeepRegistryReadable(t *testing.T) {
 	}
 }
 
+func TestUpdatePreservesConcurrentMutationsFromSeparateStores(t *testing.T) {
+	dir := t.TempDir()
+	first, second := mustStore(t, dir), mustStore(t, dir)
+	if err := first.Save(context.Background(), Registry{Version: CurrentVersion}); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for _, pair := range []struct {
+		store *Store
+		id    string
+	}{{first, "a"}, {second, "b"}} {
+		wg.Add(1)
+		go func(s *Store, id string) {
+			defer wg.Done()
+			if err := s.Update(context.Background(), func(r *Registry) error {
+				r.Projects = append(r.Projects, Project{ID: id, UProject: filepath.Join(dir, id+".uproject")})
+				return nil
+			}); err != nil {
+				t.Error(err)
+			}
+		}(pair.store, pair.id)
+	}
+	wg.Wait()
+	got, err := first.Load(context.Background())
+	if err != nil || len(got.Projects) != 2 {
+		t.Fatalf("registry=%#v err=%v", got, err)
+	}
+}
+
 func TestSaveRejectsPathsDifferingOnlyByCase(t *testing.T) {
 	dir := t.TempDir()
 	project := filepath.Join(dir, "Game.uproject")

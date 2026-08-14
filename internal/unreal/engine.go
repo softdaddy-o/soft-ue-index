@@ -49,6 +49,20 @@ type buildVersion struct {
 }
 
 func discoverEngine(root string) (Engine, error) {
+	engine, err := ValidateEngine(root)
+	if err != nil {
+		return Engine{}, err
+	}
+	ubt := filepath.Join(engine.Root, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.dll")
+	if err := validateUnrealBuildTool(ubt, os.Stat); err != nil {
+		return Engine{}, err
+	}
+	engine.UnrealBuildToolPath = ubt
+	return engine, nil
+}
+
+// ValidateEngine verifies the engine root and its readable UE 5.8 Build.version marker.
+func ValidateEngine(root string) (Engine, error) {
 	normalizedRoot, err := normalizePath(root)
 	if err != nil {
 		return Engine{}, err
@@ -66,12 +80,11 @@ func discoverEngine(root string) (Engine, error) {
 	if version.Major != 5 || version.Minor != 8 {
 		return Engine{}, fmt.Errorf("%w: %d.%d", ErrUnsupportedVersion, version.Major, version.Minor)
 	}
-	ubt := filepath.Join(normalizedRoot, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.dll")
-	if err := validateUnrealBuildTool(ubt, os.Stat); err != nil {
-		return Engine{}, err
-	}
-	return Engine{Root: normalizedRoot, Version: version, UnrealBuildToolPath: ubt}, nil
+	return Engine{Root: normalizedRoot, Version: version}, nil
 }
+
+// DiscoverEngine validates a concrete UE 5.8 engine root and its required UBT marker.
+func DiscoverEngine(root string) (Engine, error) { return discoverEngine(root) }
 
 func validateUnrealBuildTool(path string, stat func(string) (os.FileInfo, error)) error {
 	info, err := stat(path)

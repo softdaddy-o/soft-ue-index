@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,14 +123,13 @@ func (a *App) add(ctx context.Context, c cli.Command) error {
 	if err != nil {
 		return err
 	}
-	r, err := a.load(ctx)
-	if err != nil {
-		return err
-	}
 	name := strings.TrimSuffix(filepath.Base(d.UProject), filepath.Ext(d.UProject))
-	p := registry.Project{ID: stableID(name, r.Projects), Name: name, UProject: d.UProject, Target: d.EditorTarget, Platform: "Win64", Configuration: "Development", Engine: registry.Engine{Root: d.Engine.Root, Version: fmt.Sprintf("%d.%d", d.Version.Major, d.Version.Minor)}}
-	r.Projects = append(r.Projects, p)
-	if err := a.save(ctx, r); err != nil {
+	p := registry.Project{Name: name, UProject: d.UProject, Target: d.EditorTarget, Platform: "Win64", Configuration: "Development", Engine: registry.Engine{Root: d.Engine.Root, Version: fmt.Sprintf("%d.%d", d.Version.Major, d.Version.Minor)}}
+	if err := a.d.Store.Update(ctx, func(r *registry.Registry) error {
+		p.ID = stableID(name, r.Projects)
+		r.Projects = append(r.Projects, p)
+		return nil
+	}); err != nil {
 		return err
 	}
 	if c.JSON {
@@ -171,12 +171,15 @@ func (a *App) find(ctx context.Context, id string) (registry.Registry, int, erro
 	return r, -1, fmt.Errorf("project not found: %s", id)
 }
 func (a *App) remove(ctx context.Context, c cli.Command) error {
-	r, i, e := a.find(ctx, c.ProjectName)
-	if e != nil {
-		return e
-	}
-	r.Projects = append(r.Projects[:i], r.Projects[i+1:]...)
-	if e = a.save(ctx, r); e != nil {
+	if e := a.d.Store.Update(ctx, func(r *registry.Registry) error {
+		for i := range r.Projects {
+			if r.Projects[i].ID == c.ProjectName || r.Projects[i].Name == c.ProjectName {
+				r.Projects = append(r.Projects[:i], r.Projects[i+1:]...)
+				return nil
+			}
+		}
+		return fmt.Errorf("project not found: %s", c.ProjectName)
+	}); e != nil {
 		return e
 	}
 	if c.JSON {
@@ -210,8 +213,15 @@ func (a *App) generate(ctx context.Context, c cli.Command) error {
 	if e != nil {
 		return e
 	}
-	r.Projects[i] = p
-	if e = a.save(ctx, r); e != nil {
+	if e = a.d.Store.Update(ctx, func(latest *registry.Registry) error {
+		for j := range latest.Projects {
+			if latest.Projects[j].ID == r.Projects[i].ID {
+				latest.Projects[j] = p
+				return nil
+			}
+		}
+		return fmt.Errorf("project not found: %s", c.ProjectName)
+	}); e != nil {
 		return e
 	}
 	if c.JSON {
@@ -324,10 +334,11 @@ func (a *App) doctorReal(ctx context.Context, store *registry.Store) (any, error
 		return nil, err
 	}
 	probe := diagnostics.Probe{}
-	changed := false
+	updates := map[string]registry.Toolchain{}
 	for i := range r.Projects {
 		p := &r.Projects[i]
-		probe.Engine = probe.Engine || p.Engine.Root != ""
+		_, engineErr := unreal.ValidateEngine(p.Engine.Root)
+		probe.Engine = probe.Engine || engineErr == nil
 		ubt := filepath.Join(p.Engine.Root, "Engine", "Binaries", "DotNET", "UnrealBuildTool", "UnrealBuildTool.dll")
 		probe.UBT = probe.UBT || a.d.Files.Exists(ubt)
 		_, dotnet := toolchain.FindBundledDotnet(p.Engine.Root, a.d.Files)
@@ -343,7 +354,7 @@ func (a *App) doctorReal(ctx context.Context, store *registry.Store) (any, error
 					if p.Toolchain.ClangdPath != selection.Path || p.Toolchain.ClangdVersion != selection.Version.String() {
 						p.Toolchain.ClangdPath = selection.Path
 						p.Toolchain.ClangdVersion = selection.Version.String()
-						changed = true
+						updates[p.ID] = p.Toolchain
 					}
 				}
 			}
@@ -352,8 +363,15 @@ func (a *App) doctorReal(ctx context.Context, store *registry.Store) (any, error
 		probe.GeneratedHeaders = probe.GeneratedHeaders || hasBuildArtifact(projectRoot, ".generated.h")
 		probe.ResponseFiles = probe.ResponseFiles || hasBuildArtifact(projectRoot, ".rsp")
 	}
-	if changed {
-		if err := store.Save(ctx, r); err != nil {
+	if len(updates) != 0 {
+		if err := store.Update(ctx, func(latest *registry.Registry) error {
+			for i := range latest.Projects {
+				if tool, ok := updates[latest.Projects[i].ID]; ok {
+					latest.Projects[i].Toolchain = tool
+				}
+			}
+			return nil
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -414,12 +432,26 @@ func (a *App) watchReal(ctx context.Context, projects []registry.Project) error 
 		}
 		p, err := a.d.Generate(run, r.Projects[i])
 		if err != nil {
-			r.Projects[i].Generation.InvalidationReason = err.Error()
-			_ = a.save(context.Background(), r)
+			_ = a.d.Store.Update(context.Background(), func(latest *registry.Registry) error {
+				for j := range latest.Projects {
+					if latest.Projects[j].ID == id {
+						latest.Projects[j].Generation.InvalidationReason = err.Error()
+						return nil
+					}
+				}
+				return nil
+			})
 			return err
 		}
-		r.Projects[i] = p
-		return a.save(run, r)
+		return a.d.Store.Update(run, func(latest *registry.Registry) error {
+			for j := range latest.Projects {
+				if latest.Projects[j].ID == id {
+					latest.Projects[j] = p
+					return nil
+				}
+			}
+			return fmt.Errorf("project not found: %s", id)
+		})
 	}), 2, 500*time.Millisecond)
 	defer coordinator.Close()
 	w, err := uewatch.NewWatcher(coordinator)
@@ -524,5 +556,5 @@ func fileURI(path string) string {
 	if len(p) >= 2 && p[1] == ':' {
 		p = "/" + p
 	}
-	return "file://" + p
+	return (&url.URL{Scheme: "file", Path: p}).String()
 }

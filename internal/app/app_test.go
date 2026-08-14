@@ -135,6 +135,15 @@ func TestDoctorFindsNestedUnrealBuildArtifacts(t *testing.T) {
 	}
 }
 
+func TestFileURIEscapesWindowsAndUnicodePaths(t *testing.T) {
+	if got, want := fileURI(`C:\Work Dir\a#한.cpp`), "file:///C:/Work%20Dir/a%23%ED%95%9C.cpp"; got != want {
+		t.Fatalf("Windows URI = %q, want %q", got, want)
+	}
+	if got, want := fileURI(`/tmp/space # 한.cpp`), "file:///tmp/space%20%23%20%ED%95%9C.cpp"; got != want {
+		t.Fatalf("POSIX URI = %q, want %q", got, want)
+	}
+}
+
 type appEnvironment map[string]string
 
 func (e appEnvironment) LookupEnv(name string) (string, bool) { value, ok := e[name]; return value, ok }

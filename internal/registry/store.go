@@ -69,6 +69,10 @@ func (s *Store) Load(ctx context.Context) (Registry, error) {
 		return Registry{}, err
 	}
 	defer unlock()
+	return s.loadUnlocked()
+}
+
+func (s *Store) loadUnlocked() (Registry, error) {
 	contents, err := os.ReadFile(s.path())
 	if errors.Is(err, os.ErrNotExist) {
 		return Registry{Version: CurrentVersion, Projects: []Project{}}, nil
@@ -105,6 +109,45 @@ func (s *Store) Save(ctx context.Context, registry Registry) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return s.saveUnlocked(registry)
+}
+
+// Update atomically loads, mutates, validates, and saves the registry while
+// holding the same cross-process lock. Mutations must be quick and must not
+// perform external work while the registry is locked.
+func (s *Store) Update(ctx context.Context, mutate func(*Registry) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if mutate == nil {
+		return errors.New("registry update mutation is required")
+	}
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return fmt.Errorf("create registry directory: %w", err)
+	}
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	r, err := s.loadUnlocked()
+	if err != nil {
+		return err
+	}
+	if err := mutate(&r); err != nil {
+		return err
+	}
+	r, err = normalizeAndValidate(r)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.saveUnlocked(r)
+}
+
+func (s *Store) saveUnlocked(registry Registry) error {
 
 	temporary, err := os.CreateTemp(s.dir, ".registry-*.tmp")
 	if err != nil {
