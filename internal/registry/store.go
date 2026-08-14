@@ -21,6 +21,8 @@ const (
 
 var ErrLockUnavailable = errors.New("registry lock unavailable")
 
+var defaultRoot = DefaultRoot
+
 // Store provides locked, atomic access to a registry rooted in dir.
 type Store struct {
 	dir     string
@@ -28,11 +30,15 @@ type Store struct {
 }
 
 // NewStore creates a store rooted at dir. An empty dir selects DefaultRoot.
-func NewStore(dir string) *Store {
+func NewStore(dir string) (*Store, error) {
 	if dir == "" {
-		dir, _ = DefaultRoot()
+		var err error
+		dir, err = defaultRoot()
+		if err != nil {
+			return nil, err
+		}
 	}
-	return &Store{dir: dir, promote: os.Rename}
+	return &Store{dir: dir, promote: promoteFile}, nil
 }
 
 // DefaultRoot returns the platform-specific directory used for this registry.
@@ -42,6 +48,9 @@ func DefaultRoot() (string, error) {
 		root, err = os.UserCacheDir()
 	}
 	if err != nil || root == "" {
+		if err == nil {
+			err = errors.New("user configuration and cache directories are empty")
+		}
 		return "", fmt.Errorf("resolve registry root: %w", err)
 	}
 	return filepath.Join(root, "soft-ue-index"), nil
@@ -52,6 +61,14 @@ func (s *Store) Load(ctx context.Context) (Registry, error) {
 	if err := ctx.Err(); err != nil {
 		return Registry{}, err
 	}
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return Registry{}, fmt.Errorf("create registry directory: %w", err)
+	}
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return Registry{}, err
+	}
+	defer unlock()
 	contents, err := os.ReadFile(s.path())
 	if errors.Is(err, os.ErrNotExist) {
 		return Registry{Version: CurrentVersion, Projects: []Project{}}, nil
@@ -123,12 +140,16 @@ func (s *Store) path() string { return filepath.Join(s.dir, registryFileName) }
 func (s *Store) lock(ctx context.Context) (func(), error) {
 	path := filepath.Join(s.dir, lockFileName)
 	for attempt := 0; attempt < lockRetries; attempt++ {
-		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 		if err == nil {
-			return func() { _ = file.Close(); _ = os.Remove(path) }, nil
+			err = lockFile(file)
+			if err == nil {
+				return func() { _ = unlockFile(file); _ = file.Close() }, nil
+			}
+			_ = file.Close()
 		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("create registry lock: %w", err)
+		if !errors.Is(err, errLockContended) {
+			return nil, fmt.Errorf("lock registry: %w", err)
 		}
 		select {
 		case <-ctx.Done():

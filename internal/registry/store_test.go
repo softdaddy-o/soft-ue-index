@@ -7,13 +7,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 func TestStoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(dir)
+	s := mustStore(t, dir)
 	want := Registry{Version: CurrentVersion, Projects: []Project{{
 		ID: "game-a", Name: "GameA", UProject: filepath.Join(dir, "GameA", "GameA.uproject"),
 		Engine:     Engine{Root: filepath.Join(dir, "Engine")},
@@ -41,7 +42,7 @@ func TestStoreRoundTrip(t *testing.T) {
 }
 
 func TestLoadMissingFileReturnsEmptyV1Registry(t *testing.T) {
-	got, err := NewStore(t.TempDir()).Load(context.Background())
+	got, err := mustStore(t, t.TempDir()).Load(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +57,7 @@ func TestLoadRejectsUnsupportedSchema(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, registryFileName), []byte(`{"version": 99, "projects": []}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := NewStore(dir).Load(context.Background())
+	_, err := mustStore(t, dir).Load(context.Background())
 	if !errors.Is(err, ErrUnsupportedVersion) {
 		t.Fatalf("got %v", err)
 	}
@@ -67,7 +68,7 @@ func TestLoadRejectsMalformedJSON(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, registryFileName), []byte(`{"version":`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := NewStore(dir).Load(context.Background())
+	_, err := mustStore(t, dir).Load(context.Background())
 	if err == nil {
 		t.Fatal("Load succeeded")
 	}
@@ -75,7 +76,7 @@ func TestLoadRejectsMalformedJSON(t *testing.T) {
 
 func TestSaveRejectsDuplicateIDsAndPaths(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(dir)
+	s := mustStore(t, dir)
 	project := filepath.Join(dir, "Game.uproject")
 	for _, projects := range [][]Project{{{ID: "same", UProject: project}, {ID: "same", UProject: filepath.Join(dir, "Other.uproject")}}, {{ID: "one", UProject: project}, {ID: "two", UProject: filepath.Join(dir, ".", "Game.uproject")}}} {
 		err := s.Save(context.Background(), Registry{Version: CurrentVersion, Projects: projects})
@@ -85,14 +86,16 @@ func TestSaveRejectsDuplicateIDsAndPaths(t *testing.T) {
 	}
 }
 
-func TestSaveWaitsForLockContention(t *testing.T) {
+func TestSaveReturnsLockUnavailableDuringContention(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(dir)
-	if err := os.WriteFile(filepath.Join(dir, lockFileName), []byte("busy"), 0o600); err != nil {
+	s := mustStore(t, dir)
+	unlock, err := s.lock(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer unlock()
 	started := time.Now()
-	err := s.Save(context.Background(), Registry{Version: CurrentVersion})
+	err = s.Save(context.Background(), Registry{Version: CurrentVersion})
 	if !errors.Is(err, ErrLockUnavailable) {
 		t.Fatalf("got %v", err)
 	}
@@ -101,9 +104,113 @@ func TestSaveWaitsForLockContention(t *testing.T) {
 	}
 }
 
+func TestLoadWaitsForAdvisoryLock(t *testing.T) {
+	dir := t.TempDir()
+	s := mustStore(t, dir)
+	if err := s.Save(context.Background(), Registry{Version: CurrentVersion}); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := s.lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { _, err := s.Load(context.Background()); result <- err }()
+	select {
+	case err := <-result:
+		t.Fatalf("Load returned while lock held: %v", err)
+	case <-time.After(lockRetryDelay):
+	}
+	unlock()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParallelLoadAndSaveKeepRegistryReadable(t *testing.T) {
+	dir := t.TempDir()
+	store := mustStore(t, dir)
+	if err := store.Save(context.Background(), Registry{Version: CurrentVersion}); err != nil {
+		t.Fatal(err)
+	}
+
+	var workers sync.WaitGroup
+	errs := make(chan error, 16)
+	for i := 0; i < 8; i++ {
+		workers.Add(2)
+		go func() {
+			defer workers.Done()
+			_, err := store.Load(context.Background())
+			errs <- err
+		}()
+		go func() {
+			defer workers.Done()
+			errs <- store.Save(context.Background(), Registry{Version: CurrentVersion})
+		}()
+	}
+	workers.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSaveRejectsPathsDifferingOnlyByCase(t *testing.T) {
+	dir := t.TempDir()
+	project := filepath.Join(dir, "Game.uproject")
+	err := mustStore(t, dir).Save(context.Background(), Registry{Version: CurrentVersion, Projects: []Project{{ID: "one", UProject: project}, {ID: "two", UProject: strings.ToUpper(project)}}})
+	if !errors.Is(err, ErrDuplicateProject) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestSaveRejectsPathsWithSameSymlinkIdentity(t *testing.T) {
+	dir := t.TempDir()
+	project := filepath.Join(dir, "Game.uproject")
+	if err := os.WriteFile(project, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "Game-alias.uproject")
+	if err := os.Symlink(project, alias); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	err := mustStore(t, dir).Save(context.Background(), Registry{Version: CurrentVersion, Projects: []Project{{ID: "one", UProject: project}, {ID: "two", UProject: alias}}})
+	if !errors.Is(err, ErrDuplicateProject) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestSaveRejectsMissingPathsBeneathSameSymlinkedDirectory(t *testing.T) {
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasDir := filepath.Join(dir, "alias")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	err := mustStore(t, dir).Save(context.Background(), Registry{Version: CurrentVersion, Projects: []Project{{ID: "one", UProject: filepath.Join(realDir, "Missing.uproject")}, {ID: "two", UProject: filepath.Join(aliasDir, "Missing.uproject")}}})
+	if !errors.Is(err, ErrDuplicateProject) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestNewStorePropagatesDefaultRootFailure(t *testing.T) {
+	original := defaultRoot
+	defaultRoot = func() (string, error) { return "", errors.New("injected default root failure") }
+	t.Cleanup(func() { defaultRoot = original })
+	_, err := NewStore("")
+	if err == nil {
+		t.Fatal("NewStore succeeded")
+	}
+}
+
 func TestFailedSavePreservesPreviousRegistry(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(dir)
+	s := mustStore(t, dir)
 	previous := Registry{Version: CurrentVersion, Projects: []Project{{ID: "old", UProject: filepath.Join(dir, "Old.uproject")}}}
 	if err := s.Save(context.Background(), previous); err != nil {
 		t.Fatal(err)
@@ -120,4 +227,13 @@ func TestFailedSavePreservesPreviousRegistry(t *testing.T) {
 	if !reflect.DeepEqual(previous, got) {
 		t.Fatalf("got %#v, want %#v", got, previous)
 	}
+}
+
+func mustStore(t *testing.T, dir string) *Store {
+	t.Helper()
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }

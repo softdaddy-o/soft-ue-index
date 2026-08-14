@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -89,11 +90,12 @@ func normalizeAndValidate(registry Registry) (Registry, error) {
 		if _, exists := ids[project.ID]; exists {
 			return Registry{}, fmt.Errorf("%w: ID %q", ErrDuplicateProject, project.ID)
 		}
-		if _, exists := paths[project.UProject]; exists {
+		comparisonPath := strings.ToLower(project.UProject)
+		if _, exists := paths[comparisonPath]; exists {
 			return Registry{}, fmt.Errorf("%w: path %q", ErrDuplicateProject, project.UProject)
 		}
 		ids[project.ID] = struct{}{}
-		paths[project.UProject] = struct{}{}
+		paths[comparisonPath] = struct{}{}
 	}
 	return registry, nil
 }
@@ -106,5 +108,24 @@ func normalizePath(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("normalize path %q: %w", path, err)
 	}
-	return filepath.Clean(abs), nil
+	return resolvePathIdentity(abs), nil
+}
+
+func resolvePathIdentity(path string) string {
+	current := path
+	missing := make([]string, 0)
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return filepath.Clean(path)
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
