@@ -144,9 +144,6 @@ func validateEntry(entry Entry, projectRoot, engineRoot string) (string, int, er
 	if err := requireRegularFile(source, "translation unit"); err != nil {
 		return "", 0, err
 	}
-	if !supportedTranslationUnit(source) {
-		return "", 0, fmt.Errorf("unsupported translation unit extension: %q", source)
-	}
 	args := entry.Arguments
 	if len(args) == 0 {
 		args = splitCommand(entry.Command)
@@ -193,14 +190,6 @@ func requireRegularFile(path, kind string) error {
 	return nil
 }
 
-func supportedTranslationUnit(path string) bool {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".c", ".cc", ".cpp", ".cxx", ".m", ".mm":
-		return true
-	default:
-		return false
-	}
-}
 func canonical(path string) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {

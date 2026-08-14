@@ -123,18 +123,17 @@ func TestValidateCompilerDirectoryPreservesOldDatabase(t *testing.T) {
 	assertOldDatabase(t, env.destination)
 }
 
-func TestValidateUnsupportedTranslationUnitPreservesOldDatabase(t *testing.T) {
+func TestValidateAcceptsHeaderEntry(t *testing.T) {
 	env := newValidationEnv(t)
-	unsupported := filepath.Join(env.projectRoot, "Source", "Notes.txt")
-	if err := os.WriteFile(unsupported, nil, 0o600); err != nil {
+	header := filepath.Join(env.projectRoot, "Source", "Game.hpp")
+	if err := os.WriteFile(header, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	env.projectEntry.File = unsupported
+	env.projectEntry.File = header
 	writeDatabase(t, env.staging, []Entry{env.projectEntry, env.engineEntry})
-	if _, err := ValidateAndPromote(ValidationInput{StagingDir: env.staging, DestinationDir: env.destination, ProjectRoot: env.projectRoot, EngineRoot: env.engineRoot}); err == nil {
-		t.Fatal("expected unsupported translation unit error")
+	if _, err := ValidateAndPromote(ValidationInput{StagingDir: env.staging, DestinationDir: env.destination, ProjectRoot: env.projectRoot, EngineRoot: env.engineRoot}); err != nil {
+		t.Fatalf("validate header entry: %v", err)
 	}
-	assertOldDatabase(t, env.destination)
 }
 
 func TestPromotionFailurePreservesOldDatabase(t *testing.T) {
