@@ -59,7 +59,7 @@ func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Clien
 		options.MaxMessageBytes = defaultMaxMessageBytes
 	}
 	if options.RequestTimeout <= 0 {
-		options.RequestTimeout = 15 * time.Second
+		options.RequestTimeout = 30 * time.Second
 	}
 	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), writes: make(chan writeRequest, 32), opened: make(map[string]int)}
 	c.wg.Add(3)

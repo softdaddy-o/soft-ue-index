@@ -14,6 +14,16 @@ import (
 	"time"
 )
 
+func TestClientDefaultsRequestTimeoutToThirtySeconds(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{})
+	defer c.Close()
+	if c.timeout != 30*time.Second {
+		t.Fatalf("default timeout=%v, want 30s", c.timeout)
+	}
+}
+
 func TestSourceWriteChangesOpenDocumentWithMonotonicVersions(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()
