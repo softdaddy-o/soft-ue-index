@@ -685,10 +685,6 @@ type execRunner struct {
 }
 
 func (r execRunner) Run(name string, args ...string) (string, error) {
-	return r.run(name, args...)
-}
-
-func (r execRunner) run(name string, args ...string) (string, error) {
 	timeout := r.Timeout
 	if timeout <= 0 {
 		timeout = defaultProbeTimeout

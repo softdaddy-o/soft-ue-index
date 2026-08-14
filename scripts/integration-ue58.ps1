@@ -190,7 +190,6 @@ $project = (Invoke-External $Executable @('status', $project.id, '--json') | Con
 if ($Clangd -and $project.toolchain.clangdPath -ne (Resolve-Path -LiteralPath $Clangd).Path) { throw 'Doctor did not select the supplied compatible clangd' }
 Invoke-Tool @('generate', $project.id)
 
-$database = $project.generation.compilationDatabase
 $project = (Invoke-External $Executable @('status', $project.id, '--json') | ConvertFrom-Json)
 $database = $project.generation.compilationDatabase
 if (-not (Test-Path -LiteralPath $database -PathType Leaf)) { throw 'Compilation database was not generated' }
