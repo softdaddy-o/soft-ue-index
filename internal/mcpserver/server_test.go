@@ -1,0 +1,153 @@
+package mcpserver
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/softdaddy-o/soft-ue-index/internal/lsp"
+	"github.com/softdaddy-o/soft-ue-index/internal/registry"
+)
+
+type fakeProjects struct{ projects []registry.Project }
+
+func (f fakeProjects) Load(context.Context) (registry.Registry, error) {
+	return registry.Registry{Version: registry.CurrentVersion, Projects: f.projects}, nil
+}
+
+func TestReadSymbolSourceRejectsOutsideRootAndBoundsBytes(t *testing.T) {
+	root := t.TempDir()
+	projectFile := filepath.Join(root, "Alpha.uproject")
+	if err := os.WriteFile(projectFile, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, "Source.cpp")
+	if err := os.WriteFile(source, []byte("line one\nline two\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: projectFile}}}, Limits: Limits{MaxSourceBytes: 5}})
+	r, err := s.ReadSymbolSource(context.Background(), ReadSymbolSourceInput{ProjectID: "alpha", Path: source, StartLine: 1, EndLine: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Text != "line " || !r.Truncated {
+		t.Fatalf("bounded result: %#v", r)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.cpp")
+	if err := os.WriteFile(outside, []byte("no"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReadSymbolSource(context.Background(), ReadSymbolSourceInput{ProjectID: "alpha", Path: outside, StartLine: 1, EndLine: 1}); !errors.Is(err, ErrPathForbidden) {
+		t.Fatalf("outside path: %v", err)
+	}
+}
+
+func TestSearchSymbolsMapsTimeout(t *testing.T) {
+	root := t.TempDir()
+	q := &slowQueries{fakeQueries: fakeQueries{}, wait: 50 * time.Millisecond}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "A.uproject")}}}, Queries: q, Limits: Limits{Timeout: time.Millisecond}})
+	_, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "Actor"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wanted deadline: %v", err)
+	}
+}
+
+type slowQueries struct {
+	fakeQueries
+	wait time.Duration
+}
+
+func (f *slowQueries) Symbols(ctx context.Context, p registry.Project, q string, n int) ([]lsp.Symbol, error) {
+	select {
+	case <-time.After(f.wait):
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+type fakeQueries struct {
+	seenID  string
+	symbols []lsp.Symbol
+	err     error
+}
+
+func (f *fakeQueries) Symbols(_ context.Context, project registry.Project, query string, limit int) ([]lsp.Symbol, error) {
+	f.seenID = project.ID
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.symbols, nil
+}
+func (f *fakeQueries) Locations(context.Context, registry.Project, string, TextPosition, int) ([]lsp.Location, error) {
+	return nil, f.err
+}
+func (f *fakeQueries) DocumentSymbols(context.Context, registry.Project, string, int) ([]lsp.DocumentSymbol, error) {
+	return nil, f.err
+}
+func (f *fakeQueries) Hover(context.Context, registry.Project, TextPosition) (*lsp.HoverResult, error) {
+	return nil, f.err
+}
+func (f *fakeQueries) CallHierarchy(context.Context, registry.Project, string, TextPosition, int) (any, error) {
+	return nil, f.err
+}
+
+func TestSearchSymbolsRoutesExplicitProjectAndTruncates(t *testing.T) {
+	root := t.TempDir()
+	q := &fakeQueries{symbols: []lsp.Symbol{{Name: "One"}, {Name: "Two"}}}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}, Queries: q, Limits: Limits{MaxItems: 1}})
+
+	result, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "Actor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.seenID != "alpha" {
+		t.Fatalf("routed to %q", q.seenID)
+	}
+	if len(result.Items) != 1 || result.Items[0].Name != "One" || !result.Truncated {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestSearchSymbolsRejectsMissingOrUnknownProject(t *testing.T) {
+	s := New(Dependencies{Projects: fakeProjects{}})
+	if _, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{Query: "Actor"}); !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("missing project: %v", err)
+	}
+	if _, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "missing", Query: "Actor"}); !errors.Is(err, ErrProjectNotFound) {
+		t.Fatalf("unknown project: %v", err)
+	}
+}
+
+func TestOfficialSDKRegistersAllReadOnlyTools(t *testing.T) {
+	s := New(Dependencies{Projects: fakeProjects{}}).MCPServer("test")
+	a, b := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	serverSession, err := s.Connect(ctx, a, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "test"}, nil)
+	clientSession, err := client.Connect(ctx, b, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	listed, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"list_projects": true, "project_status": true, "search_symbols": true, "find_definition": true, "find_references": true, "find_implementations": true, "document_symbols": true, "hover": true, "call_hierarchy": true, "read_symbol_source": true}
+	for _, tool := range listed.Tools {
+		delete(want, tool.Name)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing SDK tools: %v", want)
+	}
+}
