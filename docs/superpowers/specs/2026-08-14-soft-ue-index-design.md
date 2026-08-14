@@ -221,7 +221,6 @@ The first release is successful when a user with a Windows Unreal Engine 5.8 sou
 4. Edit an existing source file without regenerating the compilation database.
 5. Add a source file or change build metadata and observe one debounced database refresh.
 6. Query a project symbol and an engine symbol through MCP.
-7. retrieve definitions and bounded reference results from both project and engine source.
+7. Retrieve definitions and bounded reference results from both project and engine source.
 8. Keep one project's watcher and queries operating when another project fails generation.
 9. Diagnose missing generated headers, toolchains, or engine coverage with a concrete remediation.
-
