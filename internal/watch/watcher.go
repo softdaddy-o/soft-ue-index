@@ -145,11 +145,35 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 			return
 		}
 	}
+	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && w.isWatchedDirectory(event.Name) {
+		w.removeTree(event.Name)
+		if w.isRelevantDirectory(event.Name) && w.coordinator != nil {
+			for _, id := range ids {
+				w.coordinator.Invalidate(id)
+			}
+		}
+		return
+	}
 	if RequiresCompDB(event.Name, event.Op) && w.coordinator != nil {
 		for _, id := range ids {
 			w.coordinator.Invalidate(id)
 		}
 	}
+}
+func (w *Watcher) isWatchedDirectory(path string) bool {
+	_, ok := w.dirs.Load(filepath.Clean(path))
+	return ok
+}
+func (w *Watcher) removeTree(root string) {
+	root = filepath.Clean(root)
+	w.dirs.Range(func(key, _ any) bool {
+		path := key.(string)
+		if contains(root, path) {
+			_ = w.native.Remove(path)
+			w.dirs.Delete(path)
+		}
+		return true
+	})
 }
 func (w *Watcher) isRelevantDirectory(path string) bool {
 	w.mu.RLock()

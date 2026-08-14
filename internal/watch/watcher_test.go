@@ -61,3 +61,58 @@ func TestCreatedOrMovedInRelevantDirectoryAttachesAndInvalidates(t *testing.T) {
 		t.Fatalf("%q was not watched", dir)
 	}
 }
+
+func TestRemovedOrRenamedOutRelevantDirectoryInvalidatesAndCleansWatch(t *testing.T) {
+	for _, kind := range []string{"Source", "Plugins"} {
+		for _, op := range []fsnotify.Op{fsnotify.Remove, fsnotify.Rename} {
+			t.Run(kind+"/"+op.String(), func(t *testing.T) {
+				root := t.TempDir()
+				dir := filepath.Join(root, kind, "Populated", "Nested")
+				if err := os.MkdirAll(filepath.Join(root, kind), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				results := make(chan Result, 8)
+				c := NewCoordinatorWithOptions(nil, 1, 0, CoordinatorOptions{Result: func(result Result) { results <- result }})
+				defer c.Close()
+				w, err := NewWatcher(c)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer w.Close()
+				if err := w.AddProject(ProjectRoots{ID: "game", ProjectRoot: root}); err != nil {
+					t.Fatal(err)
+				}
+				removed := filepath.Join(root, kind, "Populated")
+				w.dirs.Store(filepath.Clean(removed), struct{}{})
+				w.dirs.Store(filepath.Clean(dir), struct{}{})
+				w.handleEvent(fsnotify.Event{Name: removed, Op: op})
+				select {
+				case got := <-results:
+					if got.ProjectID != "game" {
+						t.Fatal(got.ProjectID)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("missing directory did not invalidate")
+				}
+				if _, ok := w.dirs.Load(filepath.Clean(removed)); ok {
+					t.Fatal("stale directory watch remains")
+				}
+				if _, ok := w.dirs.Load(filepath.Clean(filepath.Join(removed, "Nested"))); ok {
+					t.Fatal("stale nested watch remains")
+				}
+				if err := os.MkdirAll(removed, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				w.handleEvent(fsnotify.Event{Name: removed, Op: fsnotify.Create})
+				if _, ok := w.dirs.Load(filepath.Clean(removed)); !ok {
+					t.Fatal("replacement directory was not watched")
+				}
+				select {
+				case <-results:
+				case <-time.After(time.Second):
+					t.Fatal("replacement did not invalidate")
+				}
+			})
+		}
+	}
+}
