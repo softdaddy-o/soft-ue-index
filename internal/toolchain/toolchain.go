@@ -262,17 +262,26 @@ type FileSystem interface {
 	Glob(pattern string) []string
 }
 
-// FindBundledDotnet locates the runtime distributed with supported UE 5.8 installations.
+// FindBundledDotnet locates the newest numeric runtime distributed with the engine.
 func FindBundledDotnet(engineRoot string, filesystem FileSystem) (string, bool) {
-	pattern := filepath.ToSlash(filepath.Join(engineRoot, "Engine", "Binaries", "ThirdParty", "DotNet", "8.0.*", "win-x64", "dotnet.exe"))
+	pattern := filepath.ToSlash(filepath.Join(engineRoot, "Engine", "Binaries", "ThirdParty", "DotNet", "*", "win-x64", "dotnet.exe"))
 	paths := filesystem.Glob(pattern)
 	sort.Strings(paths)
+	var selected string
+	var selectedVersion Version
 	for _, path := range paths {
-		if filesystem.Exists(path) {
-			return path, true
+		if !filesystem.Exists(path) {
+			continue
+		}
+		version, err := ParseVersion(filepath.Base(filepath.Dir(filepath.Dir(path))))
+		if err != nil {
+			continue
+		}
+		if selected == "" || version.Compare(selectedVersion) > 0 || (version.Compare(selectedVersion) == 0 && path < selected) {
+			selected, selectedVersion = path, version
 		}
 	}
-	return "", false
+	return selected, selected != ""
 }
 
 // DiscoverCandidates returns candidates in stable source precedence order, removing duplicate paths.

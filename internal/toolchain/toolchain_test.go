@@ -212,6 +212,33 @@ func TestFindBundledDotnetFindsAnyBundledEightRuntime(t *testing.T) {
 	}
 }
 
+func TestFindBundledDotnetSupportsTenRuntimeAndChoosesNewestNumericVersion(t *testing.T) {
+	path, ok := FindBundledDotnet("C:/UE", fakeFiles{
+		"C:/UE/Engine/Binaries/ThirdParty/DotNet/8.0.401/win-x64/dotnet.exe": true,
+		"C:/UE/Engine/Binaries/ThirdParty/DotNet/10.0.9/win-x64/dotnet.exe":  true,
+		"C:/UE/Engine/Binaries/ThirdParty/DotNet/10.0.10/win-x64/dotnet.exe": true,
+	})
+	if !ok {
+		t.Fatal("FindBundledDotnet() found no runtime")
+	}
+	if want := "C:/UE/Engine/Binaries/ThirdParty/DotNet/10.0.10/win-x64/dotnet.exe"; path != want {
+		t.Errorf("path = %q, want newest numeric runtime %q", path, want)
+	}
+}
+
+func TestFindBundledDotnetSkipsNonNumericRuntimeDirectory(t *testing.T) {
+	path, ok := FindBundledDotnet("C:/UE", fakeFiles{
+		"C:/UE/Engine/Binaries/ThirdParty/DotNet/10.0.10-preview/win-x64/dotnet.exe": true,
+		"C:/UE/Engine/Binaries/ThirdParty/DotNet/10.0.9/win-x64/dotnet.exe":          true,
+	})
+	if !ok {
+		t.Fatal("FindBundledDotnet() found no runtime")
+	}
+	if want := "C:/UE/Engine/Binaries/ThirdParty/DotNet/10.0.9/win-x64/dotnet.exe"; path != want {
+		t.Errorf("path = %q, want numeric runtime %q", path, want)
+	}
+}
+
 func mustVersion(t *testing.T, text string) Version {
 	t.Helper()
 	version, err := ParseVersion(text)
