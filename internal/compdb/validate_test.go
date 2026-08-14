@@ -93,6 +93,37 @@ func TestValidateEngineOnlyFails(t *testing.T) {
 	assertOldDatabase(t, env.destination)
 }
 
+func TestValidateClassifiesNestedProjectBeforeContainingEngineRoot(t *testing.T) {
+	root := t.TempDir()
+	engineRoot := filepath.Join(root, "UEInstall")
+	projectRoot := filepath.Join(engineRoot, "Projects", "Game")
+	projectSource := filepath.Join(projectRoot, "Source", "Game.cpp")
+	engineSource := filepath.Join(engineRoot, "Engine", "Source", "Runtime", "Core", "Core.cpp")
+	compiler := filepath.Join(root, "toolchain", "clang-cl.exe")
+	for _, path := range []string{projectSource, engineSource, compiler} {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	database := filepath.Join(root, DatabaseName)
+	if err := WriteDatabase(database, []Entry{
+		{Directory: filepath.Dir(projectSource), File: projectSource, Arguments: []string{compiler, "-c", projectSource}},
+		{Directory: filepath.Dir(engineSource), File: engineSource, Arguments: []string{compiler, "-c", engineSource}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Validate(database, projectRoot, engineRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProjectTranslationUnits != 1 || result.EngineTranslationUnits != 1 {
+		t.Fatalf("nested coverage=%+v", result)
+	}
+}
+
 func TestValidateMalformedJSONPreservesOldDatabase(t *testing.T) {
 	env := newValidationEnv(t)
 	if err := os.WriteFile(filepath.Join(env.staging, DatabaseName), []byte("[not json"), 0o600); err != nil {

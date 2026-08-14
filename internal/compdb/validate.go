@@ -183,8 +183,7 @@ func validateEntry(entry Entry, projectRoot, engineRoot string) (string, int, er
 	scope := 0
 	if within(source, projectRoot) {
 		scope = 1
-	}
-	if within(source, engineRoot) {
+	} else if within(source, engineRoot) {
 		scope = 2
 	}
 	return filepath.ToSlash(source) + "\x00" + strings.Join(args, "\x00"), scope, nil
