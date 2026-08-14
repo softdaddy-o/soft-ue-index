@@ -86,9 +86,13 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
     $process = [Diagnostics.Process]::Start($psi)
     $stderr = $process.StandardError.ReadToEndAsync()
     try {
+        function Write-McpLine([string] $Json) {
+            $bytes = ([Text.UTF8Encoding]::new($false)).GetBytes($Json + "`n")
+            $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+            $process.StandardInput.BaseStream.Flush()
+        }
         function Send-Request([hashtable] $Request) {
-            $process.StandardInput.WriteLine(($Request | ConvertTo-Json -Compress -Depth 10))
-            $process.StandardInput.Flush()
+            Write-McpLine ($Request | ConvertTo-Json -Compress -Depth 10)
             $read = $process.StandardOutput.ReadLineAsync()
             $remaining = [Math]::Floor(($script:Deadline - (Get-Date)).TotalSeconds)
             if ($remaining -lt 1 -or -not $read.Wait([int]$remaining * 1000)) { throw 'MCP request timed out' }
@@ -100,8 +104,7 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
             return $line | ConvertFrom-Json
         }
         $null = Send-Request @{ jsonrpc = '2.0'; id = 1; method = 'initialize'; params = @{ protocolVersion = '2025-06-18'; capabilities = @{}; clientInfo = @{ name = 'integration-smoke'; version = '1' } } }
-        $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
-        $process.StandardInput.Flush()
+        Write-McpLine '{"jsonrpc":"2.0","method":"notifications/initialized"}'
         $projects = Send-Request @{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = @{ name = 'list_projects'; arguments = @{ max_items = 20 } } }
         if (-not $projects.result) { throw 'MCP list_projects did not return a result' }
         $id = 3
