@@ -1,6 +1,7 @@
 package watch
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,10 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 )
+
+type watcherNoopGenerator struct{}
+
+func (watcherNoopGenerator) Generate(context.Context, string) error { return nil }
 
 func TestNativeWatcherErrorIsSurfaced(t *testing.T) {
 	w, err := NewWatcher(nil)
@@ -106,6 +111,59 @@ func TestOrdinarySourceWriteNotifiesMatchingProjectWithoutRegeneration(t *testin
 	case <-results:
 		t.Fatal("ordinary source write regenerated compilation database")
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestUnrealInstallEngineTreesAreWatchedAndClassified(t *testing.T) {
+	project, install := t.TempDir(), t.TempDir()
+	engineSource := filepath.Join(install, "Engine", "Source", "Runtime", "Core")
+	if err := os.MkdirAll(engineSource, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	changes := make(chan SourceWrite, 1)
+	results := make(chan Result, 8)
+	c := NewCoordinatorWithOptions(watcherNoopGenerator{}, 1, 0, CoordinatorOptions{Result: func(r Result) { results <- r }})
+	defer c.Close()
+	w, err := NewWatcherWithOptions(c, WatcherOptions{SourceWrite: func(change SourceWrite) { changes <- change }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.AddProject(ProjectRoots{ID: "game", ProjectRoot: project, EngineRoot: install}); err != nil {
+		t.Fatal(err)
+	}
+	cpp := filepath.Join(engineSource, "Core.cpp")
+	w.handleEvent(fsnotify.Event{Name: cpp, Op: fsnotify.Write})
+	select {
+	case got := <-changes:
+		if got.ProjectID != "game" {
+			t.Fatal(got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("engine source write was not routed")
+	}
+	build := filepath.Join(engineSource, "Core.Build.cs")
+	w.handleEvent(fsnotify.Event{Name: build, Op: fsnotify.Write})
+	select {
+	case got := <-results:
+		if got.ProjectID != "game" {
+			t.Fatal(got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("engine Build.cs did not invalidate")
+	}
+	newDir := filepath.Join(install, "Engine", "Source", "Runtime", "NewModule")
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w.handleEvent(fsnotify.Event{Name: newDir, Op: fsnotify.Create})
+	if _, ok := w.dirs.Load(filepath.Clean(newDir)); !ok {
+		t.Fatal("new engine source directory was not attached")
+	}
+	select {
+	case <-results:
+	case <-time.After(time.Second):
+		t.Fatal("new engine directory did not invalidate")
 	}
 }
 

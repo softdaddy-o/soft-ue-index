@@ -58,6 +58,7 @@ func (w *Watcher) AddProject(project ProjectRoots) error {
 		if project.EngineRoot, err = canonicalRoot(project.EngineRoot); err != nil {
 			return err
 		}
+		project.EngineRoot = filepath.Join(project.EngineRoot, "Engine")
 	}
 	if err := w.addDir(project.ProjectRoot); err != nil {
 		return err
