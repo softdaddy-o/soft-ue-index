@@ -104,11 +104,15 @@ func TestSynthesizeRiderPersistsContentAddressedResponsesAndRootEnvironment(t *t
 	if err != nil || len(files) == 0 {
 		t.Fatal("response not persisted")
 	}
-	data, err := os.ReadFile(filepath.Join(responses, files[0].Name()))
-	if err != nil {
-		t.Fatal(err)
+	var data string
+	for _, file := range files {
+		b, err := os.ReadFile(filepath.Join(responses, file.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data += string(b)
 	}
-	if !strings.Contains(string(data), "GLOBAL=1") || !strings.Contains(string(data), "SDK Includes") || !strings.Contains(string(data), "UE_MODULE_NAME=M") || !strings.Contains(string(data), "/FI") {
+	if !strings.Contains(data, "GLOBAL=1") || !strings.Contains(data, "SDK Includes") || !strings.Contains(data, "UE_MODULE_NAME=M") || !strings.Contains(data, "/FI") {
 		t.Fatalf("root env absent: %s", data)
 	}
 }
