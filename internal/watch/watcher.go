@@ -208,7 +208,10 @@ func (w *Watcher) projectsFor(path string) []string {
 }
 func contains(root, path string) bool {
 	relative, err := filepath.Rel(root, path)
-	return err == nil && relative != ".." && !filepath.IsAbs(relative)
+	if err != nil || filepath.IsAbs(relative) || relative == ".." {
+		return false
+	}
+	return !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 func (w *Watcher) Close() error {
 	var err error
