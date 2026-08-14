@@ -254,7 +254,19 @@ func TestCloseDuringStartupReturnsClosedAndKillsProcess(t *testing.T) {
 	cfg := ProjectConfig{ID: "race", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"}
 	result := make(chan error, 1)
 	go func() { _, e := m.Client(context.Background(), cfg); result <- e }()
-	time.Sleep(10 * time.Millisecond)
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.mu.Lock()
+		started := m.sessions["race"] != nil && m.sessions["race"].starting != nil
+		m.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("startup did not begin")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	m.Close()
 	close(f.ready)
 	if e := <-result; e != ErrClosed {
@@ -267,6 +279,23 @@ func TestCloseDuringStartupReturnsClosedAndKillsProcess(t *testing.T) {
 	case <-p.done:
 	case <-time.After(time.Second):
 		t.Fatal("detached process")
+	}
+}
+func TestCloseWakesAllStartupWaiters(t *testing.T) {
+	f := &slowFactory{ready: make(chan struct{})}
+	m := NewManager(f)
+	cfg := ProjectConfig{ID: "wait", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"}
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { _, e := m.Client(context.Background(), cfg); errs <- e }()
+	}
+	time.Sleep(10 * time.Millisecond)
+	m.Close()
+	close(f.ready)
+	for range 2 {
+		if e := <-errs; e != ErrClosed {
+			t.Fatalf("got %v", e)
+		}
 	}
 }
 

@@ -81,8 +81,9 @@ func (c *Client) readLoop() {
 			case <-c.done:
 				return
 			default:
-				// The peer is flooding requests while not reading replies. Dropping the
-				// excess is safer than blocking the sole transport reader indefinitely.
+				// Queue saturation is explicitly reported; send is serialized and Close
+				// closes the transport to unblock a misbehaving peer.
+				_ = c.send(wireMessage{JSONRPC: "2.0", ID: m.ID, Error: &rpcError{Code: -32000, Message: "server request queue full"}})
 			}
 			continue
 		}

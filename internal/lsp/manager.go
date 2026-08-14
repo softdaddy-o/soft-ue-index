@@ -161,12 +161,14 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 		s.config = cfg
 		s.starting = make(chan struct{})
 		wait := s.starting
-		m.mu.Unlock()
 		sessionCtx, cancel := context.WithCancel(context.Background())
 		s.cancel = cancel
+		m.mu.Unlock()
 		p, err := m.start(sessionCtx, cfg)
 		m.mu.Lock()
 		if m.closed || m.sessions[cfg.ID] != s {
+			close(wait)
+			s.starting = nil
 			m.mu.Unlock()
 			if p != nil {
 				_ = p.Kill()
