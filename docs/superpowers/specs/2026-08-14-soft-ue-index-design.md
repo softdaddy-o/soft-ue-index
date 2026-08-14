@@ -34,7 +34,7 @@ The binary is named `soft-ue-index` and provides these primary commands:
 
 ```powershell
 soft-ue-index doctor
-soft-ue-index add C:/Projects/MyGame/MyGame.uproject
+soft-ue-index add <path-to-project.uproject>
 soft-ue-index list
 soft-ue-index generate MyGame
 soft-ue-index watch
