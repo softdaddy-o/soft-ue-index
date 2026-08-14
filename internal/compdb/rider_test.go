@@ -3,6 +3,7 @@ package compdb
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -71,5 +72,42 @@ func TestRiderMetadataStaleWhenRulesNewer(t *testing.T) {
 	}
 	if !RiderMetadataStale(root) {
 		t.Fatal("expected newer build rules to mark metadata stale")
+	}
+}
+
+func TestSynthesizeRiderPersistsContentAddressedResponsesAndRootEnvironment(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "P")
+	engine := filepath.Join(root, "E")
+	dir := RiderMetadataDir(project)
+	for _, p := range []string{filepath.Join(project, "Source", "M"), filepath.Join(engine, "Source", "Core"), dir} {
+		if err := os.MkdirAll(p, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{filepath.Join(project, "Source", "M", "M.cpp"), filepath.Join(engine, "Source", "Core", "E.cpp"), filepath.Join(project, "Source", "MEditor.Target.cs")} {
+		if err := os.WriteFile(p, []byte{}, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	meta := `{"Name":"MEditor","TargetFile":"` + filepath.ToSlash(filepath.Join(project, "Source", "MEditor.Target.cs")) + `","EnvironmentIncludePaths":{"System":["C:/SDK Includes"]},"EnvironmentDefinitions":["GLOBAL=1"],"Modules":{"M":{"Directory":"` + filepath.ToSlash(filepath.Join(project, "Source", "M")) + `"},"E":{"Directory":"` + filepath.ToSlash(filepath.Join(engine, "Source", "Core")) + `"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "target.json"), []byte(meta), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(root, "stage")
+	responses := filepath.Join(root, "responses")
+	if _, err := SynthesizeRider(RiderInput{ProjectRoot: project, EngineRoot: engine, Target: "MEditor", StagingDir: stage, ResponseDir: responses, ClangCL: "clang-cl.exe"}); err != nil {
+		t.Fatal(err)
+	}
+	files, err := os.ReadDir(responses)
+	if err != nil || len(files) == 0 {
+		t.Fatal("response not persisted")
+	}
+	data, err := os.ReadFile(filepath.Join(responses, files[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "GLOBAL=1") || !strings.Contains(string(data), "SDK Includes") {
+		t.Fatalf("root env absent: %s", data)
 	}
 }

@@ -30,15 +30,16 @@ import (
 // Dependencies allow tests and embedders to replace effects without replacing
 // command routing. New supplies the real per-user store when Store is omitted.
 type Dependencies struct {
-	Store       *registry.Store
-	Output      io.Writer
-	ErrorOutput io.Writer
-	WatchResult func(error)
-	Discover    func(unreal.ProjectRequest) (unreal.Project, error)
-	Generate    func(context.Context, registry.Project) (registry.Project, error)
-	Doctor      func(context.Context, *registry.Store) (any, error)
-	Watch       func(context.Context, []registry.Project) error
-	MCP         func(context.Context, *registry.Store) error
+	Store          *registry.Store
+	Output         io.Writer
+	ErrorOutput    io.Writer
+	WatchResult    func(error)
+	Discover       func(unreal.ProjectRequest) (unreal.Project, error)
+	Generate       func(context.Context, registry.Project) (registry.Project, error)
+	GenerateScoped func(context.Context, registry.Project, bool) (registry.Project, error)
+	Doctor         func(context.Context, *registry.Store) (any, error)
+	Watch          func(context.Context, []registry.Project) error
+	MCP            func(context.Context, *registry.Store) error
 	// Environment, Files, and Runner keep doctor discovery independently testable.
 	Environment toolchain.Environment
 	Files       toolchain.FileSystem
@@ -75,6 +76,9 @@ func New(d Dependencies) *App {
 	a := &App{d: d}
 	if a.d.Generate == nil {
 		a.d.Generate = a.generateReal
+	}
+	if a.d.GenerateScoped == nil {
+		a.d.GenerateScoped = a.generateRealScoped
 	}
 	if a.d.Doctor == nil {
 		a.d.Doctor = a.doctorReal
@@ -218,7 +222,12 @@ func (a *App) generate(ctx context.Context, c cli.Command) error {
 	if e != nil {
 		return e
 	}
-	p, e := a.d.Generate(ctx, r.Projects[i])
+	p := r.Projects[i]
+	if c.EngineScope != "" {
+		p, e = a.d.GenerateScoped(ctx, r.Projects[i], c.EngineScope == "full")
+	} else {
+		p, e = a.d.Generate(ctx, r.Projects[i])
+	}
 	if e != nil {
 		return e
 	}
@@ -287,6 +296,9 @@ func (hostFiles) Exists(path string) bool {
 func (hostFiles) Glob(pattern string) []string { paths, _ := filepath.Glob(pattern); return paths }
 
 func (a *App) generateReal(ctx context.Context, p registry.Project) (registry.Project, error) {
+	return a.generateRealScoped(ctx, p, false)
+}
+func (a *App) generateRealScoped(ctx context.Context, p registry.Project, engineScopeFull bool) (registry.Project, error) {
 	sdk, err := os.ReadFile(filepath.Join(p.Engine.Root, "Engine", "Config", "Windows", "Windows_SDK.json"))
 	if err != nil {
 		return p, fmt.Errorf("read Windows SDK configuration: %w", err)
@@ -308,7 +320,7 @@ func (a *App) generateReal(ctx context.Context, p registry.Project) (registry.Pr
 		return p, err
 	}
 	projectRoot := filepath.Dir(p.UProject)
-	targetFile := filepath.Join(projectRoot, "Source", p.Target+".Target.cs")
+	targetFile := ""
 	metadataPresent := compdb.RiderMetadataAvailable(projectRoot, p.Target, targetFile)
 	metadataStale := compdb.RiderMetadataStale(projectRoot)
 	if metadataPresent && !metadataStale {
@@ -317,7 +329,7 @@ func (a *App) generateReal(ctx context.Context, p registry.Project) (registry.Pr
 			return p, stageErr
 		}
 		clangCL := filepath.Join(filepath.Dir(selection.Path), "clang-cl.exe")
-		rider, stageErr := compdb.SynthesizeRider(compdb.RiderInput{ProjectRoot: projectRoot, EngineRoot: p.Engine.Root, Target: p.Target, TargetFile: targetFile, StagingDir: staging, ClangCL: clangCL})
+		rider, stageErr := compdb.SynthesizeRider(compdb.RiderInput{ProjectRoot: projectRoot, EngineRoot: p.Engine.Root, Target: p.Target, TargetFile: targetFile, StagingDir: staging, ResponseDir: filepath.Join(cache, "responses"), ClangCL: clangCL, EngineScopeFull: engineScopeFull})
 		if stageErr == nil {
 			_, stageErr = compdb.ValidateAndPromote(compdb.ValidationInput{StagingDir: staging, DestinationDir: cache, ProjectRoot: projectRoot, EngineRoot: p.Engine.Root})
 		}

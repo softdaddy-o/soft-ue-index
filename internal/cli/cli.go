@@ -15,6 +15,7 @@ type Command struct {
 	ProjectPath string
 	ProjectName string
 	JSON        bool
+	EngineScope string
 }
 
 // Parse converts command-line arguments into a Command.
@@ -24,6 +25,14 @@ func Parse(args []string) (Command, error) {
 	for _, arg := range args {
 		if arg == "--json" {
 			command.JSON = true
+			continue
+		}
+		if arg == "--engine-scope" || arg == "--engine-scope=project" {
+			command.EngineScope = "project"
+			continue
+		}
+		if arg == "--engine-scope=full" {
+			command.EngineScope = "full"
 			continue
 		}
 		positionals = append(positionals, arg)
@@ -51,6 +60,9 @@ func Parse(args []string) (Command, error) {
 		command.ProjectName = positionals[1]
 	default:
 		return Command{}, usageError("unknown command %q", command.Name)
+	}
+	if command.EngineScope != "" && command.Name != "generate" {
+		return Command{}, usageError("--engine-scope only applies to generate")
 	}
 
 	return command, nil

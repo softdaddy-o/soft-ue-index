@@ -26,3 +26,13 @@ func TestParseAddCommand(t *testing.T) {
 		t.Errorf("Command.ProjectPath = %q, want project path", command.ProjectPath)
 	}
 }
+
+func TestParseGenerateEngineScope(t *testing.T) {
+	command, err := Parse([]string{"generate", "game", "--engine-scope=full"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.EngineScope != "full" {
+		t.Fatalf("scope=%q", command.EngineScope)
+	}
+}

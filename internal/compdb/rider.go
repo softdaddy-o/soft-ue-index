@@ -16,8 +16,8 @@ import (
 )
 
 type RiderInput struct {
-	ProjectRoot, EngineRoot, Target, TargetFile, StagingDir, ClangCL string
-	EngineScopeFull                                                  bool
+	ProjectRoot, EngineRoot, Target, TargetFile, StagingDir, ResponseDir, ClangCL string
+	EngineScopeFull                                                               bool
 }
 
 type RiderResult struct {
@@ -30,7 +30,9 @@ type riderTarget struct {
 	ToolchainInfo    struct {
 		CompilerPath string `json:"CompilerPath"`
 	} `json:"ToolchainInfo"`
-	Modules map[string]riderModule `json:"Modules"`
+	Modules                 map[string]riderModule `json:"Modules"`
+	EnvironmentIncludePaths json.RawMessage        `json:"EnvironmentIncludePaths"`
+	EnvironmentDefinitions  json.RawMessage        `json:"EnvironmentDefinitions"`
 }
 type riderModule struct {
 	Directory string     `json:"Directory"`
@@ -51,7 +53,7 @@ func RiderMetadataDir(projectRoot string) string {
 }
 
 func RiderMetadataAvailable(projectRoot, target, targetFile string) bool {
-	_, err := selectRiderTarget(RiderMetadataDir(projectRoot), target, targetFile)
+	_, err := selectRiderTarget(RiderMetadataDir(projectRoot), target, targetFile, projectRoot)
 	return err == nil
 }
 
@@ -94,7 +96,7 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 	if err != nil {
 		return RiderResult{}, err
 	}
-	target, err := selectRiderTarget(RiderMetadataDir(project), in.Target, in.TargetFile)
+	target, err := selectRiderTarget(RiderMetadataDir(project), in.Target, in.TargetFile, project)
 	if err != nil {
 		return RiderResult{}, err
 	}
@@ -105,9 +107,12 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 	if compiler == "" {
 		return RiderResult{}, fmt.Errorf("rider metadata has no clang-cl compiler")
 	}
-	modules := target.Modules
+	modules := make(map[string]riderModule, len(target.Modules))
+	for n, m := range target.Modules {
+		modules[n] = m
+	}
 	if in.EngineScopeFull {
-		if editor, e := selectRiderTarget(RiderMetadataDir(project), "UnrealEditor", ""); e == nil {
+		if editor, e := selectRiderTarget(RiderMetadataDir(project), "UnrealEditor", "", project); e == nil {
 			for n, m := range editor.Modules {
 				if _, ok := modules[n]; !ok {
 					modules[n] = m
@@ -153,9 +158,18 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 			if mod == nil {
 				return nil
 			}
-			rsp := filepath.Join(in.StagingDir, "rider-"+safeName(mod.name)+".rsp")
+			content := response(*mod, compiler, stringsFromJSON(target.EnvironmentIncludePaths), stringsFromJSON(target.EnvironmentDefinitions))
+			responseDir := in.ResponseDir
+			if responseDir == "" {
+				responseDir = in.StagingDir
+			}
+			if e := os.MkdirAll(responseDir, 0700); e != nil {
+				return e
+			}
+			sum := sha256.Sum256([]byte(content))
+			rsp := filepath.Join(responseDir, hex.EncodeToString(sum[:])+".rsp")
 			if _, e := os.Stat(rsp); os.IsNotExist(e) {
-				if e = os.WriteFile(rsp, []byte(response(*mod, compiler)), 0600); e != nil {
+				if e = writeResponseAtomic(rsp, []byte(content)); e != nil {
 					return e
 				}
 			}
@@ -205,12 +219,13 @@ func deepestModule(file string, mods []riderResolvedModule) *riderResolvedModule
 	}
 	return best
 }
-func selectRiderTarget(dir, name, targetFile string) (riderTarget, error) {
+func selectRiderTarget(dir, name, targetFile, projectRoot string) (riderTarget, error) {
 	files, e := filepath.Glob(filepath.Join(dir, "*.json"))
 	if e != nil {
 		return riderTarget{}, e
 	}
 	wanted, _ := canonical(targetFile)
+	var matches []riderTarget
 	for _, f := range files {
 		b, e := os.ReadFile(f)
 		if e != nil {
@@ -221,16 +236,23 @@ func selectRiderTarget(dir, name, targetFile string) (riderTarget, error) {
 			continue
 		}
 		tf, _ := canonical(r.TargetFile)
-		if strings.EqualFold(r.Name, name) && (targetFile == "" || strings.EqualFold(tf, wanted)) {
-			return r, nil
+		safe := within(tf, projectRoot) && strings.EqualFold(filepath.Base(tf), name+".Target.cs")
+		if strings.EqualFold(r.Name, name) && safe && (targetFile == "" || strings.EqualFold(tf, wanted)) {
+			matches = append(matches, r)
 		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return riderTarget{}, fmt.Errorf("rider_metadata_ambiguous: target %q", name)
 	}
 	return riderTarget{}, fmt.Errorf("rider_metadata_missing: target %q", name)
 }
-func response(m riderResolvedModule, compiler string) string {
+func response(m riderResolvedModule, compiler string, rootIncludes, rootDefinitions []string) string {
 	_ = compiler
-	inc := append(append(append([]string{}, m.rules.PublicIncludePaths...), m.rules.PrivateIncludePaths...), m.rules.IncludePaths...)
-	defs := append(append(append([]string{}, m.rules.Definitions...), m.rules.PublicDefinitions...), m.rules.PrivateDefinitions...)
+	inc := unique(append(append(append(append([]string{}, rootIncludes...), m.rules.PublicIncludePaths...), m.rules.PrivateIncludePaths...), m.rules.IncludePaths...))
+	defs := unique(append(append(append(append([]string{}, rootDefinitions...), m.rules.Definitions...), m.rules.PublicDefinitions...), m.rules.PrivateDefinitions...))
 	var a = []string{"/nologo", "/TP", "/std:c++20", "--target=x86_64-pc-windows-msvc", "/utf-8", "/Zc:__cplusplus", "/permissive-"}
 	for _, x := range inc {
 		if !filepath.IsAbs(x) {
@@ -248,6 +270,54 @@ func response(m riderResolvedModule, compiler string) string {
 		a = append(a, "/FI"+quoteRsp(x))
 	}
 	return strings.Join(a, "\r\n") + "\r\n"
+}
+func stringsFromJSON(raw json.RawMessage) []string {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return nil
+	}
+	var out []string
+	var visit func(any)
+	visit = func(v any) {
+		switch x := v.(type) {
+		case string:
+			out = append(out, x)
+		case []any:
+			for _, e := range x {
+				visit(e)
+			}
+		case map[string]any:
+			for _, e := range x {
+				visit(e)
+			}
+		}
+	}
+	visit(value)
+	return unique(out)
+}
+func unique(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, x := range in {
+		if x != "" && !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	return out
+}
+func writeResponseAtomic(path string, data []byte) error {
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		if _, e := os.Stat(path); e == nil {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 func quoteRsp(s string) string {
 	if strings.ContainsAny(s, " \t\"") {
