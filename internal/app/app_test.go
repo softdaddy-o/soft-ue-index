@@ -3,15 +3,18 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/softdaddy-o/soft-ue-index/internal/cli"
+	"github.com/softdaddy-o/soft-ue-index/internal/compdb"
 	"github.com/softdaddy-o/soft-ue-index/internal/diagnostics"
 	"github.com/softdaddy-o/soft-ue-index/internal/lsp"
 	"github.com/softdaddy-o/soft-ue-index/internal/mcpserver"
@@ -219,6 +222,57 @@ func TestLSPQueryResultsCannotEscapeProjectAndEngineRoots(t *testing.T) {
 	calls := filterLSPCalls(p, []lsp.CallHierarchyCall{insideCall, escapeCall})
 	if len(calls) != 1 || calls[0].From.Name != "engine" {
 		t.Fatalf("call hierarchy calls leaked: %#v", calls)
+	}
+}
+
+type countingLSPFactory struct{ starts atomic.Int32 }
+
+func (f *countingLSPFactory) Start(context.Context, string, []string, string) (lsp.Process, error) {
+	f.starts.Add(1)
+	return nil, errors.New("unexpected clangd start")
+}
+
+func TestLSPQueriesRejectCorruptRegistryCacheBeforeFilesystemEffects(t *testing.T) {
+	root := t.TempDir()
+	projectRoot := filepath.Join(root, "Project")
+	engineRoot := filepath.Join(root, "Engine")
+	for _, dir := range []string{projectRoot, engineRoot} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	p := registry.Project{ID: "game", UProject: filepath.Join(projectRoot, "Game.uproject"), Engine: registry.Engine{Root: engineRoot}, Toolchain: registry.Toolchain{ClangdPath: "clangd.exe"}}
+	for _, cache := range []string{projectRoot, engineRoot} {
+		t.Run(filepath.Base(cache), func(t *testing.T) {
+			db := filepath.Join(cache, compdb.DatabaseName)
+			if err := os.WriteFile(db, []byte("[]"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			candidate := p
+			candidate.Generation = registry.GenerationState{CacheDir: cache, CompilationDatabase: db}
+			factory := &countingLSPFactory{}
+			manager := lsp.NewManager(factory)
+			defer manager.Close()
+			if _, _, err := (lspQueries{manager: manager}).client(context.Background(), candidate); err == nil {
+				t.Fatal("corrupt registry cache was accepted")
+			}
+			if got := factory.starts.Load(); got != 0 {
+				t.Fatalf("clangd process starts=%d", got)
+			}
+			if _, err := os.Stat(filepath.Join(cache, ".cache")); !os.IsNotExist(err) {
+				t.Fatalf("manager wrote inside registry-controlled cache: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateProjectCacheRejectsSourceDirectoryWithoutWriting(t *testing.T) {
+	source := t.TempDir()
+	p := registry.Project{ID: fmt.Sprintf("malicious-%d", time.Now().UnixNano()), Generation: registry.GenerationState{CacheDir: source, CompilationDatabase: filepath.Join(source, "compile_commands.json")}}
+	if err := validateProjectCache(p); err == nil {
+		t.Fatal("malicious cache was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(source, ".cache")); !os.IsNotExist(err) {
+		t.Fatalf("validation wrote into source: %v", err)
 	}
 }
 

@@ -727,8 +727,45 @@ func (q lspQueries) client(ctx context.Context, p registry.Project) (*lsp.Client
 	if p.Toolchain.ClangdPath == "" {
 		return nil, func() {}, errors.New("clangd is not configured for project")
 	}
+	if err := validateProjectCache(p); err != nil {
+		return nil, func() {}, err
+	}
 	c, e := q.manager.Client(ctx, lsp.ProjectConfig{ID: p.ID, Clangd: p.Toolchain.ClangdPath, CompilationDatabase: p.Generation.CompilationDatabase, CacheDir: p.Generation.CacheDir, RootURI: fileURI(filepath.Dir(p.UProject))})
 	return c, func() { q.manager.Release(p.ID) }, e
+}
+
+func validateProjectCache(p registry.Project) error {
+	expected, err := projectCache(p.ID)
+	if err != nil {
+		return err
+	}
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil {
+		return err
+	}
+	cacheRoot = filepath.Join(cacheRoot, "soft-ue-index", "projects")
+	resolve := func(path string) string {
+		path = filepath.Clean(path)
+		if v, e := filepath.EvalSymlinks(path); e == nil {
+			return filepath.Clean(v)
+		}
+		return path
+	}
+	expectedResolved, rootResolved := resolve(expected), resolve(cacheRoot)
+	rel, err := filepath.Rel(rootResolved, expectedResolved)
+	if err != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errors.New("project cache escapes user cache root")
+	}
+	equal := func(a, b string) bool {
+		if runtime.GOOS == "windows" {
+			return strings.EqualFold(resolve(a), resolve(b))
+		}
+		return resolve(a) == resolve(b)
+	}
+	if !equal(p.Generation.CacheDir, expected) || !equal(p.Generation.CompilationDatabase, filepath.Join(expected, compdb.DatabaseName)) {
+		return errors.New("project cache does not match registered project")
+	}
+	return nil
 }
 func (q lspQueries) Symbols(ctx context.Context, p registry.Project, s string, n int) ([]lsp.Symbol, error) {
 	c, done, e := q.client(ctx, p)
