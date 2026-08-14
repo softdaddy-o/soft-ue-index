@@ -355,14 +355,15 @@ func TestOfficialSDKStdioCallToolFramesRespectResponseCap(t *testing.T) {
 				t.Fatal(err)
 			}
 			write(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
-			write(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": map[string]any{"name": "search_symbols", "arguments": map[string]any{"project_id": "p", "query": "x"}}})
+			requestID := strings.Repeat("i", defaultMaxRequestIDBytes)
+			write(map[string]any{"jsonrpc": "2.0", "id": requestID, "method": "tools/call", "params": map[string]any{"name": "search_symbols", "arguments": map[string]any{"project_id": "p", "query": "x"}}})
 			for scanner.Scan() {
 				line := append([]byte(nil), scanner.Bytes()...)
 				var msg struct {
-					ID     int                 `json:"id"`
+					ID     string              `json:"id"`
 					Result *mcp.CallToolResult `json:"result"`
 				}
-				if json.Unmarshal(line, &msg) != nil || msg.ID != 2 {
+				if json.Unmarshal(line, &msg) != nil || msg.ID != requestID {
 					continue
 				}
 				if len(line)+1 > 512 {
@@ -380,6 +381,44 @@ func TestOfficialSDKStdioCallToolFramesRespectResponseCap(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Fatal("missing tools/call response")
+		})
+	}
+}
+
+func TestStdioIngressRejectsOversizedFramesAndStringIDs(t *testing.T) {
+	for _, input := range []string{
+		`{"jsonrpc":"2.0","id":"` + strings.Repeat("i", defaultMaxRequestIDBytes+1) + `","method":"tools/call","params":{}}` + "\n",
+		`{"jsonrpc":"2.0","method":"tools/call","params":"` + strings.Repeat("x", defaultMaxRequestBytes) + `"}` + "\n",
+	} {
+		t.Run("reject", func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=TestMCPStdioHelperProcess", "--")
+			cmd.Env = append(os.Environ(), "SOFT_UE_INDEX_MCP_HELPER=1")
+			in, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(in, input); err != nil {
+				t.Fatal(err)
+			}
+			_ = in.Close()
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			select {
+			case <-time.After(3 * time.Second):
+				t.Fatal("server did not stop after rejected ingress")
+			case <-done:
+			}
+			data, _ := io.ReadAll(out)
+			if len(data) != 0 {
+				t.Fatalf("unexpected response: %q", data)
+			}
 		})
 	}
 }

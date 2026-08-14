@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"os"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -101,5 +103,6 @@ func (s *Server) compactToolError(err error) error {
 // RunStdio serves MCP only through stdin/stdout. Callers must send diagnostics
 // elsewhere; this package never writes logs or status messages to stdout.
 func (s *Server) RunStdio(ctx context.Context, version string) error {
-	return s.MCPServer(version).Run(ctx, &mcp.StdioTransport{})
+	reader := newBoundedJSONReader(os.Stdin, s.limits.MaxRequestBytes, s.limits.MaxRequestIDBytes)
+	return s.MCPServer(version).Run(ctx, &mcp.IOTransport{Reader: io.NopCloser(reader), Writer: stdoutWriteCloser{os.Stdout}})
 }

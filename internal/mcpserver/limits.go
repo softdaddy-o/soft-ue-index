@@ -9,20 +9,24 @@ const (
 	defaultMaxBytes = 32 * 1024
 	// minimumResponseBytes leaves room for the SDK's newline-delimited JSON-RPC
 	// envelope as well as a useful structured tool result.
-	minimumResponseBytes  = 512
-	protocolEnvelopeBytes = 256
+	minimumResponseBytes     = 512
+	protocolEnvelopeBytes    = 256
+	defaultMaxRequestBytes   = 64 * 1024
+	defaultMaxRequestIDBytes = 128
 )
 
 // Limits bound every MCP request and response so a malformed client cannot
 // turn code intelligence into an unbounded local-file or memory operation.
 type Limits struct {
-	MaxItems         int
-	MaxQueryBytes    int
-	MaxPathBytes     int
-	MaxSourceBytes   int
-	MaxResponseBytes int
-	MaxCallDepth     int
-	Timeout          time.Duration
+	MaxItems          int
+	MaxQueryBytes     int
+	MaxPathBytes      int
+	MaxSourceBytes    int
+	MaxResponseBytes  int
+	MaxRequestBytes   int
+	MaxRequestIDBytes int
+	MaxCallDepth      int
+	Timeout           time.Duration
 }
 
 func (l Limits) normalized() Limits {
@@ -41,6 +45,12 @@ func (l Limits) normalized() Limits {
 	if l.MaxResponseBytes <= 0 {
 		l.MaxResponseBytes = defaultMaxBytes
 	}
+	if l.MaxRequestBytes <= 0 {
+		l.MaxRequestBytes = defaultMaxRequestBytes
+	}
+	if l.MaxRequestIDBytes <= 0 {
+		l.MaxRequestIDBytes = defaultMaxRequestIDBytes
+	}
 	if l.MaxCallDepth <= 0 {
 		l.MaxCallDepth = 3
 	}
@@ -52,6 +62,9 @@ func (l Limits) normalized() Limits {
 
 func (l Limits) validate() error {
 	if l.MaxResponseBytes > 0 && l.MaxResponseBytes < minimumResponseBytes {
+		return ErrInvalidLimits
+	}
+	if (l.MaxRequestBytes > 0 && l.MaxRequestBytes < 2) || (l.MaxRequestIDBytes > 0 && l.MaxRequestIDBytes < 1) {
 		return ErrInvalidLimits
 	}
 	return nil
