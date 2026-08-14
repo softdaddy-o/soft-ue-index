@@ -112,11 +112,13 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 		modules[n] = m
 	}
 	if in.EngineScopeFull {
-		if editor, e := selectRiderTarget(RiderMetadataDir(project), "UnrealEditor", "", project); e == nil {
-			for n, m := range editor.Modules {
-				if _, ok := modules[n]; !ok {
-					modules[n] = m
-				}
+		editor, e := selectRiderTarget(RiderMetadataDir(project), "UnrealEditor", "", engine)
+		if e != nil {
+			return RiderResult{}, fmt.Errorf("rider_metadata_missing: full engine scope requires UnrealEditor metadata: %w", e)
+		}
+		for n, m := range editor.Modules {
+			if _, ok := modules[n]; !ok {
+				modules[n] = m
 			}
 		}
 	}

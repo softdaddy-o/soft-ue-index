@@ -125,3 +125,42 @@ func TestStringsFromJSONNestedObjectsAreDeterministic(t *testing.T) {
 		t.Fatalf("order=%q", want)
 	}
 }
+
+func TestSynthesizeRiderFullScopeRequiresSafeUnrealEditorMetadata(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "P")
+	engine := filepath.Join(root, "E")
+	dir := RiderMetadataDir(project)
+	for _, p := range []string{filepath.Join(project, "Source", "M"), filepath.Join(engine, "Source", "Extra"), dir} {
+		if err := os.MkdirAll(p, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{filepath.Join(project, "Source", "M", "M.cpp"), filepath.Join(engine, "Source", "Extra", "X.cpp"), filepath.Join(project, "Source", "MEditor.Target.cs")} {
+		if err := os.WriteFile(p, []byte{}, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projectMeta := `{"Name":"MEditor","TargetFile":"` + filepath.ToSlash(filepath.Join(project, "Source", "MEditor.Target.cs")) + `","Modules":{"M":{"Directory":"` + filepath.ToSlash(filepath.Join(project, "Source", "M")) + `"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "project.json"), []byte(projectMeta), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SynthesizeRider(RiderInput{ProjectRoot: project, EngineRoot: engine, Target: "MEditor", StagingDir: filepath.Join(root, "stage"), ClangCL: "clang-cl", EngineScopeFull: true}); err == nil {
+		t.Fatal("expected missing full metadata error")
+	}
+	engineTarget := filepath.Join(engine, "Source", "UnrealEditor.Target.cs")
+	if err := os.WriteFile(engineTarget, []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	full := `{"Name":"UnrealEditor","TargetFile":"` + filepath.ToSlash(engineTarget) + `","Modules":{"Extra":{"Directory":"` + filepath.ToSlash(filepath.Join(engine, "Source", "Extra")) + `"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "engine.json"), []byte(full), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := SynthesizeRider(RiderInput{ProjectRoot: project, EngineRoot: engine, Target: "MEditor", StagingDir: filepath.Join(root, "stage2"), ClangCL: "clang-cl", EngineScopeFull: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.EngineTranslationUnits != 1 {
+		t.Fatalf("engine=%d", r.EngineTranslationUnits)
+	}
+}
