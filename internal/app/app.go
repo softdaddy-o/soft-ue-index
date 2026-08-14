@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/softdaddy-o/soft-ue-index/internal/cli"
@@ -29,24 +30,32 @@ import (
 // Dependencies allow tests and embedders to replace effects without replacing
 // command routing. New supplies the real per-user store when Store is omitted.
 type Dependencies struct {
-	Store    *registry.Store
-	Output   io.Writer
-	Discover func(unreal.ProjectRequest) (unreal.Project, error)
-	Generate func(context.Context, registry.Project) (registry.Project, error)
-	Doctor   func(context.Context, *registry.Store) (any, error)
-	Watch    func(context.Context, []registry.Project) error
-	MCP      func(context.Context, *registry.Store) error
+	Store       *registry.Store
+	Output      io.Writer
+	ErrorOutput io.Writer
+	WatchResult func(error)
+	Discover    func(unreal.ProjectRequest) (unreal.Project, error)
+	Generate    func(context.Context, registry.Project) (registry.Project, error)
+	Doctor      func(context.Context, *registry.Store) (any, error)
+	Watch       func(context.Context, []registry.Project) error
+	MCP         func(context.Context, *registry.Store) error
 	// Environment, Files, and Runner keep doctor discovery independently testable.
 	Environment toolchain.Environment
 	Files       toolchain.FileSystem
 	Runner      toolchain.Runner
 }
 
-type App struct{ d Dependencies }
+type App struct {
+	d      Dependencies
+	sinkMu sync.Mutex
+}
 
 func New(d Dependencies) *App {
 	if d.Output == nil {
 		d.Output = os.Stdout
+	}
+	if d.ErrorOutput == nil {
+		d.ErrorOutput = os.Stderr
 	}
 	if d.Discover == nil {
 		d.Discover = unreal.Discover
@@ -425,22 +434,16 @@ type watchGenerator func(context.Context, string) error
 
 func (f watchGenerator) Generate(ctx context.Context, id string) error { return f(ctx, id) }
 func (a *App) watchReal(ctx context.Context, projects []registry.Project) error {
-	coordinator := uewatch.NewCoordinator(watchGenerator(func(run context.Context, id string) error {
+	coordinator := uewatch.NewCoordinatorWithOptions(watchGenerator(func(run context.Context, id string) error {
 		r, i, err := a.find(run, id)
 		if err != nil {
 			return err
 		}
 		p, err := a.d.Generate(run, r.Projects[i])
 		if err != nil {
-			_ = a.d.Store.Update(context.Background(), func(latest *registry.Registry) error {
-				for j := range latest.Projects {
-					if latest.Projects[j].ID == id {
-						latest.Projects[j].Generation.InvalidationReason = err.Error()
-						return nil
-					}
-				}
-				return nil
-			})
+			if persistErr := a.persistWatchFailure(id, err); persistErr != nil {
+				return errors.Join(err, persistErr)
+			}
 			return err
 		}
 		return a.d.Store.Update(run, func(latest *registry.Registry) error {
@@ -452,7 +455,11 @@ func (a *App) watchReal(ctx context.Context, projects []registry.Project) error 
 			}
 			return fmt.Errorf("project not found: %s", id)
 		})
-	}), 2, 500*time.Millisecond)
+	}), 2, 500*time.Millisecond, uewatch.CoordinatorOptions{Result: func(result uewatch.Result) {
+		if result.Err != nil {
+			a.reportWatchError(result.Err)
+		}
+	}})
 	defer coordinator.Close()
 	w, err := uewatch.NewWatcher(coordinator)
 	if err != nil {
@@ -466,6 +473,45 @@ func (a *App) watchReal(ctx context.Context, projects []registry.Project) error 
 	}
 	<-ctx.Done()
 	return nil
+}
+
+const watchPersistAttempts = 3
+const watchPersistTimeout = 350 * time.Millisecond
+
+func (a *App) persistWatchFailure(id string, cause error) error {
+	var last error
+	for attempt := 0; attempt < watchPersistAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), watchPersistTimeout)
+		err := a.d.Store.Update(ctx, func(latest *registry.Registry) error {
+			for i := range latest.Projects {
+				if latest.Projects[i].ID == id {
+					latest.Projects[i].Generation.InvalidationReason = cause.Error()
+					return nil
+				}
+			}
+			return fmt.Errorf("project not found: %s", id)
+		})
+		cancel()
+		if err == nil {
+			return nil
+		}
+		last = err
+		time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
+	}
+	return fmt.Errorf("persist watch failure state: %w", last)
+}
+
+func (a *App) reportWatchError(err error) {
+	if err == nil {
+		return
+	}
+	a.sinkMu.Lock()
+	defer a.sinkMu.Unlock()
+	if a.d.WatchResult != nil {
+		a.d.WatchResult(err)
+		return
+	}
+	fmt.Fprintf(a.d.ErrorOutput, "watch: %v\n", err)
 }
 
 // execRunner remains intentionally small so diagnostics commands never invoke a shell.
