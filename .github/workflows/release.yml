@@ -30,7 +30,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/package | Out-Null
-          go build -trimpath -ldflags "-s -w" -o dist/package/soft-ue-index.exe ./cmd/soft-ue-index
+          go build -trimpath -ldflags "-s -w -X github.com/softdaddy-o/soft-ue-index/internal/app.Version=${{ github.ref_name }}" -o dist/package/soft-ue-index.exe ./cmd/soft-ue-index
           Copy-Item README.md, LICENSE dist/package/
           Compress-Archive -Path dist/package/* -DestinationPath "dist/soft-ue-index-windows-amd64.zip"
           $hash = (Get-FileHash "dist/soft-ue-index-windows-amd64.zip" -Algorithm SHA256).Hash.ToLowerInvariant()

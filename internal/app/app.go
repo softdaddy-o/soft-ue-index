@@ -29,6 +29,9 @@ import (
 	uewatch "github.com/softdaddy-o/soft-ue-index/internal/watch"
 )
 
+// Version is replaced by release builds and reported through MCP serverInfo.
+var Version = "dev"
+
 // Dependencies allow tests and embedders to replace effects without replacing
 // command routing. New supplies the real per-user store when Store is omitted.
 type Dependencies struct {
@@ -317,7 +320,7 @@ func (a *App) mcp(ctx context.Context) error {
 		}
 		watchDone <- err
 	}()
-	err = mcpserver.New(mcpserver.Dependencies{Projects: a.d.Store, Queries: lspQueries{manager: manager}}).RunStdio(serveCtx, "dev")
+	err = mcpserver.New(mcpserver.Dependencies{Projects: a.d.Store, Queries: lspQueries{manager: manager}}).RunStdio(serveCtx, Version)
 	stop()
 	watchErr := <-watchDone
 	if watchErr != nil {
