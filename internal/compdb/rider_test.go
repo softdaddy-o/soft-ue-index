@@ -213,7 +213,7 @@ func TestSynthesizeRiderPersistsContentAddressedResponsesAndRootEnvironment(t *t
 			t.Fatal(err)
 		}
 	}
-	meta := `{"Name":"MEditor","TargetFile":"` + filepath.ToSlash(filepath.Join(project, "Source", "MEditor.Target.cs")) + `","EnvironmentIncludePaths":{"System":["C:/SDK Includes"]},"EnvironmentDefinitions":["GLOBAL=1"],"Modules":{"M":{"Directory":"` + filepath.ToSlash(filepath.Join(project, "Source", "M")) + `","Rules":"M.Build.cs","PrivateIncludePaths":["Private"],"ApiDefinitions":["UE_MODULE_NAME=M"],"ForceIncludeFiles":["PCH.h"]},"E":{"Directory":"` + filepath.ToSlash(filepath.Join(engine, "Source", "Core")) + `"}}}`
+	meta := `{"Name":"MEditor","TargetFile":"` + filepath.ToSlash(filepath.Join(project, "Source", "MEditor.Target.cs")) + `","EnvironmentIncludePaths":{"System":["C:/SDK Includes"]},"EnvironmentDefinitions":["GLOBAL=1"],"Modules":{"M":{"Directory":"` + filepath.ToSlash(filepath.Join(project, "Source", "M")) + `","Rules":"M.Build.cs","PrivateIncludePaths":["Private"],"PublicSystemIncludePaths":["Public System Only"],"ApiDefinitions":["UE_MODULE_NAME=M"],"ForceIncludeFiles":["PCH.h"]},"E":{"Directory":"` + filepath.ToSlash(filepath.Join(engine, "Source", "Core")) + `"}}}`
 	if err := os.WriteFile(filepath.Join(dir, "target.json"), []byte(meta), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestSynthesizeRiderPersistsContentAddressedResponsesAndRootEnvironment(t *t
 		}
 		data += string(b)
 	}
-	if !strings.Contains(data, "GLOBAL=1") || !strings.Contains(data, "SDK Includes") || !strings.Contains(data, "UE_MODULE_NAME=M") || !strings.Contains(data, "/FI") {
+	if !strings.Contains(data, "GLOBAL=1") || !strings.Contains(data, "SDK Includes") || !strings.Contains(data, "Public System Only") || !strings.Contains(data, "UE_MODULE_NAME=M") || !strings.Contains(data, "/FI") {
 		t.Fatalf("root env absent: %s", data)
 	}
 }

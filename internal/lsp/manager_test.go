@@ -38,13 +38,9 @@ type slowFactory struct {
 	ready chan struct{}
 }
 
-func (f *slowFactory) Start(ctx context.Context, path string, args []string, log string) (Process, error) {
-	select {
-	case <-f.ready:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	return f.base.Start(ctx, path, args, log)
+func (f *slowFactory) Start(_ context.Context, path string, args []string, log string) (Process, error) {
+	<-f.ready
+	return f.base.Start(context.Background(), path, args, log)
 }
 
 func (f *fakeFactory) Start(_ context.Context, _ string, args []string, _ string) (Process, error) {
@@ -296,6 +292,59 @@ func TestCloseWakesAllStartupWaiters(t *testing.T) {
 		if e := <-errs; e != ErrClosed {
 			t.Fatalf("got %v", e)
 		}
+	}
+}
+
+type silentInitializeFactory struct {
+	mu      sync.Mutex
+	started chan struct{}
+	process *fakeProcess
+}
+
+func (f *silentInitializeFactory) Start(_ context.Context, _ string, _ []string, _ string) (Process, error) {
+	a, b := net.Pipe()
+	p := &fakeProcess{conn: a, done: make(chan struct{})}
+	f.mu.Lock()
+	f.process = p
+	f.mu.Unlock()
+	close(f.started)
+	go func() { _, _ = io.Copy(io.Discard, b); _ = b.Close() }()
+	return p, nil
+}
+
+func TestCloseReturnsPromptlyWhileInitializeNeverResponds(t *testing.T) {
+	f := &silentInitializeFactory{started: make(chan struct{})}
+	m := NewManager(f)
+	result := make(chan error, 1)
+	go func() {
+		_, err := m.Client(context.Background(), ProjectConfig{ID: "silent", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"})
+		result <- err
+	}()
+	select {
+	case <-f.started:
+	case <-time.After(time.Second):
+		t.Fatal("server did not start")
+	}
+	start := time.Now()
+	m.Close()
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Close blocked for %v", elapsed)
+	}
+	select {
+	case err := <-result:
+		if err != ErrClosed {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Client did not return after Close")
+	}
+	f.mu.Lock()
+	p := f.process
+	f.mu.Unlock()
+	select {
+	case <-p.done:
+	case <-time.After(time.Second):
+		t.Fatal("silent server was not killed")
 	}
 }
 

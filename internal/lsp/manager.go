@@ -160,61 +160,82 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 		}
 		s.config = cfg
 		s.starting = make(chan struct{})
-		wait := s.starting
 		sessionCtx, cancel := context.WithCancel(context.Background())
-		keepSessionContext := false
-		defer func() {
-			if !keepSessionContext {
-				cancel()
-			}
-		}()
+		s.cancel = cancel
 		m.mu.Unlock()
+
 		p, err := m.start(sessionCtx, cfg)
+		if err != nil {
+			return m.finishStartup(cfg.ID, s, nil, nil, err)
+		}
+		// Publish the process before initializing it so Close can cancel and kill
+		// a server that never answers initialize, without waiting on this goroutine.
 		m.mu.Lock()
 		if m.closed || m.sessions[cfg.ID] != s {
-			close(wait)
-			s.starting = nil
 			m.mu.Unlock()
-			if p != nil {
-				_ = p.Kill()
-				_ = p.Wait()
-			}
-			cancel()
+			cleanupStartup(p, nil, cancel)
 			return nil, ErrClosed
 		}
-		if err == nil {
-			s.process = p
-			s.cancel = cancel
-			s.client = NewClient(p.Stdout(), p.Stdin(), ClientOptions{})
-			err = s.client.Initialize(ctx, cfg.RootURI)
-			if err == nil {
-				s.refs = 1
-				go m.watch(cfg.ID, s, p)
-			}
-		}
-		if err != nil {
-			s.failures++
-			s.nextStart = m.now().Add(backoff(s.failures))
-			if p != nil {
-				_ = p.Kill()
-				_ = p.Wait()
-			}
-			if s.client != nil {
-				s.client.Close()
-			}
-			cancel()
-			s.client = nil
-			s.process = nil
-		}
-		close(wait)
-		s.starting = nil
-		c := s.client
+		s.process = p
 		m.mu.Unlock()
-		if err != nil {
-			return nil, err
-		}
-		keepSessionContext = true
-		return c, nil
+
+		client := NewClient(p.Stdout(), p.Stdin(), ClientOptions{})
+		// The session context belongs to Manager, so Close always interrupts an
+		// in-flight initialize while a caller cancellation cannot own the process.
+		err = client.Initialize(sessionCtx, cfg.RootURI)
+		return m.finishStartup(cfg.ID, s, p, client, err)
+	}
+}
+
+// finishStartup is the only normal completion path for a session startup. It
+// closes the shared waiter exactly once and never performs I/O while m.mu is held.
+func (m *Manager) finishStartup(id string, s *session, p Process, client *Client, startErr error) (*Client, error) {
+	m.mu.Lock()
+	stale := m.closed || m.sessions[id] != s
+	if stale {
+		finishStartupLocked(s)
+		cancel := s.cancel
+		s.cancel = nil
+		m.mu.Unlock()
+		cleanupStartup(p, client, cancel)
+		return nil, ErrClosed
+	}
+	if startErr != nil {
+		s.failures++
+		s.nextStart = m.now().Add(backoff(s.failures))
+		s.process, s.client = nil, nil
+		cancel := s.cancel
+		s.cancel = nil
+		finishStartupLocked(s)
+		m.mu.Unlock()
+		cleanupStartup(p, client, cancel)
+		return nil, startErr
+	}
+	s.client = client
+	s.refs = 1
+	finishStartupLocked(s)
+	m.mu.Unlock()
+	go m.watch(id, s, p)
+	return client, nil
+}
+
+func finishStartupLocked(s *session) {
+	if s.starting != nil {
+		close(s.starting)
+		s.starting = nil
+	}
+}
+
+func cleanupStartup(p Process, client *Client, cancel context.CancelFunc) {
+	if cancel != nil {
+		cancel()
+	}
+	if client != nil {
+		client.Close()
+	}
+	if p != nil {
+		_ = p.Kill()
+		_ = p.Wait()
 	}
 }
 func (m *Manager) start(ctx context.Context, cfg ProjectConfig) (Process, error) {
@@ -305,20 +326,22 @@ func (m *Manager) Close() {
 	m.closed = true
 	ss := m.sessions
 	m.sessions = map[string]*session{}
-	m.mu.Unlock()
+	type cleanup struct {
+		process Process
+		client  *Client
+		cancel  context.CancelFunc
+	}
+	cleanups := make([]cleanup, 0, len(ss))
 	for _, s := range ss {
 		if s.timer != nil {
 			s.timer.Stop()
 		}
-		if s.client != nil {
-			_ = s.client.Shutdown(context.Background())
-			s.client.Close()
-		}
-		if s.process != nil {
-			_ = s.process.Kill()
-		}
-		if s.cancel != nil {
-			s.cancel()
-		}
+		finishStartupLocked(s)
+		cleanups = append(cleanups, cleanup{s.process, s.client, s.cancel})
+		s.process, s.client, s.cancel = nil, nil, nil
+	}
+	m.mu.Unlock()
+	for _, item := range cleanups {
+		cleanupStartup(item.process, item.client, item.cancel)
 	}
 }

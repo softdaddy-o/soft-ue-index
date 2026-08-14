@@ -50,6 +50,7 @@ type riderRules struct {
 	PublicDefinitions        []string `json:"PublicDefinitions"`
 	PrivateDefinitions       []string `json:"PrivateDefinitions"`
 	ForceIncludeFiles        []string `json:"ForceIncludeFiles"`
+	PublicSystemIncludePaths []string `json:"PublicSystemIncludePaths"`
 	SystemIncludePaths       []string `json:"SystemIncludePaths"`
 	InternalIncludePaths     []string `json:"InternalIncludePaths"`
 	LegacyPublicIncludePaths []string `json:"LegacyPublicIncludePaths"`
@@ -91,7 +92,7 @@ func mergeRiderRules(a, b riderRules) riderRules {
 	return riderRules{
 		PublicIncludePaths: unique(append(a.PublicIncludePaths, b.PublicIncludePaths...)), PrivateIncludePaths: unique(append(a.PrivateIncludePaths, b.PrivateIncludePaths...)), IncludePaths: unique(append(a.IncludePaths, b.IncludePaths...)),
 		Definitions: unique(append(a.Definitions, b.Definitions...)), PublicDefinitions: unique(append(a.PublicDefinitions, b.PublicDefinitions...)), PrivateDefinitions: unique(append(a.PrivateDefinitions, b.PrivateDefinitions...)),
-		ForceIncludeFiles: unique(append(a.ForceIncludeFiles, b.ForceIncludeFiles...)), SystemIncludePaths: unique(append(a.SystemIncludePaths, b.SystemIncludePaths...)), InternalIncludePaths: unique(append(a.InternalIncludePaths, b.InternalIncludePaths...)),
+		ForceIncludeFiles: unique(append(a.ForceIncludeFiles, b.ForceIncludeFiles...)), PublicSystemIncludePaths: unique(append(a.PublicSystemIncludePaths, b.PublicSystemIncludePaths...)), SystemIncludePaths: unique(append(a.SystemIncludePaths, b.SystemIncludePaths...)), InternalIncludePaths: unique(append(a.InternalIncludePaths, b.InternalIncludePaths...)),
 		LegacyPublicIncludePaths: unique(append(a.LegacyPublicIncludePaths, b.LegacyPublicIncludePaths...)), ProjectDefinitions: unique(append(a.ProjectDefinitions, b.ProjectDefinitions...)), ApiDefinitions: unique(append(a.ApiDefinitions, b.ApiDefinitions...)),
 	}
 }
@@ -417,7 +418,7 @@ func selectRiderTarget(dir, name, targetFile, projectRoot string) (riderSelected
 }
 func response(m riderResolvedModule, compiler string, rootIncludes, rootDefinitions []string) string {
 	_ = compiler
-	inc := unique(append(append(append(append(append(append(append([]string{}, rootIncludes...), m.rules.PublicIncludePaths...), m.rules.PrivateIncludePaths...), m.rules.IncludePaths...), m.rules.SystemIncludePaths...), m.rules.InternalIncludePaths...), m.rules.LegacyPublicIncludePaths...))
+	inc := unique(append(append(append(append(append(append(append(append([]string{}, rootIncludes...), m.rules.PublicIncludePaths...), m.rules.PrivateIncludePaths...), m.rules.IncludePaths...), m.rules.PublicSystemIncludePaths...), m.rules.SystemIncludePaths...), m.rules.InternalIncludePaths...), m.rules.LegacyPublicIncludePaths...))
 	defs := unique(append(append(append(append(append(append([]string{}, rootDefinitions...), m.rules.Definitions...), m.rules.PublicDefinitions...), m.rules.PrivateDefinitions...), m.rules.ProjectDefinitions...), m.rules.ApiDefinitions...))
 	var a = []string{"/nologo", "/TP", "/std:c++20", "--target=x86_64-pc-windows-msvc", "/utf-8", "/Zc:__cplusplus", "/permissive-"}
 	for _, x := range inc {
