@@ -95,3 +95,24 @@ func TestLimitsTruncateTypedResults(t *testing.T) {
 		t.Fatalf("%#v", got)
 	}
 }
+func TestDecodeLocationUnionsAndDocumentLimit(t *testing.T) {
+	for _, raw := range []string{`{"uri":"file:///a","range":{"start":{},"end":{}}}`, `[{"targetUri":"file:///b","targetRange":{"start":{},"end":{}},"targetSelectionRange":{"start":{},"end":{}}}]`, `null`} {
+		got, err := decodeLocations(json.RawMessage(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if raw != "null" && len(got) != 1 {
+			t.Fatalf("%s: %#v", raw, got)
+		}
+	}
+	got := limitDocumentSymbols([]DocumentSymbol{{Name: "a", Children: []DocumentSymbol{{Name: "b"}}}, {Name: "c"}}, 2)
+	if len(got) != 1 || len(got[0].Children) != 1 {
+		t.Fatalf("%#v", got)
+	}
+}
+func TestHoverUnion(t *testing.T) {
+	var h HoverResult
+	if err := json.Unmarshal([]byte(`{"contents":"text"}`), &h); err != nil || h.Contents.Value != "text" {
+		t.Fatalf("%#v %v", h, err)
+	}
+}

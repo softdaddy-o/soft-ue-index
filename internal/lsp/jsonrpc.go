@@ -51,12 +51,12 @@ func readFrame(r *bufio.Reader, max int) ([]byte, error) {
 	length := -1
 	headerBytes := 0
 	for {
-		line, err := r.ReadString('\n')
+		line, err := readHeaderLine(r, 8<<10)
 		if err != nil {
 			return nil, err
 		}
 		headerBytes += len(line)
-		if headerBytes > defaultMaxHeaderBytes || len(line) > 8<<10 {
+		if headerBytes > defaultMaxHeaderBytes {
 			return nil, ErrMessageTooLarge
 		}
 		line = strings.TrimSpace(line)
@@ -83,6 +83,24 @@ func readFrame(r *bufio.Reader, max int) ([]byte, error) {
 	body := make([]byte, length)
 	_, err := io.ReadFull(r, body)
 	return body, err
+}
+
+// readHeaderLine uses ReadSlice chunks so a peer cannot make ReadString allocate an unbounded line.
+func readHeaderLine(r *bufio.Reader, limit int) (string, error) {
+	var line bytes.Buffer
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if line.Len()+len(chunk) > limit {
+			return "", ErrMessageTooLarge
+		}
+		line.Write(chunk)
+		if err == nil {
+			return line.String(), nil
+		}
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return "", err
+		}
+	}
 }
 
 func frameBytes(value any) []byte { var b bytes.Buffer; _ = writeFrame(&b, value); return b.Bytes() }

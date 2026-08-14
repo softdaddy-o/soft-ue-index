@@ -59,9 +59,9 @@ func (ExecFactory) Start(ctx context.Context, path string, args []string, logPat
 }
 
 type ProjectConfig struct {
-	// CompilationDatabase is a durable, project-unique cache directory. clangd's
-	// supported --background-index writes shards to .cache/clangd/index beneath it.
-	// Do not point two projects at the same directory.
+	// CacheDir is a durable, project-unique compilation database directory: it
+	// contains compile_commands.json. clangd's supported --background-index puts
+	// shards in CacheDir/.cache/clangd/index. Do not share CacheDir across projects.
 	ID, Clangd, CompilationDatabase, CacheDir, RootURI string
 	Threads                                            int
 	IdleTimeout                                        time.Duration
@@ -175,10 +175,16 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 	}
 }
 func (m *Manager) start(ctx context.Context, cfg ProjectConfig) (Process, error) {
-	if err := os.MkdirAll(filepath.Join(cfg.CompilationDatabase, ".cache", "clangd", "index"), 0700); err != nil {
+	if cfg.CacheDir == "" {
+		return nil, errors.New("clangd cache directory is required")
+	}
+	if cfg.CompilationDatabase != "" && filepath.Clean(cfg.CompilationDatabase) != filepath.Clean(cfg.CacheDir) {
+		return nil, errors.New("compilation database must equal project cache directory")
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.CacheDir, ".cache", "clangd", "index"), 0700); err != nil {
 		return nil, err
 	}
-	args := []string{"--compile-commands-dir=" + cfg.CompilationDatabase, "--background-index", "--j=" + itoa(cfg.Threads), "--log=error"}
+	args := []string{"--compile-commands-dir=" + cfg.CacheDir, "--background-index", "--j=" + itoa(cfg.Threads), "--log=error"}
 	return m.factory.Start(ctx, cfg.Clangd, args, filepath.Join(cfg.CacheDir, "clangd.log"))
 }
 func itoa(i int) string { return fmt.Sprintf("%d", i) }

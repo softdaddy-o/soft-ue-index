@@ -28,8 +28,9 @@ func (p *fakeProcess) Kill() error {
 }
 
 type fakeFactory struct {
-	mu sync.Mutex
-	n  int
+	mu   sync.Mutex
+	n    int
+	args [][]string
 }
 type slowFactory struct {
 	base  fakeFactory
@@ -45,9 +46,10 @@ func (f *slowFactory) Start(ctx context.Context, path string, args []string, log
 	return f.base.Start(ctx, path, args, log)
 }
 
-func (f *fakeFactory) Start(_ context.Context, _ string, _ []string, _ string) (Process, error) {
+func (f *fakeFactory) Start(_ context.Context, _ string, args []string, _ string) (Process, error) {
 	f.mu.Lock()
 	f.n++
+	f.args = append(f.args, append([]string(nil), args...))
 	f.mu.Unlock()
 	a, b := net.Pipe()
 	p := &fakeProcess{conn: a, done: make(chan struct{})}
@@ -72,7 +74,8 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	f := &fakeFactory{}
 	m := NewManager(f)
 	defer m.Close()
-	cfg := ProjectConfig{ID: "game", Clangd: "fake", CompilationDatabase: "db", CacheDir: t.TempDir(), RootURI: "file:///game", IdleTimeout: time.Millisecond}
+	dir := t.TempDir()
+	cfg := ProjectConfig{ID: "game", Clangd: "fake", CacheDir: dir, RootURI: "file:///game", IdleTimeout: time.Millisecond}
 	a, err := m.Client(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -89,6 +92,9 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	f.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("starts=%d", n)
+	}
+	if f.args[0][0] != "--compile-commands-dir="+dir {
+		t.Fatalf("args=%v", f.args[0])
 	}
 	m.Release("game")
 	m.Release("game")
@@ -108,7 +114,7 @@ func TestManagerCreatesIsolatedPersistentShardRoots(t *testing.T) {
 	base := t.TempDir()
 	for _, id := range []string{"a", "b"} {
 		dir := filepath.Join(base, id)
-		c, e := m.Client(context.Background(), ProjectConfig{ID: id, Clangd: "fake", CompilationDatabase: dir, CacheDir: filepath.Join(base, "logs", id), RootURI: "file:///x"})
+		c, e := m.Client(context.Background(), ProjectConfig{ID: id, Clangd: "fake", CacheDir: dir, RootURI: "file:///x"})
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -128,7 +134,7 @@ func TestManagerCrashBackoffAndRestart(t *testing.T) {
 	now := time.Unix(100, 0)
 	m := NewManagerWithClock(f, func() time.Time { return now })
 	defer m.Close()
-	cfg := ProjectConfig{ID: "game", Clangd: "fake", CompilationDatabase: t.TempDir(), CacheDir: t.TempDir(), RootURI: "file:///game"}
+	cfg := ProjectConfig{ID: "game", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///game"}
 	_, err := m.Client(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +180,7 @@ func TestManagerSharesSimultaneousStartup(t *testing.T) {
 	f := &slowFactory{ready: make(chan struct{})}
 	m := NewManager(f)
 	defer m.Close()
-	cfg := ProjectConfig{ID: "same", Clangd: "fake", CompilationDatabase: t.TempDir(), CacheDir: t.TempDir(), RootURI: "file:///same"}
+	cfg := ProjectConfig{ID: "same", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///same"}
 	out := make(chan *Client, 2)
 	errs := make(chan error, 2)
 	for range 2 {

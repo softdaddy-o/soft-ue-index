@@ -201,6 +201,11 @@ type Location struct {
 	URI   string `json:"uri"`
 	Range Range  `json:"range"`
 }
+type LocationLink struct {
+	TargetURI            string `json:"targetUri"`
+	TargetRange          Range  `json:"targetRange"`
+	TargetSelectionRange Range  `json:"targetSelectionRange"`
+}
 type Symbol struct {
 	Name          string   `json:"name"`
 	Kind          int      `json:"kind"`
@@ -222,6 +227,35 @@ type HoverResult struct {
 	Contents MarkupContent `json:"contents"`
 	Range    *Range        `json:"range,omitempty"`
 }
+
+func (h *HoverResult) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Contents json.RawMessage `json:"contents"`
+		Range    *Range          `json:"range"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	h.Range = raw.Range
+	var markup MarkupContent
+	if json.Unmarshal(raw.Contents, &markup) == nil && markup.Value != "" {
+		h.Contents = markup
+		return nil
+	}
+	var text string
+	if json.Unmarshal(raw.Contents, &text) == nil {
+		h.Contents = MarkupContent{Kind: "plaintext", Value: text}
+		return nil
+	}
+	var many []any
+	if err := json.Unmarshal(raw.Contents, &many); err != nil {
+		return err
+	}
+	b, _ := json.Marshal(many)
+	h.Contents = MarkupContent{Kind: "plaintext", Value: string(b)}
+	return nil
+}
+
 type CallHierarchyItem struct {
 	Name           string `json:"name"`
 	Kind           int    `json:"kind"`
@@ -242,6 +276,48 @@ func limit[T any](l Limits, items []T) []T {
 	}
 	return items
 }
+func limitDocumentSymbols(items []DocumentSymbol, max int) []DocumentSymbol {
+	if max <= 0 {
+		return items
+	}
+	remaining := max
+	var visit func([]DocumentSymbol) []DocumentSymbol
+	visit = func(in []DocumentSymbol) []DocumentSymbol {
+		out := make([]DocumentSymbol, 0, len(in))
+		for _, v := range in {
+			if remaining == 0 {
+				break
+			}
+			remaining--
+			v.Children = visit(v.Children)
+			out = append(out, v)
+		}
+		return out
+	}
+	return visit(items)
+}
+func decodeLocations(data json.RawMessage) ([]Location, error) {
+	if string(data) == "null" {
+		return nil, nil
+	}
+	var many []Location
+	if json.Unmarshal(data, &many) == nil {
+		return many, nil
+	}
+	var one Location
+	if json.Unmarshal(data, &one) == nil && one.URI != "" {
+		return []Location{one}, nil
+	}
+	var links []LocationLink
+	if err := json.Unmarshal(data, &links); err != nil {
+		return nil, err
+	}
+	out := make([]Location, 0, len(links))
+	for _, x := range links {
+		out = append(out, Location{URI: x.TargetURI, Range: x.TargetSelectionRange})
+	}
+	return out, nil
+}
 
 type TextDocumentPosition struct {
 	URI      string   `json:"uri"`
@@ -257,24 +333,36 @@ func (c *Client) WorkspaceSymbols(ctx context.Context, query string, limits Limi
 	return limit(limits, out), err
 }
 func (c *Client) Definitions(ctx context.Context, p TextDocumentPosition, limits Limits) ([]Location, error) {
-	var out []Location
-	err := c.Definition(ctx, p, &out)
+	var raw json.RawMessage
+	err := c.Definition(ctx, p, &raw)
+	out, decodeErr := decodeLocations(raw)
+	if err == nil {
+		err = decodeErr
+	}
 	return limit(limits, out), err
 }
 func (c *Client) ReferenceLocations(ctx context.Context, p TextDocumentPosition, limits Limits) ([]Location, error) {
-	var out []Location
-	err := c.References(ctx, p, &out)
+	var raw json.RawMessage
+	err := c.References(ctx, p, &raw)
+	out, decodeErr := decodeLocations(raw)
+	if err == nil {
+		err = decodeErr
+	}
 	return limit(limits, out), err
 }
 func (c *Client) Implementations(ctx context.Context, p TextDocumentPosition, limits Limits) ([]Location, error) {
-	var out []Location
-	err := c.Implementation(ctx, p, &out)
+	var raw json.RawMessage
+	err := c.Implementation(ctx, p, &raw)
+	out, decodeErr := decodeLocations(raw)
+	if err == nil {
+		err = decodeErr
+	}
 	return limit(limits, out), err
 }
 func (c *Client) DocumentSymbols(ctx context.Context, uri string, limits Limits) ([]DocumentSymbol, error) {
 	var out []DocumentSymbol
 	err := c.DocumentSymbol(ctx, uri, &out)
-	return limit(limits, out), err
+	return limitDocumentSymbols(out, limits.MaxItems), err
 }
 func (c *Client) HoverResult(ctx context.Context, p TextDocumentPosition) (*HoverResult, error) {
 	var out HoverResult
