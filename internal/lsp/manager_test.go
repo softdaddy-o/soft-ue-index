@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -345,6 +346,82 @@ func TestCloseReturnsPromptlyWhileInitializeNeverResponds(t *testing.T) {
 	case <-p.done:
 	case <-time.After(time.Second):
 		t.Fatal("silent server was not killed")
+	}
+}
+
+type gatedInitializeFactory struct {
+	mu      sync.Mutex
+	started chan struct{}
+	respond chan struct{}
+	process *fakeProcess
+}
+
+func (f *gatedInitializeFactory) Start(_ context.Context, _ string, _ []string, _ string) (Process, error) {
+	a, b := net.Pipe()
+	p := &fakeProcess{conn: a, done: make(chan struct{})}
+	f.mu.Lock()
+	f.process = p
+	f.mu.Unlock()
+	close(f.started)
+	go func() {
+		defer b.Close()
+		body, err := readFrame(bufio.NewReader(b), 1024*1024)
+		if err != nil {
+			return
+		}
+		var request wireMessage
+		if json.Unmarshal(body, &request) != nil {
+			return
+		}
+		<-f.respond
+		_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: request.ID, Result: mustJSON(map[string]any{})}))
+		_, _ = io.Copy(io.Discard, b)
+	}()
+	return p, nil
+}
+
+func TestFirstCallerCancellationDoesNotOwnSharedStartup(t *testing.T) {
+	f := &gatedInitializeFactory{started: make(chan struct{}), respond: make(chan struct{})}
+	m := NewManager(f)
+	defer m.Close()
+	canceled, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := m.Client(canceled, ProjectConfig{ID: "gated", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v", err)
+	}
+	select {
+	case <-f.started:
+	case <-time.After(time.Second):
+		t.Fatal("startup did not continue after caller cancellation")
+	}
+	f.mu.Lock()
+	p := f.process
+	f.mu.Unlock()
+	select {
+	case <-p.done:
+		t.Fatal("first caller cancellation killed shared process")
+	default:
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := m.Client(context.Background(), ProjectConfig{ID: "gated", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"})
+		result <- err
+	}()
+	close(f.respond)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("second caller did not receive shared startup: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second caller did not complete")
+	}
+	m.Close()
+	select {
+	case <-p.done:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not kill shared process")
 	}
 }
 

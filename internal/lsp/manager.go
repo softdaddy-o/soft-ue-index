@@ -99,6 +99,7 @@ type session struct {
 	failures  int
 	nextStart time.Time
 	starting  chan struct{}
+	startErr  error
 	cancel    context.CancelFunc
 }
 
@@ -140,51 +141,93 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 			m.mu.Unlock()
 			return c, nil
 		}
-		if s != nil && s.starting != nil {
+		if s == nil {
+			sessionCtx, cancel := context.WithCancel(context.Background())
+			s = &session{config: cfg, starting: make(chan struct{}), cancel: cancel}
+			m.sessions[cfg.ID] = s
 			wait := s.starting
 			m.mu.Unlock()
-			select {
-			case <-wait:
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
+			go m.startSession(cfg.ID, s, sessionCtx)
+			if err := waitForStartup(ctx, wait); err != nil {
+				return nil, err
 			}
+			return m.startupResult(cfg.ID, s)
 		}
-		if s == nil {
-			s = &session{}
-			m.sessions[cfg.ID] = s
+		if s.starting != nil {
+			wait := s.starting
+			m.mu.Unlock()
+			if err := waitForStartup(ctx, wait); err != nil {
+				return nil, err
+			}
+			return m.startupResult(cfg.ID, s)
 		}
 		if !s.nextStart.IsZero() && m.now().Before(s.nextStart) {
 			m.mu.Unlock()
 			return nil, errors.New("clangd restart is backing off")
 		}
-		s.config = cfg
-		s.starting = make(chan struct{})
 		sessionCtx, cancel := context.WithCancel(context.Background())
+		s.config = cfg
+		s.startErr = nil
+		s.starting = make(chan struct{})
 		s.cancel = cancel
+		wait := s.starting
 		m.mu.Unlock()
-
-		p, err := m.start(sessionCtx, cfg)
-		if err != nil {
-			return m.finishStartup(cfg.ID, s, nil, nil, err)
+		go m.startSession(cfg.ID, s, sessionCtx)
+		if err := waitForStartup(ctx, wait); err != nil {
+			return nil, err
 		}
-		// Publish the process before initializing it so Close can cancel and kill
-		// a server that never answers initialize, without waiting on this goroutine.
-		m.mu.Lock()
-		if m.closed || m.sessions[cfg.ID] != s {
-			m.mu.Unlock()
-			cleanupStartup(p, nil, cancel)
-			return nil, ErrClosed
-		}
-		s.process = p
-		m.mu.Unlock()
-
-		client := NewClient(p.Stdout(), p.Stdin(), ClientOptions{})
-		// The session context belongs to Manager, so Close always interrupts an
-		// in-flight initialize while a caller cancellation cannot own the process.
-		err = client.Initialize(sessionCtx, cfg.RootURI)
-		return m.finishStartup(cfg.ID, s, p, client, err)
+		return m.startupResult(cfg.ID, s)
 	}
+}
+
+func waitForStartup(ctx context.Context, wait <-chan struct{}) error {
+	select {
+	case <-wait:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) startupResult(id string, s *session) (*Client, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed || m.sessions[id] != s {
+		return nil, ErrClosed
+	}
+	if s.client != nil {
+		if s.timer != nil {
+			s.timer.Stop()
+			s.timer = nil
+		}
+		s.refs++
+		return s.client, nil
+	}
+	if s.startErr != nil {
+		return nil, s.startErr
+	}
+	return nil, errors.New("clangd restart is backing off")
+}
+
+func (m *Manager) startSession(id string, s *session, sessionCtx context.Context) {
+	p, err := m.start(sessionCtx, s.config)
+	if err != nil {
+		_, _ = m.finishStartup(id, s, nil, nil, err)
+		return
+	}
+	// Publish the process before initializing it so Close can cancel and kill
+	// a server that never answers initialize, without waiting on this goroutine.
+	m.mu.Lock()
+	if m.closed || m.sessions[id] != s {
+		m.mu.Unlock()
+		cleanupStartup(p, nil, nil)
+		return
+	}
+	s.process = p
+	m.mu.Unlock()
+	client := NewClient(p.Stdout(), p.Stdin(), ClientOptions{})
+	err = client.Initialize(sessionCtx, s.config.RootURI)
+	_, _ = m.finishStartup(id, s, p, client, err)
 }
 
 // finishStartup is the only normal completion path for a session startup. It
@@ -203,6 +246,7 @@ func (m *Manager) finishStartup(id string, s *session, p Process, client *Client
 	if startErr != nil {
 		s.failures++
 		s.nextStart = m.now().Add(backoff(s.failures))
+		s.startErr = startErr
 		s.process, s.client = nil, nil
 		cancel := s.cancel
 		s.cancel = nil
@@ -212,7 +256,8 @@ func (m *Manager) finishStartup(id string, s *session, p Process, client *Client
 		return nil, startErr
 	}
 	s.client = client
-	s.refs = 1
+	s.startErr = nil
+	s.refs = 0
 	finishStartupLocked(s)
 	m.mu.Unlock()
 	go m.watch(id, s, p)
