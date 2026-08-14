@@ -15,8 +15,10 @@ import (
 
 // Entry is one compile_commands.json entry.
 type Entry struct {
-	Directory, File, Command string
-	Arguments                []string
+	Directory string   `json:"directory"`
+	File      string   `json:"file"`
+	Command   string   `json:"command,omitempty"`
+	Arguments []string `json:"arguments,omitempty"`
 }
 
 // ValidationInput declares the staging output and the source roots it must cover.

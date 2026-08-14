@@ -1,10 +1,39 @@
 package compdb
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestWriteDatabaseUsesSpecificationKeyCasing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, DatabaseName)
+	if err := WriteDatabase(path, []Entry{{Directory: dir, File: filepath.Join(dir, "main.cpp"), Arguments: []string{"clang++", "-c", "main.cpp"}}}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{`"Directory"`, `"File"`, `"Command"`, `"Arguments"`} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("non-standard uppercase key %s in %s", forbidden, data)
+		}
+	}
+	var raw []map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 1 || raw[0]["directory"] == nil || raw[0]["file"] == nil || raw[0]["arguments"] == nil {
+		t.Fatalf("missing required lowercase keys: %s", data)
+	}
+	if _, present := raw[0]["command"]; present {
+		t.Fatalf("empty command must be omitted: %s", data)
+	}
+}
 
 func TestValidateProjectOnlyFails(t *testing.T) {
 	env := newValidationEnv(t)
