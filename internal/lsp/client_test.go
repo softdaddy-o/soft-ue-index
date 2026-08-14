@@ -6,10 +6,81 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestDocumentRequestOpensFileOnceBeforeConcurrentDefinitions(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{})
+	defer c.Close()
+	path := filepath.Join(t.TempDir(), "with space.cpp")
+	if err := os.WriteFile(path, []byte("int value;"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uri := pathURI(path)
+	methods := make(chan string, 3)
+	go func() {
+		r := bufio.NewReader(b)
+		for range 3 {
+			body, _ := readFrame(r, 4096)
+			var message wireMessage
+			_ = json.Unmarshal(body, &message)
+			methods <- message.Method
+			if len(message.ID) != 0 {
+				_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: message.ID, Result: mustJSON(json.RawMessage(`[]`))}))
+			}
+		}
+	}()
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.Definitions(context.Background(), TextDocumentPosition{URI: uri}, Limits{})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := []string{<-methods, <-methods, <-methods}
+	if got[0] != "textDocument/didOpen" || got[1] != "textDocument/definition" || got[2] != "textDocument/definition" {
+		t.Fatalf("methods=%v", got)
+	}
+}
+
+func TestEnsureDocumentOpenRejectsUnsafeOrOversizedFiles(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{})
+	defer c.Close()
+	if err := c.ensureDocumentOpen("https://example.invalid/file.cpp"); err == nil {
+		t.Fatal("expected non-file URI rejection")
+	}
+	path := filepath.Join(t.TempDir(), "large.cpp")
+	if err := os.WriteFile(path, make([]byte, maxIndexSeedBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ensureDocumentOpen(pathURI(path)); err == nil {
+		t.Fatal("expected size rejection")
+	}
+	c.openMu.Lock()
+	_, marked := c.opened[pathURI(path)]
+	c.openMu.Unlock()
+	if marked {
+		t.Fatal("failed open was tracked")
+	}
+}
 
 func TestClientCorrelatesSplitConcurrentResponses(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
@@ -123,8 +194,14 @@ func TestCallHierarchyTypedPrimitivesDecodeProtocolRecords(t *testing.T) {
 	defer serverSide.Close()
 	c := NewClient(clientSide, clientSide, ClientOptions{})
 	defer c.Close()
+	path := filepath.Join(t.TempDir(), "a.cpp")
+	if err := os.WriteFile(path, []byte("void a();"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uri := pathURI(path)
 	go func() {
 		r := bufio.NewReader(serverSide)
+		_, _ = readFrame(r, 4096) // textDocument/didOpen
 		for _, result := range []string{
 			`[{"name":"root","uri":"file:///a.cpp","range":{"start":{},"end":{}},"selectionRange":{"start":{},"end":{}}}]`,
 			`[{"from":{"name":"caller","uri":"file:///b.cpp","range":{"start":{},"end":{}},"selectionRange":{"start":{},"end":{}}}}]`,
@@ -136,7 +213,7 @@ func TestCallHierarchyTypedPrimitivesDecodeProtocolRecords(t *testing.T) {
 			_, _ = serverSide.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: request.ID, Result: mustJSON(json.RawMessage(result))}))
 		}
 	}()
-	position := TextDocumentPosition{URI: "file:///a.cpp"}
+	position := TextDocumentPosition{URI: uri}
 	roots, err := c.PrepareCallHierarchy(context.Background(), position)
 	if err != nil || len(roots) != 1 || roots[0].Name != "root" {
 		t.Fatalf("prepare=%#v err=%v", roots, err)

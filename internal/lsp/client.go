@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +45,8 @@ type Client struct {
 	next      atomic.Uint64
 	wg        sync.WaitGroup
 	requests  chan wireMessage
+	openMu    sync.Mutex
+	opened    map[string]struct{}
 }
 
 func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Client {
@@ -51,7 +56,7 @@ func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Clien
 	if options.RequestTimeout <= 0 {
 		options.RequestTimeout = 15 * time.Second
 	}
-	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32)}
+	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), opened: make(map[string]struct{})}
 	c.wg.Add(2)
 	go c.readLoop()
 	go c.requestLoop()
@@ -412,18 +417,33 @@ func (c *Client) CallHierarchy(ctx context.Context, p TextDocumentPosition, limi
 	return limit(limits, out), err
 }
 func (c *Client) Definition(ctx context.Context, p TextDocumentPosition, out any) error {
+	if err := c.ensureDocumentOpen(p.URI); err != nil {
+		return err
+	}
 	return c.Call(ctx, "textDocument/definition", map[string]any{"textDocument": map[string]string{"uri": p.URI}, "position": p.Position}, out)
 }
 func (c *Client) References(ctx context.Context, p TextDocumentPosition, out any) error {
+	if err := c.ensureDocumentOpen(p.URI); err != nil {
+		return err
+	}
 	return c.Call(ctx, "textDocument/references", map[string]any{"textDocument": map[string]string{"uri": p.URI}, "position": p.Position, "context": map[string]bool{"includeDeclaration": true}}, out)
 }
 func (c *Client) Implementation(ctx context.Context, p TextDocumentPosition, out any) error {
+	if err := c.ensureDocumentOpen(p.URI); err != nil {
+		return err
+	}
 	return c.Call(ctx, "textDocument/implementation", map[string]any{"textDocument": map[string]string{"uri": p.URI}, "position": p.Position}, out)
 }
 func (c *Client) DocumentSymbol(ctx context.Context, uri string, out any) error {
+	if err := c.ensureDocumentOpen(uri); err != nil {
+		return err
+	}
 	return c.Call(ctx, "textDocument/documentSymbol", map[string]any{"textDocument": map[string]string{"uri": uri}}, out)
 }
 func (c *Client) Hover(ctx context.Context, p TextDocumentPosition, out any) error {
+	if err := c.ensureDocumentOpen(p.URI); err != nil {
+		return err
+	}
 	return c.Call(ctx, "textDocument/hover", map[string]any{"textDocument": map[string]string{"uri": p.URI}, "position": p.Position}, out)
 }
 
@@ -436,6 +456,9 @@ func (c *Client) PrepareCallHierarchy(ctx context.Context, p TextDocumentPositio
 	return out, err
 }
 func (c *Client) prepareCallHierarchy(ctx context.Context, p TextDocumentPosition, out any) error {
+	if err := c.ensureDocumentOpen(p.URI); err != nil {
+		return err
+	}
 	return c.Call(ctx, "textDocument/prepareCallHierarchy", map[string]any{"textDocument": map[string]string{"uri": p.URI}, "position": p.Position}, out)
 }
 func (c *Client) IncomingCalls(ctx context.Context, item CallHierarchyItem) ([]CallHierarchyCall, error) {
@@ -449,8 +472,69 @@ func (c *Client) OutgoingCalls(ctx context.Context, item CallHierarchyItem) ([]C
 	return out, err
 }
 func (c *Client) DidOpen(uri, languageID, text string) error {
-	return c.Notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": languageID, "version": 1, "text": text}})
+	c.openMu.Lock()
+	defer c.openMu.Unlock()
+	if _, ok := c.opened[uri]; ok {
+		return nil
+	}
+	if err := c.Notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": languageID, "version": 1, "text": text}}); err != nil {
+		return err
+	}
+	c.opened[uri] = struct{}{}
+	return nil
 }
 func (c *Client) DidClose(uri string) error {
-	return c.Notify("textDocument/didClose", map[string]any{"textDocument": map[string]string{"uri": uri}})
+	c.openMu.Lock()
+	defer c.openMu.Unlock()
+	if err := c.Notify("textDocument/didClose", map[string]any{"textDocument": map[string]string{"uri": uri}}); err != nil {
+		return err
+	}
+	delete(c.opened, uri)
+	return nil
+}
+
+func (c *Client) ensureDocumentOpen(uri string) error {
+	c.openMu.Lock()
+	defer c.openMu.Unlock()
+	if _, ok := c.opened[uri]; ok {
+		return nil
+	}
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "file" || u.Host != "" {
+		return errors.New("document URI must be a local file URI")
+	}
+	path := filepath.FromSlash(u.Path)
+	if len(path) >= 3 && (path[0] == '/' || path[0] == '\\') && path[2] == ':' {
+		path = path[1:]
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("open document: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("document is not a regular file")
+	}
+	if info.Size() > maxIndexSeedBytes {
+		return errors.New("document exceeds read limit")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open document: %w", err)
+	}
+	b, readErr := io.ReadAll(io.LimitReader(f, maxIndexSeedBytes+1))
+	closeErr := f.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if len(b) > maxIndexSeedBytes {
+		return errors.New("document exceeds read limit")
+	}
+	if err := c.Notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": "cpp", "version": 1, "text": string(b)}}); err != nil {
+		return err
+	}
+	c.opened[uri] = struct{}{}
+	return nil
 }
