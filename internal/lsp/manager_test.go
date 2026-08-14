@@ -205,3 +205,24 @@ func TestManagerSharesSimultaneousStartup(t *testing.T) {
 		t.Fatalf("starts=%d", n)
 	}
 }
+
+func TestManagerAcceptsCompilationDatabaseFileAndRejectsMismatch(t *testing.T) {
+	f := &fakeFactory{}
+	m := NewManager(f)
+	defer m.Close()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "compile_commands.json")
+	if err := os.WriteFile(db, []byte("[]"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := ProjectConfig{ID: "file", Clangd: "fake", CacheDir: dir, CompilationDatabase: db, RootURI: "file:///x"}
+	if _, err := m.Client(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	m.Release("file")
+	cfg.ID = "bad"
+	cfg.CompilationDatabase = filepath.Join(t.TempDir(), "compile_commands.json")
+	if _, err := m.Client(context.Background(), cfg); err == nil {
+		t.Fatal("expected mismatch rejection")
+	}
+}

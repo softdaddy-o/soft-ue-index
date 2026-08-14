@@ -178,8 +178,18 @@ func (m *Manager) start(ctx context.Context, cfg ProjectConfig) (Process, error)
 	if cfg.CacheDir == "" {
 		return nil, errors.New("clangd cache directory is required")
 	}
-	if cfg.CompilationDatabase != "" && filepath.Clean(cfg.CompilationDatabase) != filepath.Clean(cfg.CacheDir) {
-		return nil, errors.New("compilation database must equal project cache directory")
+	if cfg.CompilationDatabase != "" {
+		path := filepath.Clean(cfg.CompilationDatabase)
+		if filepath.Base(path) != "compile_commands.json" || filepath.Clean(filepath.Dir(path)) != filepath.Clean(cfg.CacheDir) {
+			return nil, errors.New("compilation database must be CacheDir/compile_commands.json")
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, errors.New("compilation database is not a regular file")
+		}
 	}
 	if err := os.MkdirAll(filepath.Join(cfg.CacheDir, ".cache", "clangd", "index"), 0700); err != nil {
 		return nil, err
