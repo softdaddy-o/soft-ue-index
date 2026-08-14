@@ -10,23 +10,27 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
 function Invoke-External([string] $FileName, [string[]] $Arguments) {
+    $remaining = [Math]::Floor(($script:Deadline - (Get-Date)).TotalSeconds)
+    if ($remaining -lt 1) { throw 'overall integration timeout expired' }
     $psi = [Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $FileName; $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     foreach ($argument in $Arguments) { [void]$psi.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::Start($psi)
     $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    if (-not $process.WaitForExit([int]$remaining * 1000)) {
         $process.Kill($true); $process.WaitForExit(); $process.Dispose()
         throw 'external command timed out'
     }
-    $out.Wait(); $err.Wait(); $code = $process.ExitCode; $process.Dispose()
+    $out.Wait(); $err.Wait(); $code = $process.ExitCode; $text = $out.Result; $process.Dispose()
     if ($code -ne 0) { throw "external command failed with exit code $code" }
+    return $text
 }
 function Invoke-Tool([string[]] $Arguments) {
-    Invoke-External $Executable $Arguments
+    $null = Invoke-External $Executable $Arguments
 }
 
 function Convert-FileUriToPath([string] $Uri) {
@@ -58,7 +62,8 @@ function Invoke-McpSmoke([string] $ProjectID, [string] $ProjectRoot, [string] $E
             $process.StandardInput.WriteLine(($Request | ConvertTo-Json -Compress -Depth 10))
             $process.StandardInput.Flush()
             $read = $process.StandardOutput.ReadLineAsync()
-            if (-not $read.Wait($TimeoutSeconds * 1000)) { throw 'MCP request timed out' }
+            $remaining = [Math]::Floor(($script:Deadline - (Get-Date)).TotalSeconds)
+            if ($remaining -lt 1 -or -not $read.Wait([int]$remaining * 1000)) { throw 'MCP request timed out' }
             $line = $read.Result
             if ([string]::IsNullOrWhiteSpace($line)) { throw 'MCP server returned no response' }
             return $line | ConvertFrom-Json
@@ -107,29 +112,30 @@ if ($Clangd) {
 }
 
 $start = Get-Date
-$projects = (& $Executable list --json | ConvertFrom-Json)
+$projects = (Invoke-External $Executable @('list', '--json') | ConvertFrom-Json)
 $project = $projects | Where-Object { $_.uproject -eq (Resolve-Path -LiteralPath $UProject).Path } | Select-Object -First 1
 if (-not $project) {
     Invoke-Tool @('add', $UProject)
-    $projects = (& $Executable list --json | ConvertFrom-Json)
+    $projects = (Invoke-External $Executable @('list', '--json') | ConvertFrom-Json)
     $project = $projects | Where-Object { $_.uproject -eq (Resolve-Path -LiteralPath $UProject).Path } | Select-Object -First 1
 }
 if (-not $project) { throw 'Registered project was not found' }
 if ($Engine -and $project.engine.root -ne (Resolve-Path -LiteralPath $Engine).Path) { throw 'Registered engine does not match the supplied engine' }
 Invoke-Tool @('doctor', '--json')
-$project = (& $Executable status $project.id --json | ConvertFrom-Json)
+$project = (Invoke-External $Executable @('status', $project.id, '--json') | ConvertFrom-Json)
 if ($Clangd -and $project.toolchain.clangdPath -ne (Resolve-Path -LiteralPath $Clangd).Path) { throw 'Doctor did not select the supplied compatible clangd' }
 Invoke-Tool @('generate', $project.id)
 
 $database = $project.generation.compilationDatabase
-$project = (& $Executable status $project.id --json | ConvertFrom-Json)
+$project = (Invoke-External $Executable @('status', $project.id, '--json') | ConvertFrom-Json)
 $database = $project.generation.compilationDatabase
 if (-not (Test-Path -LiteralPath $database -PathType Leaf)) { throw 'Compilation database was not generated' }
 $entries = Get-Content -Raw -LiteralPath $database | ConvertFrom-Json
 $projectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $UProject)).Path
 $engineRoot = $project.engine.root
-$projectCount = @($entries | Where-Object { $_.file.StartsWith($projectRoot, [StringComparison]::OrdinalIgnoreCase) }).Count
-$engineCount = @($entries | Where-Object { $_.file.StartsWith($engineRoot, [StringComparison]::OrdinalIgnoreCase) }).Count
+$projectCount = @($entries | Where-Object { Test-UnderRoot $_.file $projectRoot }).Count
+$engineCount = @($entries | Where-Object { Test-UnderRoot $_.file $engineRoot }).Count
+if (Test-UnderRoot (Join-Path ([IO.Path]::GetDirectoryName($projectRoot)) (([IO.Path]::GetFileName($projectRoot)) + '-sibling/test.cpp')) $projectRoot) { throw 'root containment regression' }
 if ($projectCount -eq 0 -or $engineCount -eq 0) { throw 'Compilation database does not cover both project and engine translation units' }
 Invoke-McpSmoke $project.id $projectRoot $engineRoot $ProjectSymbol $EngineSymbol
 $elapsed = [Math]::Round(((Get-Date) - $start).TotalSeconds, 2)

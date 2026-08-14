@@ -22,7 +22,10 @@ jobs:
           install: mingw-w64-x86_64-gcc
       - name: Verify with race detector
         shell: msys2 {0}
-        run: CC=gcc go test -race ./...
+        run: |
+          test -z "$(gofmt -l $(find . -name '*.go'))"
+          go vet ./...
+          CC=gcc go test -race ./...
       - name: Package
         shell: pwsh
         run: |
