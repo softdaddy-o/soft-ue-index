@@ -17,49 +17,58 @@ func (s *Server) MCPServer(version string) *mcp.Server {
 		MaxItems int `json:"max_items,omitempty"`
 	}) (*mcp.CallToolResult, ListProjectsResult, error) {
 		r, e := s.ListProjects(ctx, in.MaxItems)
-		return textResult(e), r, e
+		return s.textResult(e), r, nil
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "project_status", Description: "Get compilation database status for one explicit project."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ProjectStatusInput) (*mcp.CallToolResult, ProjectStatusResult, error) {
 		r, e := s.ProjectStatus(ctx, in)
-		return textResult(e), r, e
+		return s.textResult(e), r, nil
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "search_symbols", Description: "Search symbols in one explicit project."}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchSymbolsInput) (*mcp.CallToolResult, SearchSymbolsResult, error) {
 		r, e := s.SearchSymbols(ctx, in)
-		return textResult(e), r, e
+		return s.textResult(e), r, nil
 	})
-	addLocations(m, "find_definition", "Find a definition.", s.FindDefinition)
-	addLocations(m, "find_references", "Find references.", s.FindReferences)
-	addLocations(m, "find_implementations", "Find implementations.", s.FindImplementations)
+	addLocations(m, "find_definition", "Find a definition.", s.FindDefinition, s.textResult)
+	addLocations(m, "find_references", "Find references.", s.FindReferences, s.textResult)
+	addLocations(m, "find_implementations", "Find implementations.", s.FindImplementations, s.textResult)
 	mcp.AddTool(m, &mcp.Tool{Name: "document_symbols", Description: "List document symbols for a project or engine source file."}, func(ctx context.Context, _ *mcp.CallToolRequest, in PathQueryInput) (*mcp.CallToolResult, DocumentSymbolsResult, error) {
 		r, e := s.DocumentSymbols(ctx, in)
-		return textResult(e), r, e
+		return s.textResult(e), r, nil
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "hover", Description: "Get hover information at a source position."}, func(ctx context.Context, _ *mcp.CallToolRequest, in LocationQueryInput) (*mcp.CallToolResult, HoverResult, error) {
 		r, e := s.Hover(ctx, in)
-		return textResult(e), r, e
+		return s.textResult(e), r, nil
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "call_hierarchy", Description: "Prepare, list incoming, or list outgoing calls at a source position."}, func(ctx context.Context, _ *mcp.CallToolRequest, in CallHierarchyInput) (*mcp.CallToolResult, CallHierarchyResult, error) {
 		r, e := s.CallHierarchy(ctx, in)
-		return textResult(e), r, e
+		return s.textResult(e), r, nil
 	})
 	mcp.AddTool(m, &mcp.Tool{Name: "read_symbol_source", Description: "Read a line-bounded source excerpt inside the selected project or engine."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ReadSymbolSourceInput) (*mcp.CallToolResult, ReadSymbolSourceResult, error) {
 		r, e := s.ReadSymbolSource(ctx, in)
-		return textResult(e), r, e
+		return s.textResult(e), r, nil
 	})
 	return m
 }
 
-func addLocations(m *mcp.Server, name, description string, f func(context.Context, LocationQueryInput) (LocationsResult, error)) {
+func addLocations(m *mcp.Server, name, description string, f func(context.Context, LocationQueryInput) (LocationsResult, error), result func(error) *mcp.CallToolResult) {
 	mcp.AddTool(m, &mcp.Tool{Name: name, Description: description}, func(ctx context.Context, _ *mcp.CallToolRequest, in LocationQueryInput) (*mcp.CallToolResult, LocationsResult, error) {
 		r, e := f(ctx, in)
-		return textResult(e), r, e
+		return result(e), r, nil
 	})
 }
-func textResult(err error) *mcp.CallToolResult {
+
+func (s *Server) textResult(err error) *mcp.CallToolResult {
 	if err == nil {
 		return &mcp.CallToolResult{}
 	}
-	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}}}
+	message := mapError(err).Error()
+	max := s.limits.MaxResponseBytes / 8
+	if max < 32 {
+		max = 32
+	}
+	if len(message) > max {
+		message = message[:max]
+	}
+	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: message}}}
 }
 
 // RunStdio serves MCP only through stdin/stdout. Callers must send diagnostics

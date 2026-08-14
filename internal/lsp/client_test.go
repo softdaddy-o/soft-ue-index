@@ -95,6 +95,39 @@ func TestLimitsTruncateTypedResults(t *testing.T) {
 		t.Fatalf("%#v", got)
 	}
 }
+
+func TestCallHierarchyTypedPrimitivesDecodeProtocolRecords(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer serverSide.Close()
+	c := NewClient(clientSide, clientSide, ClientOptions{})
+	defer c.Close()
+	go func() {
+		r := bufio.NewReader(serverSide)
+		for _, result := range []string{
+			`[{"name":"root","uri":"file:///a.cpp","range":{"start":{},"end":{}},"selectionRange":{"start":{},"end":{}}}]`,
+			`[{"from":{"name":"caller","uri":"file:///b.cpp","range":{"start":{},"end":{}},"selectionRange":{"start":{},"end":{}}}}]`,
+			`[{"to":{"name":"callee","uri":"file:///c.cpp","range":{"start":{},"end":{}},"selectionRange":{"start":{},"end":{}}}}]`,
+		} {
+			body, _ := readFrame(r, 4096)
+			var request wireMessage
+			_ = json.Unmarshal(body, &request)
+			_, _ = serverSide.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: request.ID, Result: mustJSON(json.RawMessage(result))}))
+		}
+	}()
+	position := TextDocumentPosition{URI: "file:///a.cpp"}
+	roots, err := c.PrepareCallHierarchy(context.Background(), position)
+	if err != nil || len(roots) != 1 || roots[0].Name != "root" {
+		t.Fatalf("prepare=%#v err=%v", roots, err)
+	}
+	incoming, err := c.IncomingCalls(context.Background(), roots[0])
+	if err != nil || len(incoming) != 1 || incoming[0].From == nil || incoming[0].From.Name != "caller" {
+		t.Fatalf("incoming=%#v err=%v", incoming, err)
+	}
+	outgoing, err := c.OutgoingCalls(context.Background(), roots[0])
+	if err != nil || len(outgoing) != 1 || outgoing[0].To == nil || outgoing[0].To.Name != "callee" {
+		t.Fatalf("outgoing=%#v err=%v", outgoing, err)
+	}
+}
 func TestDecodeLocationUnionsAndDocumentLimit(t *testing.T) {
 	for _, raw := range []string{`{"uri":"file:///a","range":{"start":{},"end":{}}}`, `[{"targetUri":"file:///b","targetRange":{"start":{},"end":{}},"targetSelectionRange":{"start":{},"end":{}}}]`, `null`} {
 		got, err := decodeLocations(json.RawMessage(raw))

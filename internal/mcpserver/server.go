@@ -36,7 +36,9 @@ type Queries interface {
 	Locations(context.Context, registry.Project, string, TextPosition, int) ([]lsp.Location, error)
 	DocumentSymbols(context.Context, registry.Project, string, int) ([]lsp.DocumentSymbol, error)
 	Hover(context.Context, registry.Project, TextPosition) (*lsp.HoverResult, error)
-	CallHierarchy(context.Context, registry.Project, string, TextPosition, int) ([]lsp.CallHierarchyItem, error)
+	PrepareCallHierarchy(context.Context, registry.Project, TextPosition) ([]lsp.CallHierarchyItem, error)
+	IncomingCalls(context.Context, registry.Project, lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error)
+	OutgoingCalls(context.Context, registry.Project, lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error)
 }
 
 type Dependencies struct {
@@ -139,8 +141,18 @@ type HoverResult struct {
 	Truncated bool             `json:"truncated"`
 }
 type CallHierarchyResult struct {
-	Items     []lsp.CallHierarchyItem `json:"items"`
-	Truncated bool                    `json:"truncated"`
+	Roots     []string            `json:"roots"`
+	Nodes     []CallHierarchyNode `json:"nodes"`
+	Edges     []CallHierarchyEdge `json:"edges"`
+	Truncated bool                `json:"truncated"`
+}
+type CallHierarchyNode struct {
+	ID   string                `json:"id"`
+	Item lsp.CallHierarchyItem `json:"item"`
+}
+type CallHierarchyEdge struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 func (s *Server) locations(ctx context.Context, kind string, in LocationQueryInput) (LocationsResult, error) {
@@ -253,17 +265,70 @@ func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (Call
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.limits.Timeout)
 	defer cancel()
-	v, err := s.queries.CallHierarchy(ctx, p, kind, in.Position, s.itemLimit(in.MaxItems)+1)
+	roots, err := s.queries.PrepareCallHierarchy(ctx, p, in.Position)
 	if err != nil {
 		return CallHierarchyResult{}, mapError(err)
 	}
-	r := CallHierarchyResult{Items: v}
-	if len(r.Items) > s.itemLimit(in.MaxItems) {
-		r.Items = r.Items[:s.itemLimit(in.MaxItems)]
-		r.Truncated = true
+	roots, filtered := s.filterCalls(p, roots, false)
+	r := CallHierarchyResult{Truncated: filtered}
+	max := s.itemLimit(in.MaxItems)
+	seen := map[string]bool{}
+	for _, root := range roots {
+		if len(r.Nodes) >= max {
+			r.Truncated = true
+			break
+		}
+		if addCallNode(&r, seen, root) {
+			r.Roots = append(r.Roots, callKey(root))
+		}
 	}
-	r.Items, r.Truncated = s.filterCalls(p, r.Items, r.Truncated)
-	return bounded(s.limits.MaxResponseBytes, r)
+	if kind == "prepare" || in.MaxDepth == 0 {
+		return trimCallHierarchy(r, s.limits.MaxResponseBytes)
+	}
+	frontier := make([]lsp.CallHierarchyItem, 0, len(r.Nodes))
+	for _, node := range r.Nodes {
+		frontier = append(frontier, node.Item)
+	}
+	for d := 1; d <= in.MaxDepth && len(frontier) > 0 && !r.Truncated; d++ {
+		next := []lsp.CallHierarchyItem{}
+		for _, from := range frontier {
+			var calls []lsp.CallHierarchyCall
+			if kind == "incoming" {
+				calls, err = s.queries.IncomingCalls(ctx, p, from)
+			} else {
+				calls, err = s.queries.OutgoingCalls(ctx, p, from)
+			}
+			if err != nil {
+				return CallHierarchyResult{}, mapError(err)
+			}
+			for _, call := range calls {
+				to := call.To
+				if kind == "incoming" {
+					to = call.From
+				}
+				if to == nil || !s.allowed(p, to.URI) {
+					r.Truncated = true
+					continue
+				}
+				toKey := callKey(*to)
+				cost := 1 // the edge itself
+				if !seen[toKey] {
+					cost++ // a previously unseen endpoint is another result item
+				}
+				if len(r.Nodes)+len(r.Edges)+cost > max {
+					r.Truncated = true
+					break
+				}
+				added := addCallNode(&r, seen, *to)
+				r.Edges = append(r.Edges, CallHierarchyEdge{From: callKey(from), To: toKey})
+				if added {
+					next = append(next, *to)
+				}
+			}
+		}
+		frontier = next
+	}
+	return trimCallHierarchy(r, s.limits.MaxResponseBytes)
 }
 func (s *Server) validatePosition(p registry.Project, v TextPosition) error {
 	if v.Line < 0 || v.Character < 0 {
@@ -483,6 +548,36 @@ func bounded[T any](limit int, value T) (T, error) {
 	}
 	return value, nil
 }
+func trimCallHierarchy(r CallHierarchyResult, limit int) (CallHierarchyResult, error) {
+	if _, err := bounded(limit, r); err == nil {
+		return r, nil
+	}
+	r.Truncated = true
+	for len(r.Edges) > 0 {
+		r.Edges = r.Edges[:len(r.Edges)-1]
+		if _, err := bounded(limit, r); err == nil {
+			return r, nil
+		}
+	}
+	for len(r.Nodes) > 0 {
+		removed := r.Nodes[len(r.Nodes)-1].ID
+		r.Nodes = r.Nodes[:len(r.Nodes)-1]
+		r.Roots = removeCallID(r.Roots, removed)
+		if _, err := bounded(limit, r); err == nil {
+			return r, nil
+		}
+	}
+	return bounded(limit, r)
+}
+func removeCallID(in []string, id string) []string {
+	out := in[:0]
+	for _, v := range in {
+		if v != id {
+			out = append(out, v)
+		}
+	}
+	return out
+}
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -579,6 +674,18 @@ func (s *Server) filterCalls(p registry.Project, in []lsp.CallHierarchyItem, tru
 		}
 	}
 	return out, truncated
+}
+func callKey(v lsp.CallHierarchyItem) string {
+	return fmt.Sprintf("%s:%d:%d:%d:%d", v.URI, v.Range.Start.Line, v.Range.Start.Character, v.Range.End.Line, v.Range.End.Character)
+}
+func addCallNode(r *CallHierarchyResult, seen map[string]bool, item lsp.CallHierarchyItem) bool {
+	id := callKey(item)
+	if seen[id] {
+		return false
+	}
+	seen[id] = true
+	r.Nodes = append(r.Nodes, CallHierarchyNode{ID: id, Item: item})
+	return true
 }
 func flattenSymbols(in []lsp.DocumentSymbol) []DocumentSymbol {
 	out := make([]DocumentSymbol, 0)

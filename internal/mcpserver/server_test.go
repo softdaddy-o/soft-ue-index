@@ -96,7 +96,13 @@ func (f *fakeQueries) DocumentSymbols(context.Context, registry.Project, string,
 func (f *fakeQueries) Hover(context.Context, registry.Project, TextPosition) (*lsp.HoverResult, error) {
 	return nil, f.err
 }
-func (f *fakeQueries) CallHierarchy(context.Context, registry.Project, string, TextPosition, int) ([]lsp.CallHierarchyItem, error) {
+func (f *fakeQueries) PrepareCallHierarchy(context.Context, registry.Project, TextPosition) ([]lsp.CallHierarchyItem, error) {
+	return nil, f.err
+}
+func (f *fakeQueries) IncomingCalls(context.Context, registry.Project, lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error) {
+	return nil, f.err
+}
+func (f *fakeQueries) OutgoingCalls(context.Context, registry.Project, lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error) {
 	return nil, f.err
 }
 
@@ -243,7 +249,7 @@ func TestReadSymbolSourceCancellationClosesBlockedReader(t *testing.T) {
 
 func TestResponseFamiliesRespectSerializedByteCap(t *testing.T) {
 	limit := 64
-	values := []any{SearchSymbolsResult{Items: []lsp.Symbol{{Name: string(make([]byte, 200))}}, Truncated: true}, LocationsResult{Items: []lsp.Location{{URI: string(make([]byte, 200))}}, Truncated: true}, DocumentSymbolsResult{Items: []DocumentSymbol{{Name: string(make([]byte, 200))}}, Truncated: true}, HoverResult{Item: &lsp.HoverResult{Contents: lsp.MarkupContent{Value: string(make([]byte, 200))}}, Truncated: true}, CallHierarchyResult{Items: []lsp.CallHierarchyItem{{Name: string(make([]byte, 200))}}, Truncated: true}}
+	values := []any{SearchSymbolsResult{Items: []lsp.Symbol{{Name: string(make([]byte, 200))}}, Truncated: true}, LocationsResult{Items: []lsp.Location{{URI: string(make([]byte, 200))}}, Truncated: true}, DocumentSymbolsResult{Items: []DocumentSymbol{{Name: string(make([]byte, 200))}}, Truncated: true}, HoverResult{Item: &lsp.HoverResult{Contents: lsp.MarkupContent{Value: string(make([]byte, 200))}}, Truncated: true}, CallHierarchyResult{Nodes: []CallHierarchyNode{{Item: lsp.CallHierarchyItem{Name: string(make([]byte, 200))}}}, Truncated: true}}
 	for _, v := range values {
 		if _, err := bounded(limit, v); !errors.Is(err, ErrLimitExceeded) {
 			t.Fatalf("oversize %T: %v", v, err)
@@ -351,5 +357,145 @@ func TestCallHierarchyDepthIsBounded(t *testing.T) {
 	}
 	if _, err := s.CallHierarchy(context.Background(), CallHierarchyInput{ProjectID: "p", Position: TextPosition{Path: path}, MaxDepth: 0}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type hierarchyQueries struct {
+	fakeQueries
+	roots    []lsp.CallHierarchyItem
+	incoming map[string][]lsp.CallHierarchyCall
+	outgoing map[string][]lsp.CallHierarchyCall
+}
+
+func (q *hierarchyQueries) PrepareCallHierarchy(context.Context, registry.Project, TextPosition) ([]lsp.CallHierarchyItem, error) {
+	return q.roots, q.err
+}
+func (q *hierarchyQueries) IncomingCalls(_ context.Context, _ registry.Project, item lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error) {
+	return q.incoming[callKey(item)], q.err
+}
+func (q *hierarchyQueries) OutgoingCalls(_ context.Context, _ registry.Project, item lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error) {
+	return q.outgoing[callKey(item)], q.err
+}
+
+func TestCallHierarchyTraversesDepthsCyclesAndDirections(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "S.cpp")
+	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	uri := "file:///" + strings.ReplaceAll(path, "\\", "/")
+	item := func(name string, line int) lsp.CallHierarchyItem {
+		return lsp.CallHierarchyItem{Name: name, URI: uri, Range: lsp.Range{Start: lsp.Position{Line: line}}}
+	}
+	a, b, c := item("A", 0), item("B", 1), item("C", 2)
+	q := &hierarchyQueries{roots: []lsp.CallHierarchyItem{a}, outgoing: map[string][]lsp.CallHierarchyCall{
+		callKey(a): {{To: &b}}, callKey(b): {{To: &c}}, callKey(c): {{To: &a}},
+	}, incoming: map[string][]lsp.CallHierarchyCall{callKey(a): {{From: &b}}}}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}, Queries: q, Limits: Limits{MaxCallDepth: 3, MaxItems: 20, MaxResponseBytes: 4096}})
+	for depth, edges := range map[int]int{0: 0, 1: 1, 2: 2, 3: 3} {
+		got, err := s.CallHierarchy(context.Background(), CallHierarchyInput{ProjectID: "p", Position: TextPosition{Path: path}, Direction: "outgoing", MaxDepth: depth})
+		if err != nil || len(got.Edges) != edges {
+			t.Fatalf("depth %d: edges=%d err=%v", depth, len(got.Edges), err)
+		}
+	}
+	got, err := s.CallHierarchy(context.Background(), CallHierarchyInput{ProjectID: "p", Position: TextPosition{Path: path}, Direction: "incoming", MaxDepth: 1})
+	if err != nil || len(got.Edges) != 1 || got.Edges[0].To != callKey(b) {
+		t.Fatalf("incoming=%#v err=%v", got, err)
+	}
+}
+
+func TestCallHierarchyLimitsItemsAndSerializedBytes(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "S.cpp")
+	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	uri := "file:///" + strings.ReplaceAll(path, "\\", "/")
+	a := lsp.CallHierarchyItem{Name: "A", URI: uri}
+	b := lsp.CallHierarchyItem{Name: "B", URI: uri, Range: lsp.Range{Start: lsp.Position{Line: 1}}}
+	c := lsp.CallHierarchyItem{Name: "C", URI: uri, Range: lsp.Range{Start: lsp.Position{Line: 2}}}
+	q := &hierarchyQueries{roots: []lsp.CallHierarchyItem{a}, outgoing: map[string][]lsp.CallHierarchyCall{callKey(a): {{To: &b}, {To: &c}}}}
+	project := fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}
+	s := New(Dependencies{Projects: project, Queries: q, Limits: Limits{MaxCallDepth: 2, MaxItems: 3, MaxResponseBytes: 4096}})
+	got, err := s.CallHierarchy(context.Background(), CallHierarchyInput{ProjectID: "p", Position: TextPosition{Path: path}, Direction: "outgoing", MaxDepth: 1})
+	if err != nil || !got.Truncated || len(got.Nodes)+len(got.Edges) > 3 {
+		t.Fatalf("item cap=%#v err=%v", got, err)
+	}
+	big := a
+	big.Name = strings.Repeat("x", 4096)
+	q.roots = []lsp.CallHierarchyItem{big}
+	s = New(Dependencies{Projects: project, Queries: q, Limits: Limits{MaxCallDepth: 1, MaxItems: 5, MaxResponseBytes: 256}})
+	got, err = s.CallHierarchy(context.Background(), CallHierarchyInput{ProjectID: "p", Position: TextPosition{Path: path}})
+	if err != nil || !got.Truncated {
+		t.Fatalf("byte cap=%#v err=%v", got, err)
+	}
+	encoded, _ := json.Marshal(got)
+	if len(encoded) > 256 {
+		t.Fatalf("serialized result exceeded cap: %d", len(encoded))
+	}
+}
+
+func TestCallHierarchyPropagatesRequestTimeout(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "S.cpp")
+	if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	uri := "file:///" + strings.ReplaceAll(path, "\\", "/")
+	// The adapter keeps this test focused on server-owned timeout behavior.
+	timeoutQ := &timeoutCalls{root: lsp.CallHierarchyItem{URI: uri}}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}, Queries: timeoutQ, Limits: Limits{Timeout: time.Millisecond}})
+	_, err := s.CallHierarchy(context.Background(), CallHierarchyInput{ProjectID: "p", Position: TextPosition{Path: path}, Direction: "outgoing", MaxDepth: 1})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout: %v", err)
+	}
+}
+
+type timeoutCalls struct {
+	fakeQueries
+	root lsp.CallHierarchyItem
+}
+
+func (q *timeoutCalls) PrepareCallHierarchy(context.Context, registry.Project, TextPosition) ([]lsp.CallHierarchyItem, error) {
+	return []lsp.CallHierarchyItem{q.root}, nil
+}
+func (q *timeoutCalls) OutgoingCalls(ctx context.Context, _ registry.Project, _ lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestOfficialSDKCallToolSanitizesLargeBackendError(t *testing.T) {
+	root := t.TempDir()
+	q := &fakeQueries{err: errors.New(strings.Repeat("secret", 1<<20))}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}, Queries: q, Limits: Limits{MaxResponseBytes: 512}}).MCPServer("test")
+	a, b := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	serverSession, err := s.Connect(ctx, a, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "test"}, nil)
+	clientSession, err := client.Connect(ctx, b, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: "search_symbols", Arguments: map[string]any{"project_id": "p", "query": "x"}})
+	if err != nil || !result.IsError || len(result.Content) != 1 {
+		t.Fatalf("tool error=%v result=%#v", err, result)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil || len(encoded) > 512 || strings.Contains(string(encoded), "secret") {
+		t.Fatalf("unsanitized MCP result bytes=%d err=%v", len(encoded), err)
+	}
+	wire, err := json.Marshal(struct {
+		JSONRPC string              `json:"jsonrpc"`
+		ID      int                 `json:"id"`
+		Result  *mcp.CallToolResult `json:"result"`
+	}{JSONRPC: "2.0", ID: 1, Result: result})
+	if err != nil || len(wire) > 512 {
+		t.Fatalf("serialized MCP response exceeded cap: bytes=%d err=%v", len(wire), err)
 	}
 }

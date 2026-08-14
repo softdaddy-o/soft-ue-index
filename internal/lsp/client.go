@@ -411,7 +411,7 @@ func (c *Client) HoverResult(ctx context.Context, p TextDocumentPosition) (*Hove
 }
 func (c *Client) CallHierarchy(ctx context.Context, p TextDocumentPosition, limits Limits) ([]CallHierarchyItem, error) {
 	var out []CallHierarchyItem
-	err := c.PrepareCallHierarchy(ctx, p, &out)
+	err := c.prepareCallHierarchy(ctx, p, &out)
 	return limit(limits, out), err
 }
 func (c *Client) Definition(ctx context.Context, p TextDocumentPosition, out any) error {
@@ -429,14 +429,27 @@ func (c *Client) DocumentSymbol(ctx context.Context, uri string, out any) error 
 func (c *Client) Hover(ctx context.Context, p TextDocumentPosition, out any) error {
 	return c.Call(ctx, "textDocument/hover", map[string]any{"textDocument": map[string]string{"uri": p.URI}, "position": p.Position}, out)
 }
-func (c *Client) PrepareCallHierarchy(ctx context.Context, p TextDocumentPosition, out any) error {
+
+// PrepareCallHierarchy returns the starting call hierarchy items at a source
+// position. IncomingCalls and OutgoingCalls return the protocol's typed call
+// records, whose From/To endpoint is selected by the caller.
+func (c *Client) PrepareCallHierarchy(ctx context.Context, p TextDocumentPosition) ([]CallHierarchyItem, error) {
+	var out []CallHierarchyItem
+	err := c.prepareCallHierarchy(ctx, p, &out)
+	return out, err
+}
+func (c *Client) prepareCallHierarchy(ctx context.Context, p TextDocumentPosition, out any) error {
 	return c.Call(ctx, "textDocument/prepareCallHierarchy", map[string]any{"textDocument": map[string]string{"uri": p.URI}, "position": p.Position}, out)
 }
-func (c *Client) IncomingCalls(ctx context.Context, item any, out any) error {
-	return c.Call(ctx, "callHierarchy/incomingCalls", map[string]any{"item": item}, out)
+func (c *Client) IncomingCalls(ctx context.Context, item CallHierarchyItem) ([]CallHierarchyCall, error) {
+	var out []CallHierarchyCall
+	err := c.Call(ctx, "callHierarchy/incomingCalls", map[string]any{"item": item}, &out)
+	return out, err
 }
-func (c *Client) OutgoingCalls(ctx context.Context, item any, out any) error {
-	return c.Call(ctx, "callHierarchy/outgoingCalls", map[string]any{"item": item}, out)
+func (c *Client) OutgoingCalls(ctx context.Context, item CallHierarchyItem) ([]CallHierarchyCall, error) {
+	var out []CallHierarchyCall
+	err := c.Call(ctx, "callHierarchy/outgoingCalls", map[string]any{"item": item}, &out)
+	return out, err
 }
 func (c *Client) DidOpen(uri, languageID, text string) error {
 	return c.Notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": languageID, "version": 1, "text": text}})
