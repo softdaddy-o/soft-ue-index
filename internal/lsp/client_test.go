@@ -103,6 +103,40 @@ func TestTerminateDoesNotCloseDetachedResponseChannel(t *testing.T) {
 	c.Close()
 }
 
+func TestCallTimeoutIncludesBlockedTransportWrite(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{RequestTimeout: 20 * time.Millisecond})
+	defer c.Close()
+	done := make(chan error, 1)
+	go func() { done <- c.Call(context.Background(), "blocked", nil, nil) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Call blocked beyond its request timeout while writing")
+	}
+}
+
+func TestNotificationTimeoutClosesBlockedTransport(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{RequestTimeout: 20 * time.Millisecond})
+	defer c.Close()
+	done := make(chan error, 1)
+	go func() { done <- c.DidOpen("file:///blocked.cpp", "cpp", "text") }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("notification blocked beyond request timeout")
+	}
+}
+
 func TestDocumentRequestOpensFileOnceBeforeConcurrentDefinitions(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()

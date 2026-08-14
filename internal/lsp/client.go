@@ -37,7 +37,6 @@ type Client struct {
 	max       int
 	timeout   time.Duration
 	notify    func(string, json.RawMessage)
-	writeMu   sync.Mutex
 	mu        sync.Mutex
 	pending   map[uint64]chan wireMessage
 	done      chan struct{}
@@ -45,8 +44,14 @@ type Client struct {
 	next      atomic.Uint64
 	wg        sync.WaitGroup
 	requests  chan wireMessage
+	writes    chan writeRequest
+	closeOnce sync.Once
 	openMu    sync.Mutex
 	opened    map[string]int
+}
+type writeRequest struct {
+	value any
+	done  chan error
 }
 
 func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Client {
@@ -56,10 +61,11 @@ func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Clien
 	if options.RequestTimeout <= 0 {
 		options.RequestTimeout = 15 * time.Second
 	}
-	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), opened: make(map[string]int)}
-	c.wg.Add(2)
+	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), writes: make(chan writeRequest, 32), opened: make(map[string]int)}
+	c.wg.Add(3)
 	go c.readLoop()
 	go c.requestLoop()
+	go c.writeLoop()
 	return c
 }
 func (c *Client) readLoop() {
@@ -118,6 +124,22 @@ func (c *Client) requestLoop() {
 		}
 	}
 }
+func (c *Client) writeLoop() {
+	defer c.wg.Done()
+	for {
+		select {
+		case request := <-c.writes:
+			err := writeFrame(c.w, request.value)
+			request.done <- err
+			if err != nil {
+				c.terminate()
+				return
+			}
+		case <-c.done:
+			return
+		}
+	}
+}
 func (c *Client) respondServerRequest(m wireMessage) {
 	if m.Method == "workspace/configuration" {
 		var p struct {
@@ -141,16 +163,38 @@ func (c *Client) terminate() {
 		delete(c.pending, id)
 	}
 }
-func (c *Client) send(value any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+func (c *Client) sendContext(ctx context.Context, value any) error {
 	c.mu.Lock()
 	closed := c.closed
 	c.mu.Unlock()
 	if closed {
 		return ErrClosed
 	}
-	return writeFrame(c.w, value)
+	request := writeRequest{value: value, done: make(chan error, 1)}
+	select {
+	case c.writes <- request:
+	case <-ctx.Done():
+		c.closeTransport()
+		c.terminate()
+		return ctx.Err()
+	case <-c.done:
+		return ErrClosed
+	}
+	select {
+	case err := <-request.done:
+		return err
+	case <-ctx.Done():
+		c.closeTransport()
+		c.terminate()
+		return ctx.Err()
+	case <-c.done:
+		return ErrClosed
+	}
+}
+func (c *Client) send(value any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+	return c.sendContext(ctx, value)
 }
 func (c *Client) Notify(method string, params any) error {
 	return c.send(wireMessage{JSONRPC: "2.0", Method: method, Params: mustJSON(params)})
@@ -169,7 +213,7 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 	c.pending[id] = response
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }()
-	if err := c.send(wireMessage{JSONRPC: "2.0", ID: mustJSON(id), Method: method, Params: mustJSON(params)}); err != nil {
+	if err := c.sendContext(ctx, wireMessage{JSONRPC: "2.0", ID: mustJSON(id), Method: method, Params: mustJSON(params)}); err != nil {
 		return err
 	}
 	select {
@@ -208,13 +252,18 @@ func (c *Client) Shutdown(ctx context.Context) error {
 }
 func (c *Client) Close() {
 	c.terminate()
-	if closer, ok := c.rawReader.(io.Closer); ok {
-		_ = closer.Close()
-	}
-	if closer, ok := c.w.(io.Closer); ok {
-		_ = closer.Close()
-	}
+	c.closeTransport()
 	c.wg.Wait()
+}
+func (c *Client) closeTransport() {
+	c.closeOnce.Do(func() {
+		if closer, ok := c.rawReader.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		if closer, ok := c.w.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	})
 }
 
 type Position struct {
