@@ -35,17 +35,25 @@ type riderTarget struct {
 	EnvironmentDefinitions  json.RawMessage        `json:"EnvironmentDefinitions"`
 }
 type riderModule struct {
-	Directory string     `json:"Directory"`
-	Rules     riderRules `json:"Rules"`
+	Directory              string          `json:"Directory"`
+	Rules                  any             `json:"Rules"`
+	GeneratedCodeDirectory string          `json:"GeneratedCodeDirectory"`
+	ToolchainInfo          json.RawMessage `json:"ToolchainInfo"`
+	riderRules
 }
 type riderRules struct {
-	PublicIncludePaths  []string `json:"PublicIncludePaths"`
-	PrivateIncludePaths []string `json:"PrivateIncludePaths"`
-	IncludePaths        []string `json:"IncludePaths"`
-	Definitions         []string `json:"Definitions"`
-	PublicDefinitions   []string `json:"PublicDefinitions"`
-	PrivateDefinitions  []string `json:"PrivateDefinitions"`
-	ForceIncludeFiles   []string `json:"ForceIncludeFiles"`
+	PublicIncludePaths       []string `json:"PublicIncludePaths"`
+	PrivateIncludePaths      []string `json:"PrivateIncludePaths"`
+	IncludePaths             []string `json:"IncludePaths"`
+	Definitions              []string `json:"Definitions"`
+	PublicDefinitions        []string `json:"PublicDefinitions"`
+	PrivateDefinitions       []string `json:"PrivateDefinitions"`
+	ForceIncludeFiles        []string `json:"ForceIncludeFiles"`
+	SystemIncludePaths       []string `json:"SystemIncludePaths"`
+	InternalIncludePaths     []string `json:"InternalIncludePaths"`
+	LegacyPublicIncludePaths []string `json:"LegacyPublicIncludePaths"`
+	ProjectDefinitions       []string `json:"ProjectDefinitions"`
+	ApiDefinitions           []string `json:"ApiDefinitions"`
 }
 
 func RiderMetadataDir(projectRoot string) string {
@@ -128,7 +136,7 @@ func SynthesizeRider(in RiderInput) (RiderResult, error) {
 		if e != nil || (!within(d, project) && !within(d, engine)) {
 			return RiderResult{}, fmt.Errorf("rider module %q escapes project and engine roots", name)
 		}
-		all = append(all, riderResolvedModule{name, d, module.Rules})
+		all = append(all, riderResolvedModule{name, d, module.riderRules})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].dir < all[j].dir })
 	if err := os.MkdirAll(in.StagingDir, 0700); err != nil {

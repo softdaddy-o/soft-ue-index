@@ -91,7 +91,7 @@ func TestSynthesizeRiderPersistsContentAddressedResponsesAndRootEnvironment(t *t
 			t.Fatal(err)
 		}
 	}
-	meta := `{"Name":"MEditor","TargetFile":"` + filepath.ToSlash(filepath.Join(project, "Source", "MEditor.Target.cs")) + `","EnvironmentIncludePaths":{"System":["C:/SDK Includes"]},"EnvironmentDefinitions":["GLOBAL=1"],"Modules":{"M":{"Directory":"` + filepath.ToSlash(filepath.Join(project, "Source", "M")) + `"},"E":{"Directory":"` + filepath.ToSlash(filepath.Join(engine, "Source", "Core")) + `"}}}`
+	meta := `{"Name":"MEditor","TargetFile":"` + filepath.ToSlash(filepath.Join(project, "Source", "MEditor.Target.cs")) + `","EnvironmentIncludePaths":{"System":["C:/SDK Includes"]},"EnvironmentDefinitions":["GLOBAL=1"],"Modules":{"M":{"Directory":"` + filepath.ToSlash(filepath.Join(project, "Source", "M")) + `","Rules":"M.Build.cs","PrivateIncludePaths":["Private"],"ApiDefinitions":["UE_MODULE_NAME=M"],"ForceIncludeFiles":["PCH.h"]},"E":{"Directory":"` + filepath.ToSlash(filepath.Join(engine, "Source", "Core")) + `"}}}`
 	if err := os.WriteFile(filepath.Join(dir, "target.json"), []byte(meta), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestSynthesizeRiderPersistsContentAddressedResponsesAndRootEnvironment(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "GLOBAL=1") || !strings.Contains(string(data), "SDK Includes") {
+	if !strings.Contains(string(data), "GLOBAL=1") || !strings.Contains(string(data), "SDK Includes") || !strings.Contains(string(data), "UE_MODULE_NAME=M") || !strings.Contains(string(data), "/FI") {
 		t.Fatalf("root env absent: %s", data)
 	}
 }
