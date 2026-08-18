@@ -635,3 +635,6 @@ func (*e2eQueries) IncomingCalls(context.Context, registry.Project, lsp.CallHier
 func (*e2eQueries) OutgoingCalls(context.Context, registry.Project, lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error) {
 	return nil, nil
 }
+func (*e2eQueries) IndexState(context.Context, registry.Project) (mcpserver.IndexState, error) {
+	return mcpserver.IndexState{}, nil
+}

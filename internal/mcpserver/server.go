@@ -42,6 +42,17 @@ type Queries interface {
 	PrepareCallHierarchy(context.Context, registry.Project, TextPosition) ([]lsp.CallHierarchyItem, error)
 	IncomingCalls(context.Context, registry.Project, lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error)
 	OutgoingCalls(context.Context, registry.Project, lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error)
+	// IndexState reports the project's clangd session/index readiness without
+	// blocking on or triggering a cold start. It never returns an error in
+	// practice; the signature keeps the door open for a future backend.
+	IndexState(context.Context, registry.Project) (IndexState, error)
+}
+
+// IndexState mirrors lsp.SessionState at the MCP boundary so mcpserver does
+// not need to depend on lsp.Manager directly.
+type IndexState struct {
+	Phase   string
+	Message string
 }
 
 type Dependencies struct {
@@ -99,11 +110,15 @@ func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (Sear
 		return SearchSymbolsResult{}, errors.New("code intelligence is unavailable")
 	}
 	max := s.itemLimit(in.MaxItems)
-	ctx, cancel := context.WithTimeout(ctx, s.limits.Timeout)
+	// search_symbols alone gets a longer budget than other tools: it is the
+	// one operation that depends on clangd's background index, which can
+	// still be building on a cold session. The steady-state per-RPC timeout
+	// (lsp.Client's own 30s) is unaffected, so a warm session is no slower.
+	ctx, cancel := context.WithTimeout(ctx, s.limits.Timeout*indexReadyBudgetMultiplier)
 	defer cancel()
 	items, err := s.queries.Symbols(ctx, p, in.Query, max+1)
 	if err != nil {
-		return SearchSymbolsResult{}, mapError(err)
+		return SearchSymbolsResult{}, err
 	}
 	result := SearchSymbolsResult{Items: items}
 	if len(result.Items) > max {
@@ -186,7 +201,7 @@ func (s *Server) locations(ctx context.Context, kind string, in LocationQueryInp
 	defer cancel()
 	items, err := s.queries.Locations(ctx, p, kind, in.Position, max+1)
 	if err != nil {
-		return LocationsResult{}, mapError(err)
+		return LocationsResult{}, err
 	}
 	r := LocationsResult{Items: items}
 	if len(r.Items) > max {
@@ -223,7 +238,7 @@ func (s *Server) DocumentSymbols(ctx context.Context, in PathQueryInput) (Docume
 	defer cancel()
 	items, err := s.queries.DocumentSymbols(ctx, p, path, max+1)
 	if err != nil {
-		return DocumentSymbolsResult{}, mapError(err)
+		return DocumentSymbolsResult{}, err
 	}
 	r := DocumentSymbolsResult{Items: flattenSymbols(items)}
 	if len(r.Items) > max {
@@ -248,7 +263,7 @@ func (s *Server) Hover(ctx context.Context, in LocationQueryInput) (HoverResult,
 	defer cancel()
 	v, err := s.queries.Hover(ctx, p, in.Position)
 	if err != nil {
-		return HoverResult{}, mapError(err)
+		return HoverResult{}, err
 	}
 	r := HoverResult{Item: v}
 	if v == nil {
@@ -285,7 +300,7 @@ func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (Call
 	defer cancel()
 	roots, err := s.queries.PrepareCallHierarchy(ctx, p, in.Position)
 	if err != nil {
-		return CallHierarchyResult{}, mapError(err)
+		return CallHierarchyResult{}, err
 	}
 	roots, filtered := s.filterCalls(p, roots, false)
 	r := CallHierarchyResult{Truncated: filtered}
@@ -317,7 +332,7 @@ func (s *Server) CallHierarchy(ctx context.Context, in CallHierarchyInput) (Call
 				calls, err = s.queries.OutgoingCalls(ctx, p, from)
 			}
 			if err != nil {
-				return CallHierarchyResult{}, mapError(err)
+				return CallHierarchyResult{}, err
 			}
 			for _, call := range calls {
 				to := call.To
@@ -382,7 +397,7 @@ func (s *Server) ListProjects(ctx context.Context, maxItems int) (ListProjectsRe
 	}
 	r, err := s.projects.Load(ctx)
 	if err != nil {
-		return ListProjectsResult{}, mapError(err)
+		return ListProjectsResult{}, err
 	}
 	max := s.itemLimit(maxItems)
 	out := ListProjectsResult{Items: make([]ProjectSummary, 0, min(max, len(r.Projects)))}
@@ -405,6 +420,11 @@ type ProjectStatusResult struct {
 	EngineVersion   string `json:"engine_version,omitempty"`
 	Ready           bool   `json:"ready"`
 	LastFingerprint string `json:"last_fingerprint,omitempty"`
+	// IndexState is the clangd session/background-index phase: "absent",
+	// "starting", "indexing", "ready", or "degraded". It is independent of
+	// Ready, which only reflects the compilation database on disk.
+	IndexState   string `json:"index_state,omitempty"`
+	IndexMessage string `json:"index_message,omitempty"`
 }
 
 func (s *Server) ProjectStatus(ctx context.Context, in ProjectStatusInput) (ProjectStatusResult, error) {
@@ -412,7 +432,15 @@ func (s *Server) ProjectStatus(ctx context.Context, in ProjectStatusInput) (Proj
 	if err != nil {
 		return ProjectStatusResult{}, err
 	}
-	return bounded(s.outputLimit(), ProjectStatusResult{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Ready(), LastFingerprint: p.Generation.LastFingerprint})
+	result := ProjectStatusResult{ID: p.ID, Name: p.Name, EngineVersion: p.Engine.Version, Ready: p.Ready(), LastFingerprint: p.Generation.LastFingerprint}
+	if s.queries != nil {
+		// Never blocks and never starts a session: IndexState only reads
+		// existing state.
+		if state, err := s.queries.IndexState(ctx, p); err == nil {
+			result.IndexState, result.IndexMessage = state.Phase, state.Message
+		}
+	}
+	return bounded(s.outputLimit(), result)
 }
 
 type ReadSymbolSourceInput struct {
@@ -449,7 +477,7 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	defer cancel()
 	file, err := s.openFile(path)
 	if err != nil {
-		return ReadSymbolSourceResult{}, mapError(err)
+		return ReadSymbolSourceResult{}, err
 	}
 	limit := s.limits.MaxSourceBytes
 	if in.MaxBytes > 0 && in.MaxBytes < limit {
@@ -477,7 +505,7 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	truncated := false
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
-			return ReadSymbolSourceResult{}, mapError(err)
+			return ReadSymbolSourceResult{}, err
 		}
 		line++
 		if line < in.StartLine {
@@ -520,9 +548,9 @@ func (s *Server) ReadSymbolSource(ctx context.Context, in ReadSymbolSourceInput)
 	}
 	if err := scanner.Err(); err != nil {
 		if ctx.Err() != nil {
-			return ReadSymbolSourceResult{}, mapError(ctx.Err())
+			return ReadSymbolSourceResult{}, ctx.Err()
 		}
-		return ReadSymbolSourceResult{}, mapError(err)
+		return ReadSymbolSourceResult{}, err
 	}
 	if line < in.StartLine {
 		return ReadSymbolSourceResult{}, errors.New("start_line is outside the file")
@@ -573,7 +601,7 @@ func (s *Server) project(ctx context.Context, id string) (registry.Project, erro
 	}
 	r, err := s.projects.Load(ctx)
 	if err != nil {
-		return registry.Project{}, mapError(err)
+		return registry.Project{}, err
 	}
 	for _, p := range r.Projects {
 		if p.ID == id {
@@ -592,6 +620,12 @@ func (s *Server) itemLimit(requested int) int {
 func mapError(err error) error {
 	if err == nil {
 		return nil
+	}
+	// Checked before the generic deadline case: WaitForIndexReady wraps
+	// context.DeadlineExceeded in ErrIndexBuilding, and the actionable
+	// "still indexing" message is more useful here than a bare timeout.
+	if errors.Is(err, lsp.ErrIndexBuilding) {
+		return errors.New("code intelligence index is still building for this project; retry shortly")
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("request timed out: %w", err)

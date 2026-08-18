@@ -71,7 +71,9 @@ func admitted[T any](s *Server, run func() (T, error)) (*mcp.CallToolResult, T, 
 // regular, already-sanitized tool error so the SDK does not attach output.
 func (s *Server) toolResult(out any, err error) (*mcp.CallToolResult, error) {
 	if err != nil {
-		return nil, s.compactToolError(mapError(err))
+		// compactToolError applies mapError itself; callers pass the raw error
+		// so the user-facing message is produced exactly once.
+		return nil, s.compactToolError(err)
 	}
 	result := &mcp.CallToolResult{Content: []mcp.Content{}, StructuredContent: out}
 	if s.fitsToolResult(result) {

@@ -106,6 +106,10 @@ type ProjectConfig struct {
 	ID, Clangd, CompilationDatabase, CacheDir, RootURI string
 	Threads                                            int
 	IdleTimeout                                        time.Duration
+	// IndexGraceTimeout overrides how long a session's Client waits, after
+	// telling clangd what to initially index, for a workDoneProgress before
+	// assuming the index was already warm. See ClientOptions.IndexGraceTimeout.
+	IndexGraceTimeout time.Duration
 }
 type Manager struct {
 	factory  ProcessFactory
@@ -126,6 +130,39 @@ type session struct {
 	startErr  error
 	cancel    context.CancelFunc
 	stale     bool
+}
+
+// SessionState describes a project session's clangd process/index readiness
+// without starting one, so callers like project_status can report it
+// instantly instead of blocking on (or triggering) a cold start.
+type SessionState struct {
+	// Phase is one of "absent" (no session has been requested yet),
+	// "starting" (process launching or clangd initializing), "indexing"
+	// (initialized, background index in progress), "ready", or "degraded"
+	// (the last start attempt failed and a restart is backing off).
+	Phase   string
+	Message string
+}
+
+// SessionState reads the current phase of a project's session, if any. It
+// never blocks on session startup and never starts a new session.
+func (m *Manager) SessionState(id string) SessionState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sessions[id]
+	if s == nil {
+		return SessionState{Phase: "absent"}
+	}
+	if s.client != nil {
+		return SessionState{Phase: s.client.IndexPhase(), Message: s.client.IndexMessage()}
+	}
+	if s.starting != nil {
+		return SessionState{Phase: "starting"}
+	}
+	if s.startErr != nil {
+		return SessionState{Phase: "degraded", Message: s.startErr.Error()}
+	}
+	return SessionState{Phase: "absent"}
 }
 
 func NewManager(factory ProcessFactory) *Manager {
@@ -267,7 +304,7 @@ func (m *Manager) startSession(id string, s *session, sessionCtx context.Context
 	}
 	s.process = p
 	m.mu.Unlock()
-	client := NewClient(p.Stdout(), p.Stdin(), ClientOptions{})
+	client := NewClient(p.Stdout(), p.Stdin(), ClientOptions{IndexGraceTimeout: s.config.IndexGraceTimeout})
 	err = client.Initialize(sessionCtx, s.config.RootURI)
 	if err == nil && s.config.CompilationDatabase != "" {
 		var seed indexSeed
@@ -278,6 +315,13 @@ func (m *Manager) startSession(id string, s *session, sessionCtx context.Context
 		} else if errors.Is(err, errNoIndexSeed) {
 			err = nil
 		}
+	}
+	if err == nil {
+		// Arm the grace-timeout fallback only now: clangd has just been
+		// told everything it will initially see (initialize plus any
+		// seed didOpen), so the fallback's clock starts from the moment
+		// indexing could actually begin, not from process startup.
+		client.StartIndexGraceWindow()
 	}
 	_, _ = m.finishStartup(id, s, p, client, err)
 }

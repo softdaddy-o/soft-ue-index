@@ -87,6 +87,8 @@ Malformed or oversized stdio requests are rejected before SDK dispatch and may c
 
 The first query starts clangd lazily and opens one safe project translation unit to trigger background indexing. Project symbols and engine declarations included by that unit become available first. A cold Unreal Engine index can continue filling in the background; later requests and MCP clients reuse the daemon session and persistent shards from the project's per-user cache. Source or build-rule changes update only the affected work instead of rebuilding the entire index from scratch.
 
+`project_status` reports `index_state` (`absent`, `starting`, `indexing`, `ready`, or `degraded`) without starting or blocking on a session, so a client can poll it instead of guessing. `search_symbols` is the one query that depends on the background index: on a cold session it waits for readiness up to a bounded budget (three times the configured request timeout) and, if the index is still building when that budget runs out, returns one actionable "index is still building" error instead of a generic timeout. Every other tool keeps the configured request timeout unchanged.
+
 The daemon reconciles project additions, removals, roots, toolchains, and compilation-database identities from the per-user registry without restarting MCP clients.
 
 The MVP targets source/custom Unreal Engine installations registered in the current user's Unreal Engine Builds registry. Launcher-only binary installations are outside the current indexing scope unless they are source-enabled and registered there.

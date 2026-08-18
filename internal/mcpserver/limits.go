@@ -15,6 +15,13 @@ const (
 	defaultMaxRequestIDBytes  = 128
 	defaultMaxConcurrentTools = 8
 	maxRequestIDTokenBytes    = protocolEnvelopeBytes - 128
+	// indexReadyBudgetMultiplier scales Limits.Timeout into the outer context
+	// budget for search_symbols, the one tool that can block on a cold
+	// clangd background index. It stays proportional to the configured
+	// Timeout (rather than a fixed duration) so a caller who tightens
+	// Timeout for tests or low-latency deployments gets a proportionally
+	// tighter bound here too.
+	indexReadyBudgetMultiplier = 3
 )
 
 // Limits bound every MCP request and response so a malformed client cannot

@@ -18,6 +18,12 @@ import (
 
 var ErrClosed = errors.New("LSP client is closed")
 
+// ErrIndexBuilding is returned when a caller's context expires while
+// WaitForIndexReady is still waiting on clangd's background index. It is
+// deliberately distinct from context.DeadlineExceeded so callers can surface
+// one actionable message instead of a generic timeout.
+var ErrIndexBuilding = errors.New("background index is still building")
+
 type ProtocolError struct {
 	Code    int
 	Message string
@@ -29,6 +35,13 @@ type ClientOptions struct {
 	MaxMessageBytes int
 	RequestTimeout  time.Duration
 	Notification    func(string, json.RawMessage)
+	// IndexGraceTimeout bounds how long the client waits, after startup, for
+	// clangd to announce a workDoneProgress before assuming no background
+	// indexing is needed (an already-warm index, or a server that never
+	// advertises progress). It does not bound an indexing run that has
+	// already announced itself: that phase only ends on its own "end" event
+	// or on the caller's own context.
+	IndexGraceTimeout time.Duration
 }
 type Client struct {
 	r         *bufio.Reader
@@ -48,6 +61,17 @@ type Client struct {
 	closeOnce sync.Once
 	openMu    sync.Mutex
 	opened    map[string]int
+
+	// progressMu guards the background-index readiness state derived from
+	// clangd's window/workDoneProgress requests and $/progress notifications.
+	progressMu   sync.Mutex
+	activeTokens map[string]struct{}
+	indexMessage string
+	indexReady   bool
+	sawProgress  bool
+	readyCh      chan struct{}
+	graceTimeout time.Duration
+	graceTimer   *time.Timer
 }
 type writeRequest struct {
 	value any
@@ -61,7 +85,10 @@ func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Clien
 	if options.RequestTimeout <= 0 {
 		options.RequestTimeout = 30 * time.Second
 	}
-	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), writes: make(chan writeRequest, 32), opened: make(map[string]int)}
+	if options.IndexGraceTimeout <= 0 {
+		options.IndexGraceTimeout = 2 * time.Second
+	}
+	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), writes: make(chan writeRequest, 32), opened: make(map[string]int), activeTokens: make(map[string]struct{}), readyCh: make(chan struct{}), graceTimeout: options.IndexGraceTimeout}
 	c.wg.Add(3)
 	go c.readLoop()
 	go c.requestLoop()
@@ -81,6 +108,10 @@ func (c *Client) readLoop() {
 			continue
 		}
 		if m.Method != "" && len(m.ID) == 0 {
+			if m.Method == "$/progress" {
+				c.handleProgress(m.Params)
+				continue
+			}
 			if c.notify != nil {
 				c.notify(m.Method, m.Params)
 			}
@@ -150,6 +181,12 @@ func (c *Client) respondServerRequest(m wireMessage) {
 		_ = c.send(wireMessage{JSONRPC: "2.0", ID: m.ID, Result: mustJSON(result)})
 		return
 	}
+	if m.Method == "window/workDoneProgress/create" {
+		// Acknowledge unconditionally: the corresponding $/progress
+		// notifications are what drive index-readiness state, not this create.
+		_ = c.send(wireMessage{JSONRPC: "2.0", ID: m.ID, Result: mustJSON(nil)})
+		return
+	}
 	_ = c.send(wireMessage{JSONRPC: "2.0", ID: m.ID, Error: &rpcError{Code: -32601, Message: "Method not found"}})
 }
 func (c *Client) terminate() {
@@ -161,6 +198,9 @@ func (c *Client) terminate() {
 	}
 	for id := range c.pending {
 		delete(c.pending, id)
+	}
+	if c.graceTimer != nil {
+		c.graceTimer.Stop()
 	}
 }
 func (c *Client) sendContext(ctx context.Context, value any) error {
@@ -239,10 +279,136 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 }
 func (c *Client) Initialize(ctx context.Context, rootURI string) error {
 	var r any
-	if err := c.Call(ctx, "initialize", map[string]any{"processId": nil, "rootUri": rootURI, "capabilities": map[string]any{}}, &r); err != nil {
+	// window.workDoneProgress lets clangd report background-index progress via
+	// window/workDoneProgress/create + $/progress, which IndexPhase and
+	// WaitForIndexReady depend on.
+	capabilities := map[string]any{"window": map[string]any{"workDoneProgress": true}}
+	if err := c.Call(ctx, "initialize", map[string]any{"processId": nil, "rootUri": rootURI, "capabilities": capabilities}, &r); err != nil {
 		return err
 	}
 	return c.Notify("initialized", map[string]any{})
+}
+
+// handleProgress updates index-readiness state from a $/progress
+// notification. Any workDoneProgress token is treated as background
+// indexing: clangd does not otherwise use server-initiated workDoneProgress.
+func (c *Client) handleProgress(raw json.RawMessage) {
+	var p struct {
+		Token json.RawMessage `json:"token"`
+		Value struct {
+			Kind    string `json:"kind"`
+			Title   string `json:"title"`
+			Message string `json:"message"`
+		} `json:"value"`
+	}
+	if json.Unmarshal(raw, &p) != nil {
+		return
+	}
+	token := string(p.Token)
+	c.progressMu.Lock()
+	defer c.progressMu.Unlock()
+	c.sawProgress = true
+	switch p.Value.Kind {
+	case "begin":
+		c.activeTokens[token] = struct{}{}
+		c.indexMessage = firstNonEmpty(p.Value.Title, p.Value.Message)
+	case "report":
+		if msg := firstNonEmpty(p.Value.Message, p.Value.Title); msg != "" {
+			c.indexMessage = msg
+		}
+	case "end":
+		delete(c.activeTokens, token)
+		if len(c.activeTokens) == 0 {
+			c.markIndexReadyLocked()
+		}
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// markIndexReadyLocked closes readyCh at most once. Callers must hold progressMu.
+func (c *Client) markIndexReadyLocked() {
+	if !c.indexReady {
+		c.indexReady = true
+		c.indexMessage = ""
+		close(c.readyCh)
+	}
+}
+
+// StartIndexGraceWindow arms the grace-timeout fallback that marks the index
+// ready if clangd never announces a workDoneProgress. Callers must invoke
+// this exactly once, only after telling clangd everything it initially
+// needs to index (after Initialize and any seed DidOpen): arming it any
+// earlier would let the timer expire before indexing was ever triggered,
+// wrongly reporting "ready" on a session that has not started indexing yet.
+// It is a no-op if the index is already known to be ready.
+func (c *Client) StartIndexGraceWindow() {
+	c.progressMu.Lock()
+	defer c.progressMu.Unlock()
+	if c.graceTimer != nil || c.indexReady {
+		return
+	}
+	c.graceTimer = time.AfterFunc(c.graceTimeout, func() {
+		c.progressMu.Lock()
+		if !c.sawProgress && len(c.activeTokens) == 0 {
+			c.markIndexReadyLocked()
+		}
+		c.progressMu.Unlock()
+	})
+}
+
+// IndexPhase reports the client's current view of clangd's background index
+// without blocking: "ready" once indexing has finished (or was never
+// needed), "indexing" while a workDoneProgress is active, and "starting"
+// immediately after startup, before the first progress signal or grace
+// timeout arrives.
+func (c *Client) IndexPhase() string {
+	c.progressMu.Lock()
+	defer c.progressMu.Unlock()
+	switch {
+	case c.indexReady:
+		return "ready"
+	case len(c.activeTokens) > 0:
+		return "indexing"
+	default:
+		return "starting"
+	}
+}
+
+// IndexMessage returns clangd's latest progress title/message while indexing,
+// or "" once ready or before any progress has been observed.
+func (c *Client) IndexMessage() string {
+	c.progressMu.Lock()
+	defer c.progressMu.Unlock()
+	return c.indexMessage
+}
+
+// WaitForIndexReady blocks until the background index is ready (or was never
+// needed) or ctx is done. It never sleeps a fixed duration: readiness is
+// signaled by closing readyCh from handleProgress or the startup grace timer.
+func (c *Client) WaitForIndexReady(ctx context.Context) error {
+	c.progressMu.Lock()
+	ready := c.indexReady
+	ch := c.readyCh
+	c.progressMu.Unlock()
+	if ready {
+		return nil
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", ErrIndexBuilding, ctx.Err())
+	case <-c.done:
+		return ErrClosed
+	}
 }
 func (c *Client) Shutdown(ctx context.Context) error {
 	var r any
