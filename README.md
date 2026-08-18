@@ -44,7 +44,7 @@ soft-ue-index status mygame --json
 
 Projects are registered in a per-user registry. The default Windows location is `%AppData%/soft-ue-index/registry.json`; generated databases and private generation logs are in `%LocalAppData%/soft-ue-index/projects/`. Paths are canonicalized, so adding the same project through a different case or junction does not create a duplicate registration.
 
-Multiple Unreal projects can share this registry. Each project receives its own compilation database, clangd process, cache, and watch state.
+Multiple Unreal projects can share this registry. Each project receives its own compilation database, lazy clangd session, and cache. One per-user daemon shares the bounded watcher and query service across every MCP client.
 
 ## Watch behavior
 
@@ -52,13 +52,21 @@ Multiple Unreal projects can share this registry. Each project receives its own 
 soft-ue-index watch
 ```
 
-`watch` supervises every registered project. Source-file writes are passed to the existing clangd process so its background index can update without regenerating the database. Creates, deletes, renames, and changes to `.Build.cs`, `.Target.cs`, `.uproject`, or `.uplugin` debounce into one database regeneration per project. Projects can regenerate concurrently, while repeated changes to the same project are serialized and get one follow-up run.
+`watch` remains a foreground compatibility command and uses the same singleton ownership as the daemon, so the two cannot run together. Windows uses one recursive registration for each existing `Source`, `Plugins`, and `Config` root plus cheap project/engine control roots; nested directories do not allocate individual 64 KiB watch buffers. Source-file writes are passed to an existing clangd process without regenerating the database. Creates, deletes, renames, and changes to `.Build.cs`, `.Target.cs`, `.uproject`, or `.uplugin` debounce into one database regeneration per project.
 
 Run `generate <project>` after changing compilation-relevant settings when `watch` is not running.
 
 ## MCP setup
 
-Start the server with `soft-ue-index mcp`. It uses stdio only: stdout is reserved for JSON-RPC and diagnostics go to stderr.
+Start a client connection with `soft-ue-index mcp`. The command is a small bounded stdio proxy: stdout is reserved for JSON-RPC, and it starts or connects to one current-user-only named-pipe daemon. The daemon owns all filesystem watches and at most one lazy clangd session per active project, regardless of the number of MCP clients.
+
+Daemon controls are available for diagnostics and upgrades:
+
+```powershell
+soft-ue-index daemon status --json
+soft-ue-index daemon stop
+soft-ue-index daemon run
+```
 
 Example client configuration:
 
@@ -77,9 +85,9 @@ The server provides `list_projects`, `project_status`, `search_symbols`, `find_d
 
 Malformed or oversized stdio requests are rejected before SDK dispatch and may close the MCP stream without a response. Restart the client connection after such a fail-closed rejection.
 
-The first query starts clangd lazily and opens one safe project translation unit to trigger background indexing. Project symbols and engine declarations included by that unit become available first. A cold Unreal Engine index can continue filling in the background; later sessions reuse persistent shards from the project's per-user cache. Source or build-rule changes handled by `watch` update only the affected work instead of rebuilding the entire index from scratch.
+The first query starts clangd lazily and opens one safe project translation unit to trigger background indexing. Project symbols and engine declarations included by that unit become available first. A cold Unreal Engine index can continue filling in the background; later requests and MCP clients reuse the daemon session and persistent shards from the project's per-user cache. Source or build-rule changes update only the affected work instead of rebuilding the entire index from scratch.
 
-Restart the MCP server after adding or removing registered projects so its project watcher set is refreshed.
+The daemon reconciles project additions, removals, roots, toolchains, and compilation-database identities from the per-user registry without restarting MCP clients.
 
 The MVP targets source/custom Unreal Engine installations registered in the current user's Unreal Engine Builds registry. Launcher-only binary installations are outside the current indexing scope unless they are source-enabled and registered there.
 
@@ -103,7 +111,7 @@ The repository includes a non-destructive PowerShell check. It calls `doctor`, r
 
 ## Privacy and removal
 
-All registry data, compilation databases, caches, and generation logs remain local to the current user. The MCP server is read-only and has no network listener. To unregister a project, run `soft-ue-index remove <project>`. To remove all local data, close `watch` and `mcp`, then delete the two per-user `soft-ue-index` directories described above.
+All registry data, compilation databases, caches, and generation logs remain local to the current user. The MCP proxy and daemon are read-only and have no TCP listener; the named pipe ACL grants access only to the current user and LocalSystem. To unregister a project, run `soft-ue-index remove <project>`. Before removing all local data, run `soft-ue-index daemon stop` and close any foreground `watch`, then delete the two per-user `soft-ue-index` directories described above.
 
 ## License
 

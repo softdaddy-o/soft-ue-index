@@ -35,3 +35,23 @@ func AcquireFileLock(ctx context.Context, path string) (func(), error) {
 		}
 	}
 }
+
+// TryAcquireFileLock attempts to own path without waiting. A contended lock is
+// reported through acquired=false rather than as an error.
+func TryAcquireFileLock(path string) (release func(), acquired bool, err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, false, err
+	}
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, false, fmt.Errorf("open lock: %w", err)
+	}
+	if err := lockFile(file); err != nil {
+		_ = file.Close()
+		if err == errLockContended {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("acquire lock: %w", err)
+	}
+	return func() { _ = unlockFile(file); _ = file.Close() }, true, nil
+}

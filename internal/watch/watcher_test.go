@@ -3,6 +3,7 @@ package watch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,14 +16,26 @@ type watcherNoopGenerator struct{}
 
 func (watcherNoopGenerator) Generate(context.Context, string) error { return nil }
 
+type fakeRootBackend struct {
+	events chan fsnotify.Event
+	errors chan error
+}
+
+func newFakeRootBackend() *fakeRootBackend {
+	return &fakeRootBackend{events: make(chan fsnotify.Event), errors: make(chan error)}
+}
+func (b *fakeRootBackend) Add(WatchSpec) error           { return nil }
+func (b *fakeRootBackend) Remove(string) error           { return nil }
+func (b *fakeRootBackend) Events() <-chan fsnotify.Event { return b.events }
+func (b *fakeRootBackend) Errors() <-chan error          { return b.errors }
+func (b *fakeRootBackend) Close() error                  { return nil }
+
 func TestNativeWatcherErrorIsSurfaced(t *testing.T) {
-	w, err := NewWatcher(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	backend := newFakeRootBackend()
+	w := newWatcherWithBackend(nil, WatcherOptions{}, backend)
 	defer w.Close()
 	want := errors.New("watch buffer overflow")
-	w.native.Errors <- want
+	backend.errors <- want
 	select {
 	case got := <-w.Errors():
 		if !errors.Is(got, want) {
@@ -35,16 +48,16 @@ func TestNativeWatcherErrorIsSurfaced(t *testing.T) {
 
 func TestCreatedDirectoryAttachmentFailureIsSurfaced(t *testing.T) {
 	root := t.TempDir()
-	created := filepath.Join(root, "Source", "NewModule")
-	if err := os.MkdirAll(created, 0o755); err != nil {
-		t.Fatal(err)
-	}
 	w, err := NewWatcher(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
 	if err := w.AddProject(ProjectRoots{ID: "game", ProjectRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	created := filepath.Join(root, "Source")
+	if err := os.MkdirAll(created, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	want := errors.New("attach failed")
@@ -76,6 +89,43 @@ func TestAddProjectPreservesEmptyEngineRoot(t *testing.T) {
 	defer w.mu.RUnlock()
 	if got := w.projects[0].EngineRoot; got != "" {
 		t.Fatalf("EngineRoot=%q, want empty", got)
+	}
+}
+
+func TestWatcherRegistrationCountDoesNotGrowWithNestedDirectories(t *testing.T) {
+	project, install := t.TempDir(), t.TempDir()
+	for _, root := range []string{
+		filepath.Join(project, "Source"),
+		filepath.Join(project, "Plugins"),
+		filepath.Join(project, "Config"),
+		filepath.Join(install, "Engine", "Source"),
+		filepath.Join(install, "Engine", "Plugins"),
+		filepath.Join(install, "Engine", "Config"),
+	} {
+		for i := range 32 {
+			path := filepath.Join(root, fmt.Sprintf("Module%02d", i), "Public", "Nested")
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	w, err := NewWatcher(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.AddProject(ProjectRoots{ID: "game", ProjectRoot: project, EngineRoot: install}); err != nil {
+		t.Fatal(err)
+	}
+
+	registrations := 0
+	w.dirs.Range(func(_, _ any) bool {
+		registrations++
+		return true
+	})
+	if registrations > 8 {
+		t.Fatalf("watch registrations=%d, want at most 8 regardless of nested directory count", registrations)
 	}
 }
 
@@ -209,8 +259,8 @@ func TestUnrealInstallEngineTreesAreWatchedAndClassified(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.handleEvent(fsnotify.Event{Name: newDir, Op: fsnotify.Create})
-	if _, ok := w.dirs.Load(filepath.Clean(newDir)); !ok {
-		t.Fatal("new engine source directory was not attached")
+	if _, ok := w.dirs.Load(filepath.Clean(newDir)); ok {
+		t.Fatal("nested engine directory added a redundant watch registration")
 	}
 	select {
 	case <-results:
@@ -219,7 +269,7 @@ func TestUnrealInstallEngineTreesAreWatchedAndClassified(t *testing.T) {
 	}
 }
 
-func TestCreatedOrMovedInRelevantDirectoryAttachesAndInvalidates(t *testing.T) {
+func TestCreatedOrMovedInRelevantDirectoryInvalidatesWithoutExtraRegistration(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "Source", "Populated")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -248,8 +298,8 @@ func TestCreatedOrMovedInRelevantDirectoryAttachesAndInvalidates(t *testing.T) {
 			t.Fatalf("%v directory did not invalidate", op)
 		}
 	}
-	if _, watched := w.dirs.Load(filepath.Clean(dir)); !watched {
-		t.Fatalf("%q was not watched", dir)
+	if _, watched := w.dirs.Load(filepath.Clean(dir)); watched {
+		t.Fatalf("%q added a redundant watch registration", dir)
 	}
 }
 
@@ -295,8 +345,11 @@ func TestRemovedOrRenamedOutRelevantDirectoryInvalidatesAndCleansWatch(t *testin
 					t.Fatal(err)
 				}
 				w.handleEvent(fsnotify.Event{Name: removed, Op: fsnotify.Create})
-				if _, ok := w.dirs.Load(filepath.Clean(removed)); !ok {
-					t.Fatal("replacement directory was not watched")
+				if _, ok := w.dirs.Load(filepath.Clean(removed)); ok {
+					t.Fatal("replacement directory added a redundant watch")
+				}
+				if _, ok := w.dirs.Load(filepath.Clean(filepath.Join(root, kind))); !ok {
+					t.Fatal("recursive relevant root watch was lost")
 				}
 				select {
 				case <-results:

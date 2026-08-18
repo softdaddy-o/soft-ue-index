@@ -100,9 +100,13 @@ func (s *Server) compactToolError(err error) error {
 // RunStdio serves MCP only through stdin/stdout. Callers must send diagnostics
 // elsewhere; this package never writes logs or status messages to stdout.
 func (s *Server) RunStdio(ctx context.Context, version string) error {
-	// Tool argument types are checked before SDK dispatch. Independently fail
-	// closed if any SDK response still exceeds the configured wire cap.
-	reader := newBoundedJSONReader(os.Stdin, s.limits.MaxRequestBytes, s.limits.MaxRequestIDBytes)
-	writer := newBoundedJSONWriter(os.Stdout, s.limits.MaxResponseBytes)
-	return s.MCPServer(version).Run(ctx, &mcp.IOTransport{Reader: io.NopCloser(reader), Writer: writer})
+	return s.RunIO(ctx, version, os.Stdin, os.Stdout)
+}
+
+// RunIO serves MCP over a bounded JSON-RPC frame transport on the provided streams.
+// Readers and writers are wrapped before the SDK sees any frame data.
+func (s *Server) RunIO(ctx context.Context, version string, reader io.Reader, writer io.Writer) error {
+	boundedReader := newBoundedJSONReader(reader, s.limits.MaxRequestBytes, s.limits.MaxRequestIDBytes)
+	boundedWriter := newBoundedJSONWriter(writer, s.limits.MaxResponseBytes)
+	return s.MCPServer(version).Run(ctx, &mcp.IOTransport{Reader: io.NopCloser(boundedReader), Writer: boundedWriter})
 }

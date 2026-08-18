@@ -1,8 +1,8 @@
 package watch
 
 import (
+	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,7 +22,7 @@ type WatcherOptions struct{ SourceWrite func(SourceWrite) }
 
 // Watcher owns one fsnotify watcher and translates events into coordinated invalidations.
 type Watcher struct {
-	native        *fsnotify.Watcher
+	native        rootBackend
 	coordinator   *Coordinator
 	onSourceWrite func(SourceWrite)
 	attachTree    func(string) error
@@ -30,6 +30,9 @@ type Watcher struct {
 	done          chan struct{}
 	errors        chan error
 	once          sync.Once
+	loopWG        sync.WaitGroup
+	lifecycleMu   sync.Mutex
+	closed        bool
 	failOnce      sync.Once
 	mu            sync.RWMutex
 	projects      []ProjectRoots
@@ -40,17 +43,27 @@ func NewWatcher(coordinator *Coordinator) (*Watcher, error) {
 }
 
 func NewWatcherWithOptions(coordinator *Coordinator, options WatcherOptions) (*Watcher, error) {
-	n, err := fsnotify.NewWatcher()
+	n, err := newRootBackend()
 	if err != nil {
 		return nil, err
 	}
-	w := &Watcher{native: n, coordinator: coordinator, onSourceWrite: options.SourceWrite, done: make(chan struct{}), errors: make(chan error, 1)}
+	return newWatcherWithBackend(coordinator, options, n), nil
+}
+
+func newWatcherWithBackend(coordinator *Coordinator, options WatcherOptions, backend rootBackend) *Watcher {
+	w := &Watcher{native: backend, coordinator: coordinator, onSourceWrite: options.SourceWrite, done: make(chan struct{}), errors: make(chan error, 1)}
 	w.attachTree = w.addTree
+	w.loopWG.Add(1)
 	go w.loop()
-	return w, nil
+	return w
 }
 
 func (w *Watcher) AddProject(project ProjectRoots) error {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	if w.closed {
+		return errors.New("watcher is closed")
+	}
 	if project.ID == "" || project.ProjectRoot == "" {
 		return fmt.Errorf("project ID and root are required")
 	}
@@ -64,13 +77,16 @@ func (w *Watcher) AddProject(project ProjectRoots) error {
 		}
 		project.EngineRoot = filepath.Join(project.EngineRoot, "Engine")
 	}
-	if err := w.addDir(project.ProjectRoot); err != nil {
+	if err := w.addRoot(WatchSpec{Root: project.ProjectRoot}); err != nil {
 		return err
 	}
 	if err := w.addRelevantTrees(project.ProjectRoot); err != nil {
 		return err
 	}
 	if project.EngineRoot != "" {
+		if err := w.addRoot(WatchSpec{Root: project.EngineRoot}); err != nil {
+			return err
+		}
 		if err := w.addRelevantTrees(project.EngineRoot); err != nil {
 			return err
 		}
@@ -94,7 +110,7 @@ func (w *Watcher) addRelevantTrees(root string) error {
 	for _, name := range []string{"Source", "Plugins", "Config"} {
 		path := filepath.Join(root, name)
 		if _, err := os.Stat(path); err == nil {
-			if err := w.addTree(path); err != nil {
+			if err := w.addRoot(WatchSpec{Root: path, Recursive: true}); err != nil {
 				return err
 			}
 		} else if !os.IsNotExist(err) {
@@ -104,44 +120,35 @@ func (w *Watcher) addRelevantTrees(root string) error {
 	return nil
 }
 func (w *Watcher) addTree(root string) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		if path != root && IgnoredDirectory(path) {
-			return filepath.SkipDir
-		}
-		return w.addDir(path)
-	})
+	return w.addRoot(WatchSpec{Root: root, Recursive: true})
 }
-func (w *Watcher) addDir(path string) error {
-	path = filepath.Clean(path)
+func (w *Watcher) addRoot(spec WatchSpec) error {
+	path := filepath.Clean(spec.Root)
 	if IgnoredDirectory(path) {
 		return nil
 	}
 	if _, loaded := w.dirs.LoadOrStore(path, struct{}{}); loaded {
 		return nil
 	}
-	if err := w.native.Add(path); err != nil {
+	spec.Root = path
+	if err := w.native.Add(spec); err != nil {
 		w.dirs.Delete(path)
 		return err
 	}
 	return nil
 }
 func (w *Watcher) loop() {
+	defer w.loopWG.Done()
 	for {
 		select {
 		case <-w.done:
 			return
-		case event, ok := <-w.native.Events:
+		case event, ok := <-w.native.Events():
 			if !ok {
 				return
 			}
 			w.handleEvent(event)
-		case err, ok := <-w.native.Errors:
+		case err, ok := <-w.native.Errors():
 			if !ok {
 				return
 			}
@@ -157,9 +164,11 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	ids := w.projectsFor(event.Name)
 	if event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
 		if info, err := os.Stat(event.Name); err == nil && info.IsDir() && w.isRelevantDirectory(event.Name) {
-			if err := w.attachTree(event.Name); err != nil {
-				w.fail(err)
-				return
+			if w.isRelevantRootDirectory(event.Name) {
+				if err := w.attachTree(event.Name); err != nil {
+					w.fail(err)
+					return
+				}
 			}
 			if w.coordinator != nil {
 				for _, id := range ids {
@@ -168,15 +177,6 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 			}
 			return
 		}
-	}
-	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && w.isWatchedDirectory(event.Name) {
-		w.removeTree(event.Name)
-		if w.isRelevantDirectory(event.Name) && w.coordinator != nil {
-			for _, id := range ids {
-				w.coordinator.Invalidate(id)
-			}
-		}
-		return
 	}
 	if isSourceFile(filepath.Base(event.Name)) && event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 && w.onSourceWrite != nil {
 		removed := false
@@ -197,6 +197,17 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	if RequiresCompDB(event.Name, event.Op) && w.coordinator != nil {
 		for _, id := range ids {
 			w.coordinator.Invalidate(id)
+		}
+		return
+	}
+	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && w.isRelevantDirectory(event.Name) {
+		if w.isWatchedDirectory(event.Name) {
+			w.removeTree(event.Name)
+		}
+		if w.coordinator != nil {
+			for _, id := range ids {
+				w.coordinator.Invalidate(id)
+			}
 		}
 		return
 	}
@@ -245,6 +256,25 @@ func (w *Watcher) isRelevantDirectory(path string) bool {
 	}
 	return false
 }
+
+func (w *Watcher) isRelevantRootDirectory(path string) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	path = filepath.Clean(path)
+	for _, p := range w.projects {
+		for _, root := range []string{p.ProjectRoot, p.EngineRoot} {
+			if root == "" {
+				continue
+			}
+			for _, name := range []string{"Source", "Plugins", "Config"} {
+				if strings.EqualFold(path, filepath.Join(root, name)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
 func (w *Watcher) projectsFor(path string) []string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -265,6 +295,13 @@ func contains(root, path string) bool {
 }
 func (w *Watcher) Close() error {
 	var err error
-	w.once.Do(func() { close(w.done); err = w.native.Close() })
+	w.once.Do(func() {
+		w.lifecycleMu.Lock()
+		w.closed = true
+		close(w.done)
+		w.lifecycleMu.Unlock()
+		w.loopWG.Wait()
+		err = w.native.Close()
+	})
 	return err
 }

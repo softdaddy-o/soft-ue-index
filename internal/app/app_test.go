@@ -84,6 +84,36 @@ func TestStableIDAvoidsPortableCaseCollision(t *testing.T) {
 	}
 }
 
+func TestWatchRejectsSecondOwner(t *testing.T) {
+	store, err := registry.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(t.TempDir(), "watch.lock")
+	started := make(chan struct{})
+	releaseWatch := make(chan struct{})
+	first := New(Dependencies{Store: store, WatchLockPath: lockPath, Watch: func(context.Context, []registry.Project) error {
+		close(started)
+		<-releaseWatch
+		return nil
+	}})
+	done := make(chan error, 1)
+	go func() { done <- first.Run(context.Background(), cli.Command{Name: "watch"}) }()
+	<-started
+
+	second := New(Dependencies{Store: store, WatchLockPath: lockPath, Watch: func(context.Context, []registry.Project) error {
+		t.Fatal("second watcher started")
+		return nil
+	}})
+	if err := second.Run(context.Background(), cli.Command{Name: "watch"}); err == nil || err.Error() != "watch already running" {
+		t.Fatalf("second watch error=%v", err)
+	}
+	close(releaseWatch)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDoctorDefaultReturnsStructuredChecks(t *testing.T) {
 	store, err := registry.NewStore(t.TempDir())
 	if err != nil {
@@ -475,8 +505,10 @@ func TestEndToEndTwoProjectsShareEngine(t *testing.T) {
 func TestWatchRealKeepsHealthyProjectWhenAnotherCannotBeWatched(t *testing.T) {
 	root := t.TempDir()
 	healthy := filepath.Join(root, "healthy")
-	if err := os.MkdirAll(filepath.Join(healthy, "Source"), 0o700); err != nil {
-		t.Fatal(err)
+	for _, path := range []string{filepath.Join(healthy, "Source"), filepath.Join(healthy, "Engine", "Source")} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var stderr bytes.Buffer
 	a := New(Dependencies{ErrorOutput: &stderr, Generate: func(context.Context, registry.Project) (registry.Project, error) {

@@ -33,3 +33,21 @@ func TestAcquireFileLockSerializesIndependentCallers(t *testing.T) {
 		t.Fatal("second caller never acquired lock")
 	}
 }
+
+func TestTryAcquireFileLockReturnsImmediatelyWhenOwned(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "watch.lock")
+	release, acquired, err := TryAcquireFileLock(path)
+	if err != nil || !acquired {
+		t.Fatalf("first acquisition: acquired=%t err=%v", acquired, err)
+	}
+	defer release()
+
+	started := time.Now()
+	secondRelease, secondAcquired, err := TryAcquireFileLock(path)
+	if err != nil || secondAcquired || secondRelease != nil {
+		t.Fatalf("second acquisition: release=%v acquired=%t err=%v", secondRelease != nil, secondAcquired, err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("nonblocking acquisition took %v", elapsed)
+	}
+}

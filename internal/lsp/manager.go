@@ -124,6 +124,7 @@ type session struct {
 	starting  chan struct{}
 	startErr  error
 	cancel    context.CancelFunc
+	stale     bool
 }
 
 func NewManager(factory ProcessFactory) *Manager {
@@ -154,6 +155,16 @@ func (m *Manager) Client(ctx context.Context, cfg ProjectConfig) (*Client, error
 			return nil, ErrClosed
 		}
 		s := m.sessions[cfg.ID]
+		if s != nil && (s.stale || s.config != cfg) {
+			s.stale = true
+			if s.refs != 0 {
+				m.mu.Unlock()
+				return nil, errors.New("project configuration changed; retry request")
+			}
+			m.retireLocked(cfg.ID, s)
+			m.mu.Unlock()
+			continue
+		}
 		if s != nil && s.client != nil {
 			if s.timer != nil {
 				s.timer.Stop()
@@ -488,8 +499,45 @@ func (m *Manager) Release(id string) {
 	}
 	s.refs--
 	if s.refs == 0 {
+		if s.stale {
+			m.retireLocked(id, s)
+			return
+		}
 		m.scheduleIdleLocked(id, s)
 	}
+}
+
+// Invalidate retires a project session once active requests release it.
+func (m *Manager) Invalidate(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sessions[id]
+	if s == nil {
+		return
+	}
+	s.stale = true
+	if s.refs == 0 {
+		m.retireLocked(id, s)
+	}
+}
+
+func (m *Manager) retireLocked(id string, s *session) {
+	if m.sessions[id] != s {
+		return
+	}
+	if s.timer != nil {
+		s.timer.Stop()
+	}
+	if s.client != nil {
+		s.client.Close()
+	}
+	if s.process != nil {
+		_ = s.process.Kill()
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	delete(m.sessions, id)
 }
 
 // SourceFileChanged forwards an ordinary source write to an existing project

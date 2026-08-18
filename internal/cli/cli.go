@@ -11,11 +11,13 @@ var ErrUsage = errors.New("usage error")
 
 // Command is a parsed soft-ue-index command.
 type Command struct {
-	Name        string
-	ProjectPath string
-	ProjectName string
-	JSON        bool
-	EngineScope string
+	Name         string
+	ProjectPath  string
+	ProjectName  string
+	JSON         bool
+	EngineScope  string
+	DaemonAction string
+	Child        bool
 }
 
 // Parse converts command-line arguments into a Command.
@@ -25,6 +27,10 @@ func Parse(args []string) (Command, error) {
 	for _, arg := range args {
 		if arg == "--json" {
 			command.JSON = true
+			continue
+		}
+		if arg == "--child" {
+			command.Child = true
 			continue
 		}
 		if arg == "--engine-scope" || arg == "--engine-scope=project" {
@@ -58,11 +64,19 @@ func Parse(args []string) (Command, error) {
 			return Command{}, usageError("%s requires a project name", command.Name)
 		}
 		command.ProjectName = positionals[1]
+	case "daemon":
+		if len(positionals) != 2 || (positionals[1] != "run" && positionals[1] != "status" && positionals[1] != "stop") {
+			return Command{}, usageError("daemon requires run, status, or stop")
+		}
+		command.DaemonAction = positionals[1]
 	default:
 		return Command{}, usageError("unknown command %q", command.Name)
 	}
 	if command.EngineScope != "" && command.Name != "generate" {
 		return Command{}, usageError("--engine-scope only applies to generate")
+	}
+	if command.Child && (command.Name != "daemon" || command.DaemonAction != "run") {
+		return Command{}, usageError("--child only applies to daemon run")
 	}
 
 	return command, nil

@@ -36,3 +36,25 @@ func TestParseGenerateEngineScope(t *testing.T) {
 		t.Fatalf("scope=%q", command.EngineScope)
 	}
 }
+
+func TestParseDaemonCommands(t *testing.T) {
+	for _, action := range []string{"run", "status", "stop"} {
+		command, err := Parse([]string{"daemon", action})
+		if err != nil {
+			t.Fatalf("daemon %s: %v", action, err)
+		}
+		if command.Name != "daemon" || command.DaemonAction != action {
+			t.Fatalf("daemon %s parsed as %+v", action, command)
+		}
+	}
+	command, err := Parse([]string{"daemon", "run", "--child"})
+	if err != nil || !command.Child {
+		t.Fatalf("daemon child parsed as %+v, %v", command, err)
+	}
+}
+
+func TestParseRejectsInvalidDaemonCommand(t *testing.T) {
+	if _, err := Parse([]string{"daemon", "restart"}); !errors.Is(err, ErrUsage) {
+		t.Fatalf("invalid daemon error=%v", err)
+	}
+}

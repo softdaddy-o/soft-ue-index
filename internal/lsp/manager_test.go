@@ -138,6 +138,34 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	}
 }
 
+func TestManagerRetiresStaleProjectConfigurationBeforeRestart(t *testing.T) {
+	f := &fakeFactory{}
+	m := NewManager(f)
+	defer m.Close()
+	first := ProjectConfig{ID: "game", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///old"}
+	if _, err := m.Client(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	m.Invalidate("game")
+	changed := first
+	changed.CacheDir = t.TempDir()
+	changed.RootURI = "file:///new"
+	if _, err := m.Client(context.Background(), changed); err == nil {
+		t.Fatal("changed configuration bypassed active stale session")
+	}
+	m.Release("game")
+	if _, err := m.Client(context.Background(), changed); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	starts := f.n
+	f.mu.Unlock()
+	if starts != 2 {
+		t.Fatalf("clangd starts=%d, want 2", starts)
+	}
+	m.Release("game")
+}
+
 func TestManagerWaitsForProcessExactlyOnceOnClose(t *testing.T) {
 	f := &fakeFactory{}
 	m := NewManager(f)
@@ -641,9 +669,10 @@ func TestFirstCallerCancellationDoesNotOwnSharedStartup(t *testing.T) {
 	f := &gatedInitializeFactory{started: make(chan struct{}), respond: make(chan struct{})}
 	m := NewManager(f)
 	defer m.Close()
+	cacheDir := t.TempDir()
 	canceled, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	_, err := m.Client(canceled, ProjectConfig{ID: "gated", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"})
+	_, err := m.Client(canceled, ProjectConfig{ID: "gated", Clangd: "fake", CacheDir: cacheDir, RootURI: "file:///x"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v", err)
 	}
@@ -662,7 +691,7 @@ func TestFirstCallerCancellationDoesNotOwnSharedStartup(t *testing.T) {
 	}
 	result := make(chan error, 1)
 	go func() {
-		_, err := m.Client(context.Background(), ProjectConfig{ID: "gated", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x"})
+		_, err := m.Client(context.Background(), ProjectConfig{ID: "gated", Clangd: "fake", CacheDir: cacheDir, RootURI: "file:///x"})
 		result <- err
 	}()
 	close(f.respond)
@@ -708,13 +737,14 @@ func TestCanceledStartupSchedulesIdleShutdownAndClaimCancelsIt(t *testing.T) {
 		f := &gatedInitializeFactory{started: make(chan struct{}), respond: make(chan struct{})}
 		m := newManager(f)
 		defer m.Close()
+		cacheDir := t.TempDir()
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 		defer cancel()
-		_, _ = m.Client(ctx, ProjectConfig{ID: "claim", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x", IdleTimeout: 80 * time.Millisecond})
+		_, _ = m.Client(ctx, ProjectConfig{ID: "claim", Clangd: "fake", CacheDir: cacheDir, RootURI: "file:///x", IdleTimeout: 80 * time.Millisecond})
 		<-f.started
 		result := make(chan error, 1)
 		go func() {
-			_, err := m.Client(context.Background(), ProjectConfig{ID: "claim", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///x", IdleTimeout: 80 * time.Millisecond})
+			_, err := m.Client(context.Background(), ProjectConfig{ID: "claim", Clangd: "fake", CacheDir: cacheDir, RootURI: "file:///x", IdleTimeout: 80 * time.Millisecond})
 			result <- err
 		}()
 		close(f.respond)

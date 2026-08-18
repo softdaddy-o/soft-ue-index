@@ -20,6 +20,7 @@ import (
 
 	"github.com/softdaddy-o/soft-ue-index/internal/cli"
 	"github.com/softdaddy-o/soft-ue-index/internal/compdb"
+	"github.com/softdaddy-o/soft-ue-index/internal/daemon"
 	"github.com/softdaddy-o/soft-ue-index/internal/diagnostics"
 	"github.com/softdaddy-o/soft-ue-index/internal/lsp"
 	"github.com/softdaddy-o/soft-ue-index/internal/mcpserver"
@@ -45,6 +46,7 @@ type Dependencies struct {
 	Doctor         func(context.Context, *registry.Store) (any, error)
 	Watch          func(context.Context, []registry.Project) error
 	MCP            func(context.Context, *registry.Store) error
+	WatchLockPath  string
 	// Environment, Files, and Runner keep doctor discovery independently testable.
 	Environment toolchain.Environment
 	Files       toolchain.FileSystem
@@ -115,6 +117,8 @@ func (a *App) Run(ctx context.Context, command cli.Command) error {
 		return a.watch(ctx)
 	case "mcp":
 		return a.mcp(ctx)
+	case "daemon":
+		return a.daemon(ctx, command)
 	default:
 		return fmt.Errorf("unknown command %q", command.Name)
 	}
@@ -294,6 +298,26 @@ func (a *App) doctor(ctx context.Context, asJSON bool) error {
 	return nil
 }
 func (a *App) watch(ctx context.Context) error {
+	lockPath := a.d.WatchLockPath
+	var release func()
+	if lockPath == "" {
+		var err error
+		release, err = daemon.AcquireLifetimeLock()
+		if err != nil {
+			return errors.New("watch already running")
+		}
+	} else {
+		var acquired bool
+		var err error
+		release, acquired, err = registry.TryAcquireFileLock(lockPath)
+		if err != nil {
+			return fmt.Errorf("acquire watch ownership: %w", err)
+		}
+		if !acquired {
+			return errors.New("watch already running")
+		}
+	}
+	defer release()
 	r, e := a.load(ctx)
 	if e != nil {
 		return e
@@ -304,30 +328,187 @@ func (a *App) mcp(ctx context.Context) error {
 	if a.d.MCP != nil {
 		return a.d.MCP(ctx, a.d.Store)
 	}
-	r, err := a.load(ctx)
+	executable, err := os.Executable()
 	if err != nil {
 		return err
 	}
+	if err := daemon.EnsureRunning(ctx, daemon.RunConfig{Start: func(context.Context) error {
+		return daemon.StartDetached(executable, "daemon", "run", "--child")
+	}}); err != nil {
+		return err
+	}
+	pipe, err := daemon.DefaultPipePath()
+	if err != nil {
+		return err
+	}
+	conn, err := daemon.NewClient(pipe).MCP(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return mcpserver.ProxyFrames(ctx, os.Stdin, conn, conn, os.Stdout, mcpserver.FrameProxyCaps{})
+}
+
+func (a *App) daemon(ctx context.Context, command cli.Command) error {
+	pipe, err := daemon.DefaultPipePath()
+	if err != nil {
+		return err
+	}
+	client := daemon.NewClient(pipe)
+	switch command.DaemonAction {
+	case "status":
+		status, err := client.Status(ctx)
+		if err != nil {
+			return err
+		}
+		if command.JSON {
+			return a.writeJSON(map[string]string{"status": status})
+		}
+		_, err = fmt.Fprintln(a.d.Output, status)
+		return err
+	case "stop":
+		if err := client.Stop(ctx); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintln(a.d.Output, "stopped")
+		return err
+	case "run":
+		return a.runDaemon(ctx)
+	default:
+		return errors.New("missing daemon action")
+	}
+}
+
+func (a *App) runDaemon(ctx context.Context) error {
+	releaseOwnership, err := daemon.AcquireLifetimeLock()
+	if err != nil {
+		return err
+	}
+	defer releaseOwnership()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	manager := lsp.NewManager(nil)
 	defer manager.Close()
-	serveCtx, stop := context.WithCancel(ctx)
 	watchDone := make(chan error, 1)
 	go func() {
-		err := a.watchRealWithSink(serveCtx, r.Projects, manager)
-		if err != nil && serveCtx.Err() == nil {
-			a.reportWatchError(err)
-			stop()
-		}
-		watchDone <- err
+		watchDone <- a.watchRegistry(runCtx, manager)
 	}()
-	err = mcpserver.New(mcpserver.Dependencies{Projects: a.d.Store, Queries: lspQueries{manager: manager}}).RunStdio(serveCtx, Version)
-	stop()
-	watchErr := <-watchDone
-	if watchErr != nil {
+	mcpService := mcpserver.New(mcpserver.Dependencies{Projects: a.d.Store, Queries: lspQueries{manager: manager}})
+	server := &daemon.Server{
+		LockAlreadyHeld: true,
+		OnStatus:        func(context.Context) (string, error) { return "ready", nil },
+		OnMCP: func(connectionCtx context.Context, conn io.ReadWriteCloser) error {
+			return mcpService.RunIO(connectionCtx, Version, conn, conn)
+		},
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.ListenAndServe(runCtx) }()
+	select {
+	case watchErr := <-watchDone:
+		cancel()
+		serveErr := <-serveDone
+		if watchErr != nil {
+			return watchErr
+		}
+		return serveErr
+	case serveErr := <-serveDone:
+		cancel()
+		watchErr := <-watchDone
+		if serveErr != nil {
+			return serveErr
+		}
 		return watchErr
 	}
-	return err
 }
+
+func (a *App) watchRegistry(ctx context.Context, manager *lsp.Manager) error {
+	const reconcileInterval = time.Second
+	var fingerprint string
+	var stop context.CancelFunc
+	var done chan error
+	current := map[string]projectRuntimeIdentity{}
+	stopCurrent := func() error {
+		if stop == nil {
+			return nil
+		}
+		stop()
+		err := <-done
+		stop, done = nil, nil
+		return err
+	}
+	defer stopCurrent()
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+	for {
+		registered, err := a.load(ctx)
+		if err != nil {
+			return err
+		}
+		next := watchFingerprint(registered.Projects)
+		if next != fingerprint {
+			nextProjects := runtimeIdentities(registered.Projects)
+			for id, previous := range current {
+				if replacement, ok := nextProjects[id]; !ok || replacement != previous {
+					manager.Invalidate(id)
+				}
+			}
+			if err := stopCurrent(); err != nil {
+				return err
+			}
+			watchCtx, cancel := context.WithCancel(ctx)
+			stop = cancel
+			done = make(chan error, 1)
+			projects := append([]registry.Project(nil), registered.Projects...)
+			go func() { done <- a.watchRealWithSink(watchCtx, projects, manager) }()
+			fingerprint = next
+			current = nextProjects
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-done:
+			stop, done = nil, nil
+			if err != nil {
+				return err
+			}
+			fingerprint = ""
+		case <-ticker.C:
+		}
+	}
+}
+
+type projectRuntimeIdentity struct {
+	UProject, Engine, Clangd, CompilationDatabase, CacheDir string
+}
+
+func runtimeIdentities(projects []registry.Project) map[string]projectRuntimeIdentity {
+	identities := make(map[string]projectRuntimeIdentity, len(projects))
+	for _, project := range projects {
+		identities[project.ID] = runtimeIdentity(project)
+	}
+	return identities
+}
+
+func runtimeIdentity(project registry.Project) projectRuntimeIdentity {
+	return projectRuntimeIdentity{
+		UProject: project.UProject, Engine: project.Engine.Root, Clangd: project.Toolchain.ClangdPath,
+		CompilationDatabase: project.Generation.CompilationDatabase, CacheDir: project.Generation.CacheDir,
+	}
+}
+
+func watchFingerprint(projects []registry.Project) string {
+	type identity struct {
+		ID string
+		projectRuntimeIdentity
+	}
+	items := make([]identity, 0, len(projects))
+	for _, project := range projects {
+		items = append(items, identity{ID: project.ID, projectRuntimeIdentity: runtimeIdentity(project)})
+	}
+	encoded, _ := json.Marshal(items)
+	return string(encoded)
+}
+
 func (a *App) writeJSON(v any) error {
 	b, e := json.Marshal(v)
 	if e != nil {
@@ -737,7 +918,10 @@ func (q lspQueries) client(ctx context.Context, p registry.Project) (*lsp.Client
 		return nil, func() {}, err
 	}
 	c, e := q.manager.Client(ctx, lsp.ProjectConfig{ID: p.ID, Clangd: p.Toolchain.ClangdPath, CompilationDatabase: p.Generation.CompilationDatabase, CacheDir: p.Generation.CacheDir, RootURI: fileURI(filepath.Dir(p.UProject))})
-	return c, func() { q.manager.Release(p.ID) }, e
+	if e != nil {
+		return nil, func() {}, e
+	}
+	return c, func() { q.manager.Release(p.ID) }, nil
 }
 
 func validateProjectCache(p registry.Project) error {
