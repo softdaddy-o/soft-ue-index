@@ -275,10 +275,6 @@ func (m *Manager) startSession(id string, s *session, sessionCtx context.Context
 		if err == nil {
 			uri := pathURI(seed.Path)
 			err = client.DidOpen(uri, "cpp", string(seed.Text))
-			if err == nil {
-				var ready any
-				err = client.DocumentSymbol(sessionCtx, uri, &ready)
-			}
 		} else if errors.Is(err, errNoIndexSeed) {
 			err = nil
 		}

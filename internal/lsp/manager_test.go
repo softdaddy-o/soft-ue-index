@@ -32,13 +32,11 @@ func (p *fakeProcess) Kill() error {
 }
 
 type fakeFactory struct {
-	mu                 sync.Mutex
-	n                  int
-	args               [][]string
-	methods            []wireMessage
-	last               *fakeProcess
-	documentSymbolGate chan struct{}
-	documentSymbolSeen chan struct{}
+	mu      sync.Mutex
+	n       int
+	args    [][]string
+	methods []wireMessage
+	last    *fakeProcess
 }
 type slowFactory struct {
 	base  fakeFactory
@@ -81,10 +79,6 @@ func (f *fakeFactory) Start(_ context.Context, _ string, args []string, _ string
 			f.mu.Lock()
 			f.methods = append(f.methods, m)
 			f.mu.Unlock()
-			if m.Method == "textDocument/documentSymbol" && f.documentSymbolGate != nil {
-				close(f.documentSymbolSeen)
-				<-f.documentSymbolGate
-			}
 			if m.Method == "initialize" || m.Method == "shutdown" || m.Method == "textDocument/documentSymbol" {
 				_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: m.ID, Result: mustJSON(map[string]any{})}))
 			}
@@ -271,7 +265,7 @@ func TestManagerOpensSeedAfterInitializeBeforePublishing(t *testing.T) {
 	f.mu.Lock()
 	messages := append([]wireMessage(nil), f.methods...)
 	f.mu.Unlock()
-	if len(messages) < 4 || messages[0].Method != "initialize" || messages[1].Method != "initialized" || messages[2].Method != "textDocument/didOpen" || messages[3].Method != "textDocument/documentSymbol" {
+	if len(messages) < 3 || messages[0].Method != "initialize" || messages[1].Method != "initialized" || messages[2].Method != "textDocument/didOpen" {
 		t.Fatalf("startup methods=%v", messages)
 	}
 	var params struct {
@@ -309,46 +303,6 @@ func TestSelectIndexSeedPrefersSmallNonGeneratedSource(t *testing.T) {
 	seed, err := selectIndexSeed(db, fileURIForTest(root), 1024)
 	if err != nil || seed.Path != small {
 		t.Fatalf("seed=%+v err=%v", seed, err)
-	}
-}
-
-func TestManagerWaitsForSeedDocumentSymbolsBeforePublishing(t *testing.T) {
-	f := &fakeFactory{documentSymbolGate: make(chan struct{}), documentSymbolSeen: make(chan struct{})}
-	m := NewManager(f)
-	defer m.Close()
-	root, cache := t.TempDir(), t.TempDir()
-	source := filepath.Join(root, "Seed.cpp")
-	if err := os.WriteFile(source, []byte("int Seed;"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	b, _ := json.Marshal([]map[string]string{{"directory": root, "file": source, "command": "clang-cl Seed.cpp"}})
-	db := filepath.Join(cache, "compile_commands.json")
-	if err := os.WriteFile(db, b, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	result := make(chan error, 1)
-	go func() {
-		_, err := m.Client(context.Background(), ProjectConfig{ID: "seed-ready", Clangd: "fake", CacheDir: cache, CompilationDatabase: db, RootURI: fileURIForTest(root)})
-		result <- err
-	}()
-	select {
-	case <-f.documentSymbolSeen:
-	case <-time.After(time.Second):
-		t.Fatal("documentSymbol was not requested")
-	}
-	select {
-	case err := <-result:
-		t.Fatalf("startup completed before documentSymbol response: %v", err)
-	default:
-	}
-	close(f.documentSymbolGate)
-	select {
-	case err := <-result:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("startup did not complete after documentSymbol response")
 	}
 }
 
