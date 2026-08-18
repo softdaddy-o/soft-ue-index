@@ -288,6 +288,30 @@ func TestManagerOpensSeedAfterInitializeBeforePublishing(t *testing.T) {
 	}
 }
 
+func TestSelectIndexSeedPrefersSmallNonGeneratedSource(t *testing.T) {
+	root, cache := t.TempDir(), t.TempDir()
+	proto := filepath.Join(root, "Proto", "Large.cpp")
+	small := filepath.Join(root, "Small.cpp")
+	if err := os.MkdirAll(filepath.Dir(proto), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(proto, []byte(strings.Repeat("x", 100)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(small, []byte("small"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	database, _ := json.Marshal([]map[string]string{{"directory": root, "file": proto}, {"directory": root, "file": small}})
+	db := filepath.Join(cache, "compile_commands.json")
+	if err := os.WriteFile(db, database, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := selectIndexSeed(db, fileURIForTest(root), 1024)
+	if err != nil || seed.Path != small {
+		t.Fatalf("seed=%+v err=%v", seed, err)
+	}
+}
+
 func TestManagerWaitsForSeedDocumentSymbolsBeforePublishing(t *testing.T) {
 	f := &fakeFactory{documentSymbolGate: make(chan struct{}), documentSymbolSeen: make(chan struct{})}
 	m := NewManager(f)

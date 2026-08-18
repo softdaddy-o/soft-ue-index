@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -312,6 +313,8 @@ func selectIndexSeed(database, rootURI string, maxBytes int64) (indexSeed, error
 		return indexSeed{}, errors.New("compilation database must be an array")
 	}
 	count := 0
+	var candidate string
+	var candidateSize int64
 	for ; d.More(); count++ {
 		if count >= 100000 {
 			return indexSeed{}, errors.New("compilation database seed scan limit exceeded")
@@ -329,17 +332,36 @@ func selectIndexSeed(database, rootURI string, maxBytes int64) (indexSeed, error
 			continue
 		}
 		info, statErr := os.Stat(path)
-		if statErr != nil || !info.Mode().IsRegular() || info.Size() > maxBytes {
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() > maxBytes || !isSeedSource(path) {
 			continue
 		}
 		if withinRoot(path, root) {
-			return readIndexSeed(path, maxBytes)
+			if candidate == "" || info.Size() < candidateSize {
+				candidate, candidateSize = path, info.Size()
+			}
 		}
+	}
+	if candidate != "" {
+		return readIndexSeed(candidate, maxBytes)
 	}
 	if count > 0 {
 		return indexSeed{}, errors.New("compilation database has no safe readable project seed")
 	}
 	return indexSeed{}, errNoIndexSeed
+}
+
+func isSeedSource(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".c", ".cc", ".cpp", ".cxx":
+	default:
+		return false
+	}
+	for _, segment := range strings.Split(strings.ToLower(filepath.ToSlash(path)), "/") {
+		if segment == "proto" || segment == "generated" || segment == "thirdparty" {
+			return false
+		}
+	}
+	return !strings.HasSuffix(strings.ToLower(path), ".gen.cpp")
 }
 
 func readIndexSeed(path string, maxBytes int64) (indexSeed, error) {
