@@ -127,6 +127,9 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	if !foundBackgroundPriority {
 		t.Fatalf("background index priority missing from args=%v", f.args[0])
 	}
+	if !containsArg(f.args[0], "--j=1") || !containsArg(f.args[0], "--pch-storage=disk") {
+		t.Fatalf("low-memory defaults missing from args=%v", f.args[0])
+	}
 	m.Release("game")
 	m.Release("game")
 	time.Sleep(20 * time.Millisecond)
@@ -136,6 +139,15 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	if ok {
 		t.Fatal("idle session remains")
 	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestManagerRetiresStaleProjectConfigurationBeforeRestart(t *testing.T) {
