@@ -91,6 +91,18 @@ The first query starts clangd lazily and opens one safe project translation unit
 
 The daemon reconciles project additions, removals, roots, toolchains, and compilation-database identities from the per-user registry without restarting MCP clients.
 
+## Cold-index memory
+
+Measured on a real ~26,800-entry Unreal Engine 5.8 compilation database (24 logical cores, `--j=1`), sampling clangd's private memory every 15s over a 20-minute cold-start window from an empty index cache:
+
+| | `--clang-tidy` default (on) | `--clang-tidy=0` |
+|---|---|---|
+| Translation units completed | 105/26,796 | 134/26,796 (+28%) |
+| Peak private memory | 2529.5 MB | 2117.5 MB (−16%) |
+| Private memory at 20 min | 2268.3 MB | 1890.0 MB (−17%) |
+
+Disabling clang-tidy's default `clang-analyzer-*` static-analysis checks (real per-TU overhead on Unreal's macro/template-heavy headers, and pure cost here since this server only does navigation/search) processed more translation units while using less memory in the same window. This is a partial-window measurement, not a peak at completion: at `--j=1`, full completion of a database this size is on the order of tens of hours, and `search_symbols` does not need it to finish (see above).
+
 The MVP targets source/custom Unreal Engine installations registered in the current user's Unreal Engine Builds registry. Launcher-only binary installations are outside the current indexing scope unless they are source-enabled and registered there.
 
 ## Local UE 5.8 integration check

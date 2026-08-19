@@ -262,9 +262,22 @@ func TestManagerOpensSeedAfterInitializeBeforePublishing(t *testing.T) {
 	if _, err := m.Client(context.Background(), ProjectConfig{ID: "seed", Clangd: "fake", CacheDir: cache, CompilationDatabase: db, RootURI: fileURIForTest(root)}); err != nil {
 		t.Fatal(err)
 	}
-	f.mu.Lock()
-	messages := append([]wireMessage(nil), f.methods...)
-	f.mu.Unlock()
+	// m.Client returning only guarantees the client's didOpen write was
+	// flushed to the transport, not that fakeFactory's reader goroutine on
+	// the other end has recorded it into f.methods yet -- poll instead of
+	// reading immediately, or this flakes under -race's added scheduling
+	// latency (observed in CI: the reader goroutine lagged past this point).
+	deadline := time.Now().Add(2 * time.Second)
+	var messages []wireMessage
+	for {
+		f.mu.Lock()
+		messages = append([]wireMessage(nil), f.methods...)
+		f.mu.Unlock()
+		if len(messages) >= 3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if len(messages) < 3 || messages[0].Method != "initialize" || messages[1].Method != "initialized" || messages[2].Method != "textDocument/didOpen" {
 		t.Fatalf("startup methods=%v", messages)
 	}

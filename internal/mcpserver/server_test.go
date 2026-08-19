@@ -274,6 +274,23 @@ func TestSearchSymbolsRejectsPathPrefixOutsideProjectAndEngine(t *testing.T) {
 	}
 }
 
+// TestSearchSymbolsReportsPathNotFoundForMissingPathPrefix guards against a
+// typo'd path_prefix collapsing into the generic "code intelligence request
+// failed" via mapError's catch-all -- a nonexistent path and an
+// out-of-bounds one should not be indistinguishable to the caller.
+func TestSearchSymbolsReportsPathNotFoundForMissingPathPrefix(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "TypoDir")
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}, Queries: &fakeQueries{}})
+	_, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "x", PathPrefix: missing})
+	if !errors.Is(err, ErrPathNotFound) {
+		t.Fatalf("expected ErrPathNotFound, got %v", err)
+	}
+	if mapped := mapError(err); mapped.Error() != ErrPathNotFound.Error() {
+		t.Fatalf("mapError collapsed a missing path_prefix into %q, want the specific %q message", mapped, ErrPathNotFound)
+	}
+}
+
 func TestSearchSymbolsReportsIndexStateAlongsideResults(t *testing.T) {
 	root := t.TempDir()
 	q := &fakeQueries{symbols: []lsp.Symbol{{Name: "One"}}, indexState: IndexState{Phase: "indexing"}}

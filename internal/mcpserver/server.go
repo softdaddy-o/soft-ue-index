@@ -23,6 +23,7 @@ var (
 	ErrProjectRequired = errors.New("project_id is required")
 	ErrProjectNotFound = errors.New("project not found")
 	ErrPathForbidden   = errors.New("path is outside the selected project or engine")
+	ErrPathNotFound    = errors.New("path does not exist")
 	ErrLimitExceeded   = errors.New("request exceeds configured limit")
 	ErrInvalidLimits   = errors.New("configured response limit is too small")
 	ErrToolBusy        = errors.New("too many concurrent tool calls")
@@ -698,7 +699,7 @@ func mapError(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("request timed out: %w", err)
 	}
-	if errors.Is(err, ErrProjectRequired) || errors.Is(err, ErrProjectNotFound) || errors.Is(err, ErrPathForbidden) || errors.Is(err, ErrLimitExceeded) || errors.Is(err, ErrToolBusy) {
+	if errors.Is(err, ErrProjectRequired) || errors.Is(err, ErrProjectNotFound) || errors.Is(err, ErrPathForbidden) || errors.Is(err, ErrPathNotFound) || errors.Is(err, ErrLimitExceeded) || errors.Is(err, ErrToolBusy) {
 		return err
 	}
 	return errors.New("code intelligence request failed")
@@ -758,6 +759,12 @@ func safePath(path string, roots ...string) (string, error) {
 	}
 	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// A distinct, actionable sentinel: an out-of-bounds path and a
+			// typo'd/missing one look identical past this point otherwise,
+			// and mapError's catch-all obscures the raw OS error text.
+			return "", ErrPathNotFound
+		}
 		return "", err
 	}
 	for _, root := range roots {
