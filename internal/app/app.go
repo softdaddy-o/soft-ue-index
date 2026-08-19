@@ -965,8 +965,22 @@ func (q lspQueries) Symbols(ctx context.Context, p registry.Project, s string, n
 	if e != nil {
 		return nil, e
 	}
+	// workspace/symbol needs clangd's background index; on a cold session
+	// this can still be building well past the client's per-RPC timeout.
+	// Wait for it (bounded by ctx, not an arbitrary sleep) instead of
+	// issuing the RPC and letting it time out on its own.
+	if e := c.WaitForIndexReady(ctx); e != nil {
+		return nil, e
+	}
 	items, err := c.WorkspaceSymbols(ctx, s, lsp.Limits{MaxItems: n})
 	return filterLSPSymbols(p, items), err
+}
+
+// IndexState reports the project's clangd session/index phase without
+// blocking on or triggering a cold start.
+func (q lspQueries) IndexState(_ context.Context, p registry.Project) (mcpserver.IndexState, error) {
+	state := q.manager.SessionState(p.ID)
+	return mcpserver.IndexState{Phase: state.Phase, Message: state.Message}, nil
 }
 func (q lspQueries) Locations(ctx context.Context, p registry.Project, kind string, v mcpserver.TextPosition, n int) ([]lsp.Location, error) {
 	c, done, e := q.client(ctx, p)

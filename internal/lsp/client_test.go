@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -539,4 +540,171 @@ func TestServerRequestFloodReturnsOneBoundedResponsePerRequest(t *testing.T) {
 		t.Fatal("close blocked by flood")
 	}
 	_ = b.Close()
+}
+
+// settle sends a synchronous server request and waits for its reply. Because
+// readLoop processes frames strictly in arrival order and handles
+// notifications (like $/progress) inline before moving on, a reply to a
+// request sent after a notification proves the notification was already
+// applied -- without sleeping an arbitrary duration.
+func settle(t *testing.T, r *bufio.Reader, w io.Writer, id int) {
+	t.Helper()
+	_, _ = w.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: mustJSON(id), Method: "workspace/configuration", Params: mustJSON(map[string]any{"items": []any{}})}))
+	body, err := readFrame(r, 4096)
+	if err != nil {
+		t.Fatalf("settle: read reply: %v", err)
+	}
+	var reply wireMessage
+	if err := json.Unmarshal(body, &reply); err != nil || string(reply.ID) != mustJSONString(id) {
+		t.Fatalf("settle: unexpected reply %s (err=%v)", body, err)
+	}
+}
+
+func mustJSONString(id int) string { return string(mustJSON(id)) }
+
+func TestIndexPhaseTransitionsThroughWorkDoneProgressLifecycle(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{IndexGraceTimeout: time.Hour})
+	defer c.Close()
+	r := bufio.NewReader(b)
+
+	if got := c.IndexPhase(); got != "starting" {
+		t.Fatalf("phase before any progress=%q, want starting", got)
+	}
+
+	// clangd must ask permission to report progress before sending it; the
+	// client must acknowledge that request.
+	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: mustJSON(1), Method: "window/workDoneProgress/create", Params: mustJSON(map[string]any{"token": "indexing"})}))
+	body, err := readFrame(r, 4096)
+	if err != nil {
+		t.Fatalf("read workDoneProgress/create ack: %v", err)
+	}
+	var ack wireMessage
+	if err := json.Unmarshal(body, &ack); err != nil || string(ack.ID) != "1" || ack.Error != nil {
+		t.Fatalf("workDoneProgress/create not acked cleanly: %s (err=%v)", body, err)
+	}
+
+	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "indexing", "value": map[string]any{"kind": "begin", "title": "indexing"}})}))
+	settle(t, r, b, 2)
+	if got := c.IndexPhase(); got != "indexing" {
+		t.Fatalf("phase after begin=%q, want indexing", got)
+	}
+	if got := c.IndexMessage(); got != "indexing" {
+		t.Fatalf("message after begin=%q, want %q", got, "indexing")
+	}
+
+	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "indexing", "value": map[string]any{"kind": "report", "message": "60%"}})}))
+	settle(t, r, b, 3)
+	if got := c.IndexPhase(); got != "indexing" {
+		t.Fatalf("phase after report=%q, want still indexing", got)
+	}
+
+	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "indexing", "value": map[string]any{"kind": "end"}})}))
+	settle(t, r, b, 4)
+	if got := c.IndexPhase(); got != "ready" {
+		t.Fatalf("phase after end=%q, want ready", got)
+	}
+	if got := c.IndexMessage(); got != "" {
+		t.Fatalf("message after ready=%q, want empty", got)
+	}
+}
+
+func TestWaitForIndexReadyBlocksUntilProgressEndsThenReturns(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{IndexGraceTimeout: time.Hour})
+	defer c.Close()
+	r := bufio.NewReader(b)
+
+	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "x", "value": map[string]any{"kind": "begin"}})}))
+	settle(t, r, b, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- c.WaitForIndexReady(context.Background()) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("WaitForIndexReady returned before the index finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "x", "value": map[string]any{"kind": "end"}})}))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForIndexReady error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForIndexReady did not unblock after the index finished")
+	}
+}
+
+func TestWaitForIndexReadyReturnsIndexBuildingOnContextDeadlineWhileStillIndexing(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{IndexGraceTimeout: time.Hour})
+	defer c.Close()
+	r := bufio.NewReader(b)
+
+	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "x", "value": map[string]any{"kind": "begin"}})}))
+	settle(t, r, b, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := c.WaitForIndexReady(ctx)
+	if !errors.Is(err, ErrIndexBuilding) {
+		t.Fatalf("err=%v, want ErrIndexBuilding", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want it to still chain to context.DeadlineExceeded", err)
+	}
+	// The grace timeout must not force readiness while indexing is actively
+	// in progress: only the caller's own deadline ends the wait.
+	if got := c.IndexPhase(); got != "indexing" {
+		t.Fatalf("phase after deadline=%q, want still indexing", got)
+	}
+}
+
+func TestIndexBecomesReadyAfterGraceTimeoutWithoutAnyProgress(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{IndexGraceTimeout: 10 * time.Millisecond})
+	defer c.Close()
+	// Mirrors manager.startSession: the grace window only starts once clangd
+	// has been told what to initially index.
+	c.StartIndexGraceWindow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := c.WaitForIndexReady(ctx); err != nil {
+		t.Fatalf("WaitForIndexReady after grace timeout=%v, want nil", err)
+	}
+	if got := c.IndexPhase(); got != "ready" {
+		t.Fatalf("phase after grace timeout with no progress=%q, want ready", got)
+	}
+}
+
+func TestWaitForIndexReadyReturnsImmediatelyOnceAlreadyReady(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := NewClient(a, a, ClientOptions{IndexGraceTimeout: time.Millisecond})
+	defer c.Close()
+	c.StartIndexGraceWindow()
+	// Let the grace timer flip readiness before checking the fast path.
+	deadline := time.Now().Add(time.Second)
+	for c.IndexPhase() != "ready" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := c.IndexPhase(); got != "ready" {
+		t.Fatalf("phase=%q, want ready before exercising the fast path", got)
+	}
+	// An already-canceled context proves WaitForIndexReady took the
+	// already-ready fast path rather than entering its select: a wait would
+	// return ctx.Err() immediately too, but only the fast path returns nil.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.WaitForIndexReady(ctx); err != nil {
+		t.Fatalf("WaitForIndexReady once ready with a canceled ctx=%v, want nil", err)
+	}
 }

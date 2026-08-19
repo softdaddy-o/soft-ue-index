@@ -759,6 +759,213 @@ func TestCanceledStartupSchedulesIdleShutdownAndClaimCancelsIt(t *testing.T) {
 	})
 }
 
+// scriptedFactory hands the test exclusive, synchronous control of the
+// fake clangd side of the pipe: unlike fakeFactory it runs no background
+// auto-responder goroutine, so exactly one goroutine (the test) ever writes
+// to the peer connection.
+type scriptedFactory struct {
+	mu   sync.Mutex
+	n    int
+	peer net.Conn
+}
+
+func (f *scriptedFactory) Start(_ context.Context, _ string, _ []string, _ string) (Process, error) {
+	f.mu.Lock()
+	f.n++
+	a, b := net.Pipe()
+	f.peer = b
+	f.mu.Unlock()
+	return &fakeProcess{conn: a, done: make(chan struct{})}, nil
+}
+
+func (f *scriptedFactory) spawns() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.n
+}
+
+// TestIndexGraceWindowStartsAfterStartupNotAtClientConstruction is a
+// regression test: the grace timer must not start ticking at NewClient
+// (before Initialize/DidOpen even reach clangd), or a slow cold startup
+// (large compilation database scan, slow clangd initialize) can let it
+// expire and mark the index "ready" before indexing was ever triggered.
+func TestIndexGraceWindowStartsAfterStartupNotAtClientConstruction(t *testing.T) {
+	f := &scriptedFactory{}
+	m := NewManager(f)
+	defer m.Close()
+	const grace = 30 * time.Millisecond
+	cfg := ProjectConfig{ID: "game", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///game", IndexGraceTimeout: grace}
+
+	clientDone := make(chan error, 1)
+	go func() {
+		_, err := m.Client(context.Background(), cfg)
+		clientDone <- err
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	var peer net.Conn
+	for peer == nil && time.Now().Before(deadline) {
+		f.mu.Lock()
+		peer = f.peer
+		f.mu.Unlock()
+		if peer == nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if peer == nil {
+		t.Fatal("factory never started a process")
+	}
+	r := bufio.NewReader(peer)
+	body, err := readFrame(r, 1<<20)
+	if err != nil {
+		t.Fatalf("read initialize: %v", err)
+	}
+	var initReq wireMessage
+	if err := json.Unmarshal(body, &initReq); err != nil || initReq.Method != "initialize" {
+		t.Fatalf("first request=%s (err=%v), want initialize", body, err)
+	}
+
+	// Hold the initialize reply well past the grace timeout. SessionState
+	// cannot observe the Client's internal state yet at this point (the
+	// session only exposes s.client, and therefore IndexPhase, once
+	// startup finishes) -- the bug's effect is only observable the instant
+	// startup completes below, not during this window.
+	time.Sleep(grace * 5)
+
+	if _, err := peer.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: initReq.ID, Result: mustJSON(map[string]any{})})); err != nil {
+		t.Fatalf("write initialize result: %v", err)
+	}
+	body, err = readFrame(r, 4096)
+	if err != nil {
+		t.Fatalf("read initialized notification: %v", err)
+	}
+	var initializedNotif wireMessage
+	if err := json.Unmarshal(body, &initializedNotif); err != nil || initializedNotif.Method != "initialized" {
+		t.Fatalf("second message=%s (err=%v), want initialized notification", body, err)
+	}
+	if err := <-clientDone; err != nil {
+		t.Fatalf("Client startup failed: %v", err)
+	}
+	defer m.Release("game")
+
+	// The discriminating check: if the grace window had (wrongly) started
+	// ticking at client construction, it already fired during the sleep
+	// above -- unobservable until now -- and SessionState would report
+	// "ready" the instant the session becomes visible, before indexing
+	// could ever have been triggered or signaled.
+	if got := m.SessionState("game").Phase; got == "ready" {
+		t.Fatal("index reported ready immediately at startup, before indexing could have been triggered")
+	}
+
+	// The grace window starts only now (no compilation database, so no
+	// seed didOpen follows initialize); wait past it and confirm it still
+	// converges to ready on its own.
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if m.SessionState("game").Phase == "ready" {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("phase never reached ready after startup, got %q", m.SessionState("game").Phase)
+}
+
+func TestManagerSessionStateReflectsIndexPhaseWithoutBlockingOrExtraSpawn(t *testing.T) {
+	f := &scriptedFactory{}
+	m := NewManager(f)
+	defer m.Close()
+	cfg := ProjectConfig{ID: "game", Clangd: "fake", CacheDir: t.TempDir(), RootURI: "file:///game"}
+
+	if got := m.SessionState("game").Phase; got != "absent" {
+		t.Fatalf("phase before any session=%q, want absent", got)
+	}
+
+	clientDone := make(chan error, 1)
+	go func() {
+		_, err := m.Client(context.Background(), cfg)
+		clientDone <- err
+	}()
+
+	// Answer initialize directly: this test drives clangd's side of the
+	// protocol itself instead of using fakeFactory's auto-responder, so it
+	// can inject $/progress notifications afterward without racing it.
+	deadline := time.Now().Add(time.Second)
+	var peer net.Conn
+	for peer == nil && time.Now().Before(deadline) {
+		f.mu.Lock()
+		peer = f.peer
+		f.mu.Unlock()
+		if peer == nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if peer == nil {
+		t.Fatal("factory never started a process")
+	}
+	r := bufio.NewReader(peer)
+	body, err := readFrame(r, 1<<20)
+	if err != nil {
+		t.Fatalf("read initialize: %v", err)
+	}
+	var initReq wireMessage
+	if err := json.Unmarshal(body, &initReq); err != nil || initReq.Method != "initialize" {
+		t.Fatalf("first request=%s (err=%v), want initialize", body, err)
+	}
+	if _, err := peer.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: initReq.ID, Result: mustJSON(map[string]any{})})); err != nil {
+		t.Fatalf("write initialize result: %v", err)
+	}
+	// net.Pipe is synchronous: the client's "initialized" notification, sent
+	// right after a successful initialize handshake, blocks its writeLoop
+	// until read even though the client itself does not wait for it.
+	body, err = readFrame(r, 4096)
+	if err != nil {
+		t.Fatalf("read initialized notification: %v", err)
+	}
+	var initializedNotif wireMessage
+	if err := json.Unmarshal(body, &initializedNotif); err != nil || initializedNotif.Method != "initialized" {
+		t.Fatalf("second message=%s (err=%v), want initialized notification", body, err)
+	}
+
+	if err := <-clientDone; err != nil {
+		t.Fatalf("Client startup failed: %v", err)
+	}
+	defer m.Release("game")
+
+	if got := m.SessionState("game").Phase; got != "starting" {
+		t.Fatalf("phase right after startup, before any progress signal=%q, want starting", got)
+	}
+
+	settlePeer := func(id int) {
+		t.Helper()
+		if _, err := peer.Write(frameBytes(wireMessage{JSONRPC: "2.0", ID: mustJSON(id), Method: "workspace/configuration", Params: mustJSON(map[string]any{"items": []any{}})})); err != nil {
+			t.Fatalf("write settle request: %v", err)
+		}
+		if _, err := readFrame(r, 4096); err != nil {
+			t.Fatalf("read settle reply: %v", err)
+		}
+	}
+
+	if _, err := peer.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "x", "value": map[string]any{"kind": "begin"}})})); err != nil {
+		t.Fatalf("write progress begin: %v", err)
+	}
+	settlePeer(1)
+	if got := m.SessionState("game").Phase; got != "indexing" {
+		t.Fatalf("phase during indexing=%q, want indexing", got)
+	}
+
+	if _, err := peer.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "x", "value": map[string]any{"kind": "end"}})})); err != nil {
+		t.Fatalf("write progress end: %v", err)
+	}
+	settlePeer(2)
+	if got := m.SessionState("game").Phase; got != "ready" {
+		t.Fatalf("phase after indexing finished=%q, want ready", got)
+	}
+
+	if got := f.spawns(); got != 1 {
+		t.Fatalf("clangd spawns=%d, want exactly 1 (project_status must not start a session)", got)
+	}
+}
+
 func TestExecFactoryClosesLogOnStartFailure(t *testing.T) {
 	dir := t.TempDir()
 	log := filepath.Join(dir, "private.log")

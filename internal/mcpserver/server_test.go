@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -181,10 +182,11 @@ func (f *slowQueries) Symbols(ctx context.Context, p registry.Project, q string,
 }
 
 type fakeQueries struct {
-	seenID  string
-	symbols []lsp.Symbol
-	hover   *lsp.HoverResult
-	err     error
+	seenID     string
+	symbols    []lsp.Symbol
+	hover      *lsp.HoverResult
+	err        error
+	indexState IndexState
 }
 
 func (f *fakeQueries) Symbols(_ context.Context, project registry.Project, query string, limit int) ([]lsp.Symbol, error) {
@@ -211,6 +213,9 @@ func (f *fakeQueries) IncomingCalls(context.Context, registry.Project, lsp.CallH
 }
 func (f *fakeQueries) OutgoingCalls(context.Context, registry.Project, lsp.CallHierarchyItem) ([]lsp.CallHierarchyCall, error) {
 	return nil, f.err
+}
+func (f *fakeQueries) IndexState(context.Context, registry.Project) (IndexState, error) {
+	return f.indexState, nil
 }
 
 func TestSearchSymbolsRoutesExplicitProjectAndTruncates(t *testing.T) {
@@ -881,5 +886,88 @@ func TestOfficialSDKCallToolSanitizesLargeBackendError(t *testing.T) {
 	}{JSONRPC: "2.0", ID: 1, Result: result})
 	if err != nil || len(wire) > 512 {
 		t.Fatalf("serialized MCP response exceeded cap: bytes=%d err=%v", len(wire), err)
+	}
+}
+
+// TestOfficialSDKSearchSymbolsReportsIndexBuildingOnce is a regression test
+// for the triple-wrapped generic timeout the issue reported: mapError was
+// applied once by the handler and again (twice) at the tool-result boundary.
+func TestOfficialSDKSearchSymbolsReportsIndexBuildingOnce(t *testing.T) {
+	root := t.TempDir()
+	q := &fakeQueries{err: fmt.Errorf("%w: %w", lsp.ErrIndexBuilding, context.DeadlineExceeded)}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "p", UProject: filepath.Join(root, "P.uproject")}}}, Queries: q}).MCPServer("test")
+	a, b := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	serverSession, err := s.Connect(ctx, a, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "test"}, nil)
+	clientSession, err := client.Connect(ctx, b, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: "search_symbols", Arguments: map[string]any{"project_id": "p", "query": "x"}})
+	if err != nil || !result.IsError || len(result.Content) != 1 {
+		t.Fatalf("tool error=%v result=%#v", err, result)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("content type=%T, want *mcp.TextContent", result.Content[0])
+	}
+	if got := strings.Count(text.Text, "still building"); got != 1 {
+		t.Fatalf("message=%q, want the actionable message exactly once, got %d", text.Text, got)
+	}
+	if strings.Contains(text.Text, "request timed out") {
+		t.Fatalf("message=%q, must not also carry the generic timeout wrapper", text.Text)
+	}
+}
+
+func TestToolResultAppliesMapErrorExactlyOnce(t *testing.T) {
+	s := New(Dependencies{Projects: fakeProjects{}})
+	_, err := s.toolResult(SearchSymbolsResult{}, context.DeadlineExceeded)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if want := "request timed out: context deadline exceeded"; err.Error() != want {
+		t.Fatalf("toolResult error=%q, want %q (mapError must apply exactly once)", err.Error(), want)
+	}
+}
+
+func TestSearchSymbolsReturnsIndexBuildingUnmappedForToolResultToMapOnce(t *testing.T) {
+	root := t.TempDir()
+	q := &fakeQueries{err: fmt.Errorf("%w: indexing 40%%", lsp.ErrIndexBuilding)}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}, Queries: q})
+	_, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "x"})
+	if !errors.Is(err, lsp.ErrIndexBuilding) {
+		t.Fatalf("SearchSymbols err=%v, want the raw ErrIndexBuilding chain (unmapped)", err)
+	}
+}
+
+func TestProjectStatusReportsIndexState(t *testing.T) {
+	root := t.TempDir()
+	q := &fakeQueries{indexState: IndexState{Phase: "indexing", Message: "60%"}}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}, Queries: q})
+	result, err := s.ProjectStatus(context.Background(), ProjectStatusInput{ProjectID: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IndexState != "indexing" || result.IndexMessage != "60%" {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestProjectStatusOmitsIndexStateWhenQueriesUnavailable(t *testing.T) {
+	root := t.TempDir()
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}})
+	result, err := s.ProjectStatus(context.Background(), ProjectStatusInput{ProjectID: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IndexState != "" {
+		t.Fatalf("IndexState=%q, want empty when queries is unavailable (must not error or block)", result.IndexState)
 	}
 }
