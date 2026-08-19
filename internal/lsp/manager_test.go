@@ -121,7 +121,7 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	if !foundBackgroundPriority {
 		t.Fatalf("background index priority missing from args=%v", f.args[0])
 	}
-	if !containsArg(f.args[0], "--j=1") || !containsArg(f.args[0], "--pch-storage=disk") {
+	if !containsArg(f.args[0], "--j=1") || !containsArg(f.args[0], "--pch-storage=disk") || !containsArg(f.args[0], "--clang-tidy=0") {
 		t.Fatalf("low-memory defaults missing from args=%v", f.args[0])
 	}
 	m.Release("game")
