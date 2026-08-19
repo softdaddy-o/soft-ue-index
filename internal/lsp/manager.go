@@ -526,7 +526,16 @@ func (m *Manager) start(ctx context.Context, cfg ProjectConfig) (Process, error)
 	// overhead here since this project only wants navigation and search,
 	// not lint diagnostics. Disabling it is a low-memory default alongside
 	// --j=1 and --pch-storage=disk above.
-	args := []string{"--compile-commands-dir=" + cfg.CacheDir, "--background-index", "--background-index-priority=background", "--pch-storage=disk", "--clang-tidy=0", "--j=" + itoa(cfg.Threads), "--log=error"}
+	//
+	// --enable-config: confirmed by direct probe to already default to true
+	// on clangd 20.1.8, so this is currently a no-op in practice -- passed
+	// explicitly anyway as the one flag `index-engine` (see internal/
+	// engineindex) depends on: it writes a project-local .clangd fragment
+	// at a project's engine root, and that fragment only takes effect if
+	// config loading is enabled. Explicit here so that dependency is
+	// visible at the one place clangd is actually launched, rather than
+	// resting on an unstated upstream default that could change.
+	args := []string{"--compile-commands-dir=" + cfg.CacheDir, "--background-index", "--background-index-priority=background", "--pch-storage=disk", "--clang-tidy=0", "--enable-config", "--j=" + itoa(cfg.Threads), "--log=error"}
 	p, err := m.factory.Start(ctx, cfg.Clangd, args, filepath.Join(cfg.CacheDir, "clangd.log"))
 	if err != nil {
 		return nil, err

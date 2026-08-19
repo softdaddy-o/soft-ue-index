@@ -46,6 +46,25 @@ Projects are registered in a per-user registry. The default Windows location is 
 
 Multiple Unreal projects can share this registry. Each project receives its own compilation database, lazy clangd session, and cache. One per-user daemon shares the bounded watcher and query service across every MCP client.
 
+## Prebuilt engine index (optional)
+
+Engine and plugin code is typically the large majority of a project's compilation database (roughly 95% on the project this feature was developed against, see issue #7) and changes far less often than the project's own source. `index-engine` builds an offline index for just that portion, once, and points clangd at it instead of re-deriving the same state from scratch on every cold session:
+
+```powershell
+soft-ue-index generate mygame
+soft-ue-index index-engine mygame
+```
+
+Requires `generate` to have already produced a compilation database, and `clangd-indexer` to be available: it does not ship with the standard LLVM/clangd release, only with LLVM's separate "clangd indexing tools" archive. `index-engine` looks for it next to the resolved `clangd` binary, then on `PATH`, and fails with an actionable message naming that archive if neither has it.
+
+**This writes a `.clangd` config file directly into the project's engine installation root** (e.g. `D:\UE_5.8\.clangd`) -- the only location from which clangd's config discovery (a walk up from each compiled file's own directory) can scope a rule to just `Engine/` for every project that uses that engine install, since a project's own source tree is typically on a different drive or subtree entirely. This is the one thing in this repository that writes outside its own per-user cache and registry directories, which is why it is a separate, explicit command rather than something `generate` does automatically. The generated fragment is marked with a comment identifying it as soft-ue-index-generated and which project last wrote it; `index-engine` refuses to overwrite a `.clangd` at that location that lacks the marker (hand-authored -- remove or merge it manually first). The same project re-running `index-engine` (see refresh policy below) always updates its own fragment; a *different* project sharing the same engine install is refused unless its entry set happens to match exactly, rather than risk one project silently losing symbol coverage the other didn't need -- remove the existing fragment manually to hand the engine root to a different project.
+
+This tree assumes one user per machine, like the rest of soft-ue-index's per-user cache (see Privacy and removal) -- but the fragment it writes lives at the engine root, which is machine-wide. Two different Windows accounts running `index-engine` against the same engine install are not coordinated with each other.
+
+Refresh policy for v1 is manual: re-run `index-engine <project>` after an engine hotfix or plugin update to rebuild from the current compilation database. There is no automatic staleness detection.
+
+Mechanism (`Index.External.File` mounted for a `PathMatch`-scoped fragment, which implicitly disables live `--background-index` for the matched files) verified against clangd 20.1.8 with a small synthetic fixture; not yet verified at the scale of a real multi-thousand-file engine install.
+
 ## Watch behavior
 
 ```powershell
@@ -130,6 +149,8 @@ The repository includes a non-destructive PowerShell check. It calls `doctor`, r
 ## Privacy and removal
 
 All registry data, compilation databases, caches, and generation logs remain local to the current user. The MCP proxy and daemon are read-only and have no TCP listener; the named pipe ACL grants access only to the current user and LocalSystem. To unregister a project, run `soft-ue-index remove <project>`. Before removing all local data, run `soft-ue-index daemon stop` and close any foreground `watch`, then delete the two per-user `soft-ue-index` directories described above.
+
+`remove` and the directory deletion above do not touch anything `index-engine` wrote (see "Prebuilt engine index"): the `.clangd` fragment at the engine installation root, and the prebuilt index under the per-user `engines/` cache, both persist independently of any one project's registration, since other projects on the same engine install may still depend on them. Delete `<engineRoot>\.clangd` manually if nothing uses it anymore.
 
 ## License
 

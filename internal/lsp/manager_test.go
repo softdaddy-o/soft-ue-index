@@ -124,6 +124,9 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	if !containsArg(f.args[0], "--j=1") || !containsArg(f.args[0], "--pch-storage=disk") || !containsArg(f.args[0], "--clang-tidy=0") {
 		t.Fatalf("low-memory defaults missing from args=%v", f.args[0])
 	}
+	if !containsArg(f.args[0], "--enable-config") {
+		t.Fatalf("--enable-config missing from args=%v -- index-engine's generated .clangd fragment (internal/engineindex) has no effect without it", f.args[0])
+	}
 	m.Release("game")
 	m.Release("game")
 	time.Sleep(20 * time.Millisecond)

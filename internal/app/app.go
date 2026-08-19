@@ -4,6 +4,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"github.com/softdaddy-o/soft-ue-index/internal/compdb"
 	"github.com/softdaddy-o/soft-ue-index/internal/daemon"
 	"github.com/softdaddy-o/soft-ue-index/internal/diagnostics"
+	"github.com/softdaddy-o/soft-ue-index/internal/engineindex"
 	"github.com/softdaddy-o/soft-ue-index/internal/lsp"
 	"github.com/softdaddy-o/soft-ue-index/internal/mcpserver"
 	"github.com/softdaddy-o/soft-ue-index/internal/registry"
@@ -43,6 +46,7 @@ type Dependencies struct {
 	Discover       func(unreal.ProjectRequest) (unreal.Project, error)
 	Generate       func(context.Context, registry.Project) (registry.Project, error)
 	GenerateScoped func(context.Context, registry.Project, bool) (registry.Project, error)
+	IndexEngine    func(context.Context, registry.Project) (IndexEngineResult, error)
 	Doctor         func(context.Context, *registry.Store) (any, error)
 	Watch          func(context.Context, []registry.Project) error
 	MCP            func(context.Context, *registry.Store) error
@@ -87,6 +91,9 @@ func New(d Dependencies) *App {
 	if a.d.GenerateScoped == nil {
 		a.d.GenerateScoped = a.generateRealScoped
 	}
+	if a.d.IndexEngine == nil {
+		a.d.IndexEngine = a.indexEngineReal
+	}
 	if a.d.Doctor == nil {
 		a.d.Doctor = a.doctorReal
 	}
@@ -111,6 +118,8 @@ func (a *App) Run(ctx context.Context, command cli.Command) error {
 		return a.status(ctx, command)
 	case "generate":
 		return a.generate(ctx, command)
+	case "index-engine":
+		return a.indexEngine(ctx, command)
 	case "doctor":
 		return a.doctor(ctx, command.JSON)
 	case "watch":
@@ -268,6 +277,170 @@ func (a *App) generate(ctx context.Context, c cli.Command) error {
 	}
 	fmt.Fprintf(a.d.Output, "generated %s\n", projectID)
 	return nil
+}
+
+// IndexEngineResult reports what index-engine built, for both human and JSON output.
+type IndexEngineResult struct {
+	EngineEntries int    `json:"engineEntries"`
+	Key           string `json:"key"`
+	IndexPath     string `json:"indexPath"`
+	FragmentPath  string `json:"fragmentPath"`
+}
+
+func (a *App) indexEngine(ctx context.Context, c cli.Command) error {
+	r, i, e := a.find(ctx, c.ProjectName)
+	if e != nil {
+		return e
+	}
+	p := r.Projects[i]
+	if !p.Ready() {
+		return fmt.Errorf("project %s has no generated compilation database -- run generate first", p.ID)
+	}
+	if p.Engine.Root == "" {
+		return fmt.Errorf("project %s has no engine root recorded", p.ID)
+	}
+	var result IndexEngineResult
+	locked, e := a.tryEngineIndexLock(p.Engine.Root, func() error {
+		var err error
+		result, err = a.d.IndexEngine(ctx, p)
+		return err
+	})
+	if e != nil {
+		return e
+	}
+	if !locked {
+		return fmt.Errorf("an index-engine run is already in progress for engine root %s (possibly from another project) -- wait for it to finish and retry", p.Engine.Root)
+	}
+	if c.JSON {
+		return a.writeJSON(result)
+	}
+	fmt.Fprintf(a.d.Output, "indexed %d engine entries -> %s\nconfigured %s\n", result.EngineEntries, result.IndexPath, result.FragmentPath)
+	return nil
+}
+
+// indexEngineReal builds an offline clangd index for p's Engine/Plugins
+// entries and points a project-local .clangd fragment at it, so clangd's
+// own live --background-index stops covering that subtree (see GitHub
+// issue #7; mechanism verified against clangd 20.1.8 by direct probe
+// before this was implemented -- Index.External.File declared for a
+// PathMatch-scoped fragment implicitly sets Background: Skip for the
+// matched files).
+func (a *App) indexEngineReal(ctx context.Context, p registry.Project) (IndexEngineResult, error) {
+	raw, err := os.ReadFile(p.Generation.CompilationDatabase)
+	if err != nil {
+		return IndexEngineResult{}, fmt.Errorf("read compilation database: %w", err)
+	}
+	var entries []compdb.Entry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return IndexEngineResult{}, fmt.Errorf("decode compilation database: %w", err)
+	}
+	engineEntries, _ := engineindex.Split(entries, p.Engine.Root)
+	if len(engineEntries) == 0 {
+		return IndexEngineResult{}, engineindex.ErrNoEngineEntries
+	}
+	key, err := engineindex.Key(p.Engine.Root, engineEntries)
+	if err != nil {
+		return IndexEngineResult{}, err
+	}
+	destDir, err := engineIndexCache(key)
+	if err != nil {
+		return IndexEngineResult{}, err
+	}
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
+		return IndexEngineResult{}, err
+	}
+	cache, err := projectCache(p.ID)
+	if err != nil {
+		return IndexEngineResult{}, err
+	}
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		return IndexEngineResult{}, err
+	}
+	staging, err := os.MkdirTemp(cache, "engine-index-")
+	if err != nil {
+		return IndexEngineResult{}, err
+	}
+	defer os.RemoveAll(staging)
+	stagedCDB := filepath.Join(staging, compdb.DatabaseName)
+	if err := compdb.WriteDatabase(stagedCDB, engineEntries); err != nil {
+		return IndexEngineResult{}, err
+	}
+	indexerPath, err := engineindex.FindIndexer(p.Toolchain.ClangdPath)
+	if err != nil {
+		return IndexEngineResult{}, err
+	}
+	destIdx := filepath.Join(destDir, "engine.idx")
+	logPath := filepath.Join(destDir, "indexer.log")
+	if err := engineindex.BuildIndex(ctx, engineindex.ExecRunner{}, indexerPath, stagedCDB, destIdx, logPath); err != nil {
+		return IndexEngineResult{}, err
+	}
+	if err := engineindex.WriteFragment(p.Engine.Root, destIdx, key, p.ID); err != nil {
+		return IndexEngineResult{}, err
+	}
+	return IndexEngineResult{EngineEntries: len(engineEntries), Key: key, IndexPath: destIdx, FragmentPath: engineindex.FragmentPath(p.Engine.Root)}, nil
+}
+
+// engineIndexCache is keyed by engineindex.Key (engine root + exact engine
+// entry set and build configuration), separate from projectCache: the
+// built index and its destination are properties of an engine install's
+// module set, not of any one project, even though only one project drives
+// the build that produces it.
+//
+// This tree, like the rest of soft-ue-index's per-user cache, assumes a
+// single user per machine per project (see README's Privacy and removal
+// section): the lock below and the destination this function computes are
+// both keyed under os.UserCacheDir(), but the resource they ultimately
+// protect -- the .clangd fragment engineindex.WriteFragment writes -- lives
+// at the engine installation root, which is machine-wide, not per-user. Two
+// different user accounts running index-engine against the same engine
+// install concurrently are not serialized against each other by this lock,
+// and each would build its own index under its own cache tree while
+// pointing the one shared fragment at whichever ran last -- not handled in
+// this version.
+func engineIndexCache(key string) (string, error) {
+	root, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "soft-ue-index", "engines", key), nil
+}
+
+// tryEngineIndexLock serializes index-engine runs against the same engine
+// root -- distinct from withProjectGenerationLock's per-project lock,
+// because the contended resource here (the shared .clangd fragment at the
+// engine root) is per-engine, not per-project: two different projects on
+// the same engine install running index-engine concurrently must not
+// interleave their WriteFragment calls. Reports contention through
+// locked=false rather than blocking indefinitely -- run's caller has no
+// deadline on ctx, and clangd-indexer against a real engine can take
+// hours, so blocking here (as an earlier version of this function did, via
+// registry.AcquireFileLock's unbounded retry loop) meant a second
+// invocation produced no output at all for that entire duration. Mirrors
+// how `watch` already reports its own equivalent contention
+// ("watch already running") rather than hanging.
+func (a *App) tryEngineIndexLock(engineRoot string, run func() error) (locked bool, err error) {
+	root, err := engineIndexCache(filepath.Join(".locks", engineRootLockKey(engineRoot)))
+	if err != nil {
+		return false, err
+	}
+	release, acquired, err := registry.TryAcquireFileLock(filepath.Join(root, "index-engine.lock"))
+	if err != nil {
+		return false, err
+	}
+	if !acquired {
+		return false, nil
+	}
+	defer release()
+	return true, run()
+}
+
+func engineRootLockKey(engineRoot string) string {
+	abs, err := filepath.Abs(engineRoot)
+	if err != nil {
+		abs = engineRoot
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(filepath.ToSlash(abs))))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 func (a *App) withProjectGenerationLock(ctx context.Context, id string, run func() error) error {
