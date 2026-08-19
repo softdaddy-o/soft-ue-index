@@ -274,6 +274,23 @@ func TestSearchSymbolsRejectsPathPrefixOutsideProjectAndEngine(t *testing.T) {
 	}
 }
 
+// TestSearchSymbolsReportsPathNotFoundForMissingPathPrefix guards against a
+// typo'd path_prefix collapsing into the generic "code intelligence request
+// failed" via mapError's catch-all -- a nonexistent path and an
+// out-of-bounds one should not be indistinguishable to the caller.
+func TestSearchSymbolsReportsPathNotFoundForMissingPathPrefix(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "TypoDir")
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}, Queries: &fakeQueries{}})
+	_, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "x", PathPrefix: missing})
+	if !errors.Is(err, ErrPathNotFound) {
+		t.Fatalf("expected ErrPathNotFound, got %v", err)
+	}
+	if mapped := mapError(err); mapped.Error() != ErrPathNotFound.Error() {
+		t.Fatalf("mapError collapsed a missing path_prefix into %q, want the specific %q message", mapped, ErrPathNotFound)
+	}
+}
+
 func TestSearchSymbolsReportsIndexStateAlongsideResults(t *testing.T) {
 	root := t.TempDir()
 	q := &fakeQueries{symbols: []lsp.Symbol{{Name: "One"}}, indexState: IndexState{Phase: "indexing"}}
@@ -504,6 +521,39 @@ func TestSafePathRejectsSymlinkEscape(t *testing.T) {
 	}
 	if _, err := safePath(link, root); !errors.Is(err, ErrPathForbidden) {
 		t.Fatalf("symlink escape: %v", err)
+	}
+}
+
+// TestSafePathReportsForbiddenNotNotFoundForOutOfBoundsMissingPath guards
+// against an ordering bug: filepath.EvalSymlinks fails not-exist before the
+// root-containment check ever runs, so a typo'd path outside every root
+// looked identical to a typo'd path inside one -- both said "not found",
+// implying the out-of-bounds one would be accepted if it existed.
+func TestSafePathReportsForbiddenNotNotFoundForOutOfBoundsMissingPath(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	missing := filepath.Join(outside, "TypoDir", "x.cpp")
+	if _, err := safePath(missing, root); !errors.Is(err, ErrPathForbidden) {
+		t.Fatalf("out-of-bounds missing path: got %v, want ErrPathForbidden", err)
+	}
+}
+
+// TestSafePathRejectsUNCPathWithoutFilesystemAccess guards against a caller
+// paying a real network round trip (measured at 21s against a blackholed
+// host) inside safePath, which runs while holding a tool-concurrency slot.
+// It also guards against Windows' inconsistent errno classification of UNC
+// failures (host unreachable reads as "not exist", missing share does not)
+// leaking into the sentinel choice -- UNC is rejected lexically before any
+// syscall, the same way fileURIPath already distrusts non-localhost hosts.
+func TestSafePathRejectsUNCPathWithoutFilesystemAccess(t *testing.T) {
+	root := t.TempDir()
+	start := time.Now()
+	_, err := safePath(`\\198.51.100.1\share\x.cpp`, root)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("safePath took %v on a UNC path -- did it hit the network instead of rejecting lexically?", elapsed)
+	}
+	if !errors.Is(err, ErrPathForbidden) {
+		t.Fatalf("UNC path: got %v, want ErrPathForbidden", err)
 	}
 }
 

@@ -87,9 +87,25 @@ Malformed or oversized stdio requests are rejected before SDK dispatch and may c
 
 The first query starts clangd lazily and opens one safe project translation unit to trigger background indexing. Project symbols and engine declarations included by that unit become available first. A cold Unreal Engine index can continue filling in the background; later requests and MCP clients reuse the daemon session and persistent shards from the project's per-user cache. Source or build-rule changes update only the affected work instead of rebuilding the entire index from scratch.
 
-`project_status` reports `index_state` (`absent`, `starting`, `indexing`, `ready`, or `degraded`) without starting or blocking on a session, so a client can poll it instead of guessing. `search_symbols` does not wait for the background index to finish -- clangd answers from whatever it has already indexed, which is useful long before the index is complete, and on a large project full completion can take hours. Its result carries the same `index_state`, so a short or empty result on a cold session can be told apart from "no such symbol": check `index_state` before concluding the latter. Scope a query to a specific directory with `path_prefix` to keep unrelated engine symbols from crowding out project matches within clangd's own result cap. A real per-RPC timeout (clangd contention, or an unusually large query) is reported with the index phase for context instead of a bare timeout.
+`project_status` reports `index_state` (`absent`, `starting`, `indexing`, `ready`, or `degraded`) without starting or blocking on a session, so a client can poll it instead of guessing. `search_symbols` does not wait for the background index to finish -- clangd answers from whatever it has already indexed, which is useful long before the index is complete, and on a large project full completion can take hours. Its result carries the same `index_state`, so a short or empty result on a cold session can be told apart from "no such symbol": check `index_state` before concluding the latter. Scope a query to a specific directory with `path_prefix` to keep unrelated engine symbols from crowding out project matches within clangd's own result cap. A per-RPC timeout while the index is still building is reported as an actionable "index is still building, retry shortly" message rather than a bare timeout; a timeout once the index is `ready` is a plain timeout, since the index is no longer the likely cause.
 
 The daemon reconciles project additions, removals, roots, toolchains, and compilation-database identities from the per-user registry without restarting MCP clients.
+
+## Cold-index memory
+
+`--clang-tidy=0` is the shipped default (unconditional, not configurable) precisely because of the measurement below. Disabling clang-tidy's default `clang-analyzer-*` static-analysis checks (real per-TU overhead on Unreal's macro/template-heavy headers, and pure cost here since this server only does navigation/search) processed more translation units while using less memory in the same window:
+
+Measured on a real ~26,800-entry Unreal Engine 5.8 compilation database with `--j=1`, sampling clangd's private memory every 15s over a 20-minute cold-start window from an empty index cache:
+
+| | `--clang-tidy` default (on) | `--clang-tidy=0` (shipped) |
+|---|---|---|
+| Translation units completed | 105/26,796 | 134/26,796 (+28%) |
+| Peak private memory | 2529.5 MB | 2117.5 MB (−16%) |
+| Private memory at 20 min | 2268.3 MB | 1890.0 MB (−17%) |
+
+This is a partial-window measurement, not a peak at completion: at `--j=1`, full completion of a database this size is on the order of tens of hours, and `search_symbols` does not need it to finish (see above).
+
+Raising `--j` to use more of the host's cores was also measured, on the same database with `--clang-tidy=0` already applied, over the same 20-minute window: `--j=4` completed only 107/26,796 translation units (vs. 134 at `--j=1`) and reached a higher peak private memory (3731.0 MB vs. 2117.5 MB). More worker threads did not trade memory for throughput here -- it cost both, on this machine and background-index priority setting. `--j` is left at its conservative default of `1` rather than tuned upward; this was not investigated further; the working assumption is contention between clangd's own worker threads and whatever else the host was doing during the run, not a property of `--j=4` in general, and it should be re-measured on a quiet, dedicated host before drawing a firm conclusion.
 
 The MVP targets source/custom Unreal Engine installations registered in the current user's Unreal Engine Builds registry. Launcher-only binary installations are outside the current indexing scope unless they are source-enabled and registered there.
 
