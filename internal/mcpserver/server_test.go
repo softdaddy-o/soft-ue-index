@@ -235,6 +235,45 @@ func TestSearchSymbolsRoutesExplicitProjectAndTruncates(t *testing.T) {
 	}
 }
 
+func TestSearchSymbolsScopesResultsToPathPrefix(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "Sub")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	inScope := filepath.Join(sub, "Foo.cpp")
+	outOfScope := filepath.Join(root, "Other.cpp")
+	for _, path := range []string{inScope, outOfScope} {
+		if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inScopeURI := "file:///" + strings.ReplaceAll(inScope, "\\", "/")
+	outOfScopeURI := "file:///" + strings.ReplaceAll(outOfScope, "\\", "/")
+	q := &fakeQueries{symbols: []lsp.Symbol{
+		{Name: "InScope", Location: lsp.Location{URI: inScopeURI}},
+		{Name: "OutOfScope", Location: lsp.Location{URI: outOfScopeURI}},
+	}}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}, Queries: q})
+
+	result, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "x", PathPrefix: sub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Name != "InScope" {
+		t.Fatalf("unexpected scoped result: %#v", result.Items)
+	}
+}
+
+func TestSearchSymbolsRejectsPathPrefixOutsideProjectAndEngine(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}, Queries: &fakeQueries{}})
+	if _, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "x", PathPrefix: outside}); !errors.Is(err, ErrPathForbidden) {
+		t.Fatalf("expected ErrPathForbidden, got %v", err)
+	}
+}
+
 func TestSearchSymbolsRejectsMissingOrUnknownProject(t *testing.T) {
 	s := New(Dependencies{Projects: fakeProjects{}})
 	if _, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{Query: "Actor"}); !errors.Is(err, ErrProjectRequired) {

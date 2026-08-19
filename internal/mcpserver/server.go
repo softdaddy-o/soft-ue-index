@@ -92,6 +92,14 @@ type SearchSymbolsInput struct {
 	ProjectID string `json:"project_id"`
 	Query     string `json:"query"`
 	MaxItems  int    `json:"max_items,omitempty"`
+	// PathPrefix, if set, keeps only symbols defined under this absolute
+	// directory path (same convention as ReadSymbolSourceInput.Path).
+	// Clangd's own workspace/symbol ranking and result cap run first, so
+	// this narrows whatever clangd already chose to return rather than
+	// deepening the underlying search: a broad query that already exhausts
+	// clangd's result budget on unrelated matches can still come back
+	// empty for a scoped path.
+	PathPrefix string `json:"path_prefix,omitempty"`
 }
 type SearchSymbolsResult struct {
 	Items     []lsp.Symbol `json:"items"`
@@ -109,6 +117,12 @@ func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (Sear
 	if s.queries == nil {
 		return SearchSymbolsResult{}, errors.New("code intelligence is unavailable")
 	}
+	var pathScope string
+	if in.PathPrefix != "" {
+		if pathScope, err = s.safeProjectPath(p, in.PathPrefix); err != nil {
+			return SearchSymbolsResult{}, err
+		}
+	}
 	max := s.itemLimit(in.MaxItems)
 	// search_symbols alone gets a longer budget than other tools: it is the
 	// one operation that depends on clangd's background index, which can
@@ -116,9 +130,19 @@ func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (Sear
 	// (lsp.Client's own 30s) is unaffected, so a warm session is no slower.
 	ctx, cancel := context.WithTimeout(ctx, s.limits.Timeout*indexReadyBudgetMultiplier)
 	defer cancel()
-	items, err := s.queries.Symbols(ctx, p, in.Query, max+1)
+	// When scoping by path, ask for clangd's full result budget rather than
+	// max+1: the scope filter below runs after clangd's own cap, so a
+	// narrow request would starve it of candidates to filter from.
+	n := max + 1
+	if pathScope != "" {
+		n = s.limits.MaxItems + 1
+	}
+	items, err := s.queries.Symbols(ctx, p, in.Query, n)
 	if err != nil {
 		return SearchSymbolsResult{}, err
+	}
+	if pathScope != "" {
+		items = filterSymbolsByPathScope(items, pathScope)
 	}
 	result := SearchSymbolsResult{Items: items}
 	if len(result.Items) > max {
@@ -128,6 +152,27 @@ func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (Sear
 	result.Items, result.Truncated = s.filterSymbols(p, result.Items, result.Truncated)
 	result.Items, result.Truncated = trimSymbols(result.Items, s.outputLimit(), result.Truncated)
 	return bounded(s.outputLimit(), result)
+}
+
+// filterSymbolsByPathScope keeps only symbols whose defining file resolves
+// to scope or a descendant of it. scope is an already-validated absolute
+// directory path (see safeProjectPath).
+func filterSymbolsByPathScope(in []lsp.Symbol, scope string) []lsp.Symbol {
+	out := in[:0]
+	for _, v := range in {
+		path, err := fileURIPath(v.Location.URI, runtimeGOOS())
+		if err != nil {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			continue
+		}
+		if resolved == scope || strings.HasPrefix(resolved, scope+string(filepath.Separator)) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 type TextPosition struct {

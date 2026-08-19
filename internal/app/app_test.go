@@ -1,13 +1,19 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -637,4 +643,227 @@ func (*e2eQueries) OutgoingCalls(context.Context, registry.Project, lsp.CallHier
 }
 func (*e2eQueries) IndexState(context.Context, registry.Project) (mcpserver.IndexState, error) {
 	return mcpserver.IndexState{}, nil
+}
+
+// --- Regression coverage: Symbols() must not wait for background-index
+// completion. scriptedProcess/scriptedFactory drive a real *lsp.Manager
+// through a hand-scripted clangd conversation over a net.Pipe, mirroring
+// the pattern used in internal/lsp's own manager tests (those helpers are
+// unexported there, so the minimal framing is reproduced here).
+
+type scriptedProcess struct {
+	conn net.Conn
+	done chan struct{}
+	once sync.Once
+}
+
+func (p *scriptedProcess) Stdin() io.WriteCloser { return p.conn }
+func (p *scriptedProcess) Stdout() io.ReadCloser { return p.conn }
+func (p *scriptedProcess) Wait() error           { <-p.done; return nil }
+func (p *scriptedProcess) Kill() error {
+	p.once.Do(func() { close(p.done); _ = p.conn.Close() })
+	return nil
+}
+
+type scriptedFactory struct {
+	mu   sync.Mutex
+	peer net.Conn
+}
+
+func (f *scriptedFactory) Start(context.Context, string, []string, string) (lsp.Process, error) {
+	a, b := net.Pipe()
+	f.mu.Lock()
+	f.peer = b
+	f.mu.Unlock()
+	return &scriptedProcess{conn: a, done: make(chan struct{})}, nil
+}
+
+// waitForPeer, writeLSPFrame, and readLSPFrame return errors rather than
+// taking a *testing.T and calling Fatal directly: they are driven from a
+// background goroutine in TestSymbolsDoesNotWaitForBackgroundIndexCompletion,
+// and t.Fatal/FailNow is only safe to call from the goroutine running the
+// test itself.
+func (f *scriptedFactory) waitForPeer(timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		peer := f.peer
+		f.mu.Unlock()
+		if peer != nil {
+			return peer, nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return nil, errors.New("factory never started a process")
+}
+
+func writeLSPFrame(w io.Writer, v any) error {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("marshal frame: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(body)); err != nil {
+		return fmt.Errorf("write frame header: %w", err)
+	}
+	if _, err := w.Write(body); err != nil {
+		return fmt.Errorf("write frame body: %w", err)
+	}
+	return nil
+}
+
+func readLSPFrame(r *bufio.Reader) (map[string]any, error) {
+	length := -1
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("read frame header: %w", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		if rest, ok := strings.CutPrefix(strings.ToLower(line), "content-length:"); ok {
+			n, err := strconv.Atoi(strings.TrimSpace(rest))
+			if err != nil {
+				return nil, fmt.Errorf("bad content-length %q: %w", line, err)
+			}
+			length = n
+		}
+	}
+	if length < 0 {
+		return nil, errors.New("frame had no content-length header")
+	}
+	body := make([]byte, length)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, fmt.Errorf("read frame body: %w", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("unmarshal frame: %w", err)
+	}
+	return m, nil
+}
+
+// newScriptedProject registers project id under the real per-user cache
+// directory (matching validateProjectCache) so lspQueries.client accepts
+// it, and cleans up afterward. It intentionally does not reuse a real
+// project's ID (e.g. any locally registered "elpis") so it cannot collide
+// with actual daemon state on this machine.
+func newScriptedProject(t *testing.T, id string) registry.Project {
+	t.Helper()
+	cache, err := projectCache(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cache, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(cache) })
+	db := filepath.Join(cache, compdb.DatabaseName)
+	if err := os.WriteFile(db, []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	return registry.Project{
+		ID:         id,
+		UProject:   filepath.Join(root, "Game.uproject"),
+		Toolchain:  registry.Toolchain{ClangdPath: "fake"},
+		Generation: registry.GenerationState{CacheDir: cache, CompilationDatabase: db},
+	}
+}
+
+func TestSymbolsDoesNotWaitForBackgroundIndexCompletion(t *testing.T) {
+	f := &scriptedFactory{}
+	manager := lsp.NewManager(f)
+	defer manager.Close()
+	p := newScriptedProject(t, fmt.Sprintf("readiness-regression-%d", time.Now().UnixNano()))
+
+	type symbolsResult struct {
+		items []lsp.Symbol
+		err   error
+	}
+	symbolsDone := make(chan symbolsResult, 1)
+	go func() {
+		items, err := (lspQueries{manager: manager}).Symbols(context.Background(), p, "Foo", 10)
+		symbolsDone <- symbolsResult{items, err}
+	}()
+
+	// Drives the fake clangd side of the conversation on its own goroutine,
+	// bounded by a read deadline on the pipe, so a regression (Symbols()
+	// blocking instead of issuing workspace/symbol) fails this test cleanly
+	// instead of hanging it -- as it did when manually verified against the
+	// pre-fix behavior, where workspace/symbol was never sent at all.
+	driverDone := make(chan error, 1)
+	go func() {
+		peer, err := f.waitForPeer(5 * time.Second)
+		if err != nil {
+			driverDone <- err
+			return
+		}
+		_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
+		r := bufio.NewReader(peer)
+
+		initReq, err := readLSPFrame(r)
+		if err != nil {
+			driverDone <- fmt.Errorf("read initialize: %w", err)
+			return
+		}
+		if initReq["method"] != "initialize" {
+			driverDone <- fmt.Errorf("first message = %v, want initialize", initReq)
+			return
+		}
+		if err := writeLSPFrame(peer, map[string]any{"jsonrpc": "2.0", "id": initReq["id"], "result": map[string]any{}}); err != nil {
+			driverDone <- err
+			return
+		}
+		initializedNotif, err := readLSPFrame(r)
+		if err != nil {
+			driverDone <- fmt.Errorf("read initialized: %w", err)
+			return
+		}
+		if initializedNotif["method"] != "initialized" {
+			driverDone <- fmt.Errorf("second message = %v, want initialized", initializedNotif)
+			return
+		}
+
+		// Start (and never finish) a background-index progress cycle. Under
+		// the old design (WaitForIndexReady gating Symbols), this alone
+		// would have blocked the call above until its context expired --
+		// and Symbols() here uses context.Background(), which never does.
+		if err := writeLSPFrame(peer, map[string]any{
+			"jsonrpc": "2.0", "method": "$/progress",
+			"params": map[string]any{"token": "x", "value": map[string]any{"kind": "begin"}},
+		}); err != nil {
+			driverDone <- err
+			return
+		}
+
+		workspaceSymbolReq, err := readLSPFrame(r)
+		if err != nil {
+			driverDone <- fmt.Errorf("read workspace/symbol (Symbols() may be blocking on index readiness instead of issuing the RPC): %w", err)
+			return
+		}
+		if workspaceSymbolReq["method"] != "workspace/symbol" {
+			driverDone <- fmt.Errorf("third message = %v, want workspace/symbol", workspaceSymbolReq)
+			return
+		}
+		driverDone <- writeLSPFrame(peer, map[string]any{"jsonrpc": "2.0", "id": workspaceSymbolReq["id"], "result": []any{}})
+	}()
+
+	select {
+	case err := <-driverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("fake clangd conversation stalled")
+	}
+	select {
+	case got := <-symbolsDone:
+		if got.err != nil {
+			t.Fatalf("Symbols() error = %v, want nil (must not wait for index completion)", got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Symbols() did not return after workspace/symbol was answered")
+	}
 }

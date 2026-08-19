@@ -965,15 +965,26 @@ func (q lspQueries) Symbols(ctx context.Context, p registry.Project, s string, n
 	if e != nil {
 		return nil, e
 	}
-	// workspace/symbol needs clangd's background index; on a cold session
-	// this can still be building well past the client's per-RPC timeout.
-	// Wait for it (bounded by ctx, not an arbitrary sleep) instead of
-	// issuing the RPC and letting it time out on its own.
-	if e := c.WaitForIndexReady(ctx); e != nil {
-		return nil, e
-	}
+	// Do not wait for the background index to finish: clangd answers
+	// workspace/symbol from whatever it has already indexed, and that is
+	// useful long before the index is complete (confirmed empirically --
+	// queries against a ~0.5% complete index on a large project returned
+	// correct results in well under a second). On a project whose full
+	// background index takes hours, gating on completion would make
+	// search_symbols report "still building" for the entire session even
+	// though clangd could already answer.
 	items, err := c.WorkspaceSymbols(ctx, s, lsp.Limits{MaxItems: n})
-	return filterLSPSymbols(p, items), err
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			// A real per-RPC deadline here is unusual (cold-start
+			// contention, or a very large query) rather than the common
+			// case, so report the current index phase for context instead
+			// of a bare timeout.
+			err = fmt.Errorf("%w: index phase is %q", lsp.ErrIndexBuilding, c.IndexPhase())
+		}
+		return nil, err
+	}
+	return filterLSPSymbols(p, items), nil
 }
 
 // IndexState reports the project's clangd session/index phase without
