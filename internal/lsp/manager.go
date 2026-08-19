@@ -519,7 +519,14 @@ func (m *Manager) start(ctx context.Context, cfg ProjectConfig) (Process, error)
 	if err := os.MkdirAll(filepath.Join(cfg.CacheDir, ".cache", "clangd", "index"), 0700); err != nil {
 		return nil, err
 	}
-	args := []string{"--compile-commands-dir=" + cfg.CacheDir, "--background-index", "--background-index-priority=background", "--pch-storage=disk", "--j=" + itoa(cfg.Threads), "--log=error"}
+	// clang-tidy is on by default in clangd and runs its clang-analyzer-*
+	// static-analysis checks even with no .clang-tidy file present. Those
+	// checks build a CFG and symbolically execute paths per translation
+	// unit -- expensive on Unreal's macro/template-heavy headers, and pure
+	// overhead here since this project only wants navigation and search,
+	// not lint diagnostics. Disabling it is a low-memory default alongside
+	// --j=1 and --pch-storage=disk above.
+	args := []string{"--compile-commands-dir=" + cfg.CacheDir, "--background-index", "--background-index-priority=background", "--pch-storage=disk", "--clang-tidy=0", "--j=" + itoa(cfg.Threads), "--log=error"}
 	p, err := m.factory.Start(ctx, cfg.Clangd, args, filepath.Join(cfg.CacheDir, "clangd.log"))
 	if err != nil {
 		return nil, err
