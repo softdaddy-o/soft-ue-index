@@ -59,13 +59,13 @@ func (f *slowFactory) Start(ctx context.Context, path string, args []string, log
 }
 
 func (f *fakeFactory) Start(_ context.Context, _ string, args []string, _ string) (Process, error) {
+	a, b := net.Pipe()
+	p := &fakeProcess{conn: a, done: make(chan struct{})}
 	f.mu.Lock()
 	f.n++
 	f.args = append(f.args, append([]string(nil), args...))
-	f.mu.Unlock()
-	a, b := net.Pipe()
-	p := &fakeProcess{conn: a, done: make(chan struct{})}
 	f.last = p
+	f.mu.Unlock()
 	go func() {
 		r := bufio.NewReader(b)
 		defer b.Close()
@@ -132,6 +132,39 @@ func TestManagerSharesSessionAndClosesIdle(t *testing.T) {
 	m.mu.Unlock()
 	if ok {
 		t.Fatal("idle session remains")
+	}
+}
+
+// waitForMethods polls fakeFactory's recorded methods until at least want
+// have been recorded or a bounded deadline passes, returning whatever was
+// recorded either way -- net.Pipe writes complete as soon as the other side
+// has read the bytes, not once fakeFactory's reader goroutine has finished
+// unmarshalling and appending them to f.methods, so a caller-side check right
+// after a write can observe fewer messages than were actually sent (flaked
+// under -race in CI: the reader goroutine lagged past an immediate read).
+//
+// This only asserts "recorded within the deadline", not "recorded by the
+// time the triggering call returned" -- the transport-level ordering (e.g.
+// didOpen fully written before Client() returns) still holds via net.Pipe's
+// synchronous writes, but a regression that defers recording further (for
+// example, moving a seed didOpen into a goroutine fired after a session is
+// published) would still pass here as long as it lands inside the deadline.
+func waitForMethods(t *testing.T, f *fakeFactory, want int) []wireMessage {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var messages []wireMessage
+	for {
+		f.mu.Lock()
+		messages = append([]wireMessage(nil), f.methods...)
+		f.mu.Unlock()
+		if len(messages) >= want {
+			return messages
+		}
+		if time.Now().After(deadline) {
+			t.Logf("waitForMethods: deadline hit with %d/%d methods -- may be recorder lag rather than a missing message", len(messages), want)
+			return messages
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -262,22 +295,7 @@ func TestManagerOpensSeedAfterInitializeBeforePublishing(t *testing.T) {
 	if _, err := m.Client(context.Background(), ProjectConfig{ID: "seed", Clangd: "fake", CacheDir: cache, CompilationDatabase: db, RootURI: fileURIForTest(root)}); err != nil {
 		t.Fatal(err)
 	}
-	// m.Client returning only guarantees the client's didOpen write was
-	// flushed to the transport, not that fakeFactory's reader goroutine on
-	// the other end has recorded it into f.methods yet -- poll instead of
-	// reading immediately, or this flakes under -race's added scheduling
-	// latency (observed in CI: the reader goroutine lagged past this point).
-	deadline := time.Now().Add(2 * time.Second)
-	var messages []wireMessage
-	for {
-		f.mu.Lock()
-		messages = append([]wireMessage(nil), f.methods...)
-		f.mu.Unlock()
-		if len(messages) >= 3 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	messages := waitForMethods(t, f, 3)
 	if len(messages) < 3 || messages[0].Method != "initialize" || messages[1].Method != "initialized" || messages[2].Method != "textDocument/didOpen" {
 		t.Fatalf("startup methods=%v", messages)
 	}
@@ -348,17 +366,7 @@ func TestManagerSourceWriteRefreshesOnlyMatchingLiveSession(t *testing.T) {
 	if err := m.SourceFileChanged("game", source); err != nil {
 		t.Fatal(err)
 	}
-	var messages []wireMessage
-	deadline := time.Now().Add(time.Second)
-	for {
-		f.mu.Lock()
-		messages = append([]wireMessage(nil), f.methods...)
-		f.mu.Unlock()
-		if len(messages) > before || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	messages := waitForMethods(t, f, before+1)
 	if len(messages) != before+1 || messages[len(messages)-1].Method != "textDocument/didChange" || !strings.Contains(string(messages[len(messages)-1].Params), `"text":"new"`) {
 		t.Fatalf("messages=%v", messages[before:])
 	}

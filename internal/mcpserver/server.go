@@ -757,13 +757,45 @@ func safePath(path string, roots ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Reject UNC paths lexically, before any filesystem call. EvalSymlinks on
+	// an unreachable or slow SMB host blocks for tens of seconds (measured:
+	// ~21s against a blackholed address) while this runs inside a bounded
+	// tool-concurrency slot, and Windows' errno for a UNC failure is
+	// inconsistent (host unreachable reads as "not exist", missing share
+	// does not) -- neither should decide the sentinel or cost a network
+	// round trip for a path this server was never going to trust anyway;
+	// fileURIPath already applies the same non-localhost distrust to
+	// clangd-returned URIs.
+	if strings.HasPrefix(abs, `\\`) {
+		return "", ErrPathForbidden
+	}
 	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// A distinct, actionable sentinel: an out-of-bounds path and a
-			// typo'd/missing one look identical past this point otherwise,
-			// and mapError's catch-all obscures the raw OS error text.
-			return "", ErrPathNotFound
+			// A distinct, actionable sentinel -- but only when the path is
+			// lexically inside one of the roots already. EvalSymlinks fails
+			// not-exist before the containment loop below ever runs, so
+			// without this check an out-of-bounds typo would say "not
+			// found" too, implying it would be accepted if it existed. This
+			// containment test is lexical only (roots are not
+			// symlink-resolved here), so a nonexistent path underneath a
+			// junction that points into a root reports "forbidden" rather
+			// than "not found" -- the same safe-by-default direction as the
+			// existing resolved-symlink check below.
+			for _, root := range roots {
+				if root == "" {
+					continue
+				}
+				rootAbs, e := filepath.Abs(root)
+				if e != nil {
+					continue
+				}
+				rel, e := filepath.Rel(rootAbs, abs)
+				if e == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+					return "", ErrPathNotFound
+				}
+			}
+			return "", ErrPathForbidden
 		}
 		return "", err
 	}

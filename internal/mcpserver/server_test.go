@@ -524,6 +524,39 @@ func TestSafePathRejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
+// TestSafePathReportsForbiddenNotNotFoundForOutOfBoundsMissingPath guards
+// against an ordering bug: filepath.EvalSymlinks fails not-exist before the
+// root-containment check ever runs, so a typo'd path outside every root
+// looked identical to a typo'd path inside one -- both said "not found",
+// implying the out-of-bounds one would be accepted if it existed.
+func TestSafePathReportsForbiddenNotNotFoundForOutOfBoundsMissingPath(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	missing := filepath.Join(outside, "TypoDir", "x.cpp")
+	if _, err := safePath(missing, root); !errors.Is(err, ErrPathForbidden) {
+		t.Fatalf("out-of-bounds missing path: got %v, want ErrPathForbidden", err)
+	}
+}
+
+// TestSafePathRejectsUNCPathWithoutFilesystemAccess guards against a caller
+// paying a real network round trip (measured at 21s against a blackholed
+// host) inside safePath, which runs while holding a tool-concurrency slot.
+// It also guards against Windows' inconsistent errno classification of UNC
+// failures (host unreachable reads as "not exist", missing share does not)
+// leaking into the sentinel choice -- UNC is rejected lexically before any
+// syscall, the same way fileURIPath already distrusts non-localhost hosts.
+func TestSafePathRejectsUNCPathWithoutFilesystemAccess(t *testing.T) {
+	root := t.TempDir()
+	start := time.Now()
+	_, err := safePath(`\\198.51.100.1\share\x.cpp`, root)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("safePath took %v on a UNC path -- did it hit the network instead of rejecting lexically?", elapsed)
+	}
+	if !errors.Is(err, ErrPathForbidden) {
+		t.Fatalf("UNC path: got %v, want ErrPathForbidden", err)
+	}
+}
+
 func TestTwoProjectsRouteToTheirOwnBackendConfiguration(t *testing.T) {
 	a, b := t.TempDir(), t.TempDir()
 	q := &fakeQueries{symbols: []lsp.Symbol{{Name: "ok"}}}
