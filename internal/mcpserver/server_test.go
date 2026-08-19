@@ -291,6 +291,28 @@ func TestSearchSymbolsReportsPathNotFoundForMissingPathPrefix(t *testing.T) {
 	}
 }
 
+// TestSearchSymbolsReportsPathInvalidForMalformedPathPrefix guards against
+// the opaque catch-all a different route into safePath's EvalSymlinks call
+// used to produce: a path_prefix with characters Windows never allows in a
+// path (e.g. a caller trying a glob) failed with ERROR_INVALID_NAME (123),
+// which is neither os.IsNotExist nor an out-of-bounds path, and fell all the
+// way through to mapError's generic "code intelligence request failed" --
+// arguably the more likely caller mistake than a plain typo, and the one
+// case among the three (typo, out-of-bounds, malformed) that still had no
+// actionable message.
+func TestSearchSymbolsReportsPathInvalidForMalformedPathPrefix(t *testing.T) {
+	root := t.TempDir()
+	malformed := filepath.Join(root, "Sou*rce")
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}, Queries: &fakeQueries{}})
+	_, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "x", PathPrefix: malformed})
+	if !errors.Is(err, ErrPathInvalid) {
+		t.Fatalf("expected ErrPathInvalid, got %v", err)
+	}
+	if mapped := mapError(err); mapped.Error() != ErrPathInvalid.Error() {
+		t.Fatalf("mapError collapsed a malformed path_prefix into %q, want the specific %q message", mapped, ErrPathInvalid)
+	}
+}
+
 func TestSearchSymbolsReportsIndexStateAlongsideResults(t *testing.T) {
 	root := t.TempDir()
 	q := &fakeQueries{symbols: []lsp.Symbol{{Name: "One"}}, indexState: IndexState{Phase: "indexing"}}

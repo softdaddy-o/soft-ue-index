@@ -24,6 +24,7 @@ var (
 	ErrProjectNotFound = errors.New("project not found")
 	ErrPathForbidden   = errors.New("path is outside the selected project or engine")
 	ErrPathNotFound    = errors.New("path does not exist")
+	ErrPathInvalid     = errors.New("path syntax is invalid")
 	ErrLimitExceeded   = errors.New("request exceeds configured limit")
 	ErrInvalidLimits   = errors.New("configured response limit is too small")
 	ErrToolBusy        = errors.New("too many concurrent tool calls")
@@ -699,7 +700,7 @@ func mapError(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("request timed out: %w", err)
 	}
-	if errors.Is(err, ErrProjectRequired) || errors.Is(err, ErrProjectNotFound) || errors.Is(err, ErrPathForbidden) || errors.Is(err, ErrPathNotFound) || errors.Is(err, ErrLimitExceeded) || errors.Is(err, ErrToolBusy) {
+	if errors.Is(err, ErrProjectRequired) || errors.Is(err, ErrProjectNotFound) || errors.Is(err, ErrPathForbidden) || errors.Is(err, ErrPathNotFound) || errors.Is(err, ErrPathInvalid) || errors.Is(err, ErrLimitExceeded) || errors.Is(err, ErrToolBusy) {
 		return err
 	}
 	return errors.New("code intelligence request failed")
@@ -796,6 +797,24 @@ func safePath(path string, roots ...string) (string, error) {
 				}
 			}
 			return "", ErrPathForbidden
+		}
+		// A malformed path (e.g. Windows' ERROR_INVALID_NAME for a
+		// character like '*' or '?', see patherr_windows.go) rather than
+		// one pointing somewhere missing or out of bounds. Likely the most
+		// common caller mistake of the three this function distinguishes --
+		// an MCP client guessing at glob support -- so it gets its own
+		// sentinel instead of falling into mapError's opaque catch-all with
+		// the other two (not-exist, forbidden) already handled above.
+		//
+		// Deliberately not containment-checked the way the not-exist branch
+		// above is: errno 123 is a pure function of the caller's own input
+		// string (Windows rejects the character before touching the
+		// filesystem at all), so an in-bounds and an out-of-bounds path
+		// with the same invalid character produce byte-identical errors --
+		// there is no root to compare against and nothing to leak either
+		// way, unlike not-exist, which genuinely is a filesystem oracle.
+		if isInvalidPathSyntax(err) {
+			return "", ErrPathInvalid
 		}
 		return "", err
 	}
