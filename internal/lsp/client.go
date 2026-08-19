@@ -18,10 +18,11 @@ import (
 
 var ErrClosed = errors.New("LSP client is closed")
 
-// ErrIndexBuilding is returned when a caller's context expires while
-// WaitForIndexReady is still waiting on clangd's background index. It is
-// deliberately distinct from context.DeadlineExceeded so callers can surface
-// one actionable message instead of a generic timeout.
+// ErrIndexBuilding marks an error as attributable to a not-yet-ready
+// background index (see IndexPhase) rather than a plain timeout, so a
+// caller can surface one actionable message instead of a generic one. It is
+// meant to wrap the underlying error (e.g. context.DeadlineExceeded) rather
+// than replace it, so both remain visible to errors.Is.
 var ErrIndexBuilding = errors.New("background index is still building")
 
 type ProtocolError struct {
@@ -69,7 +70,6 @@ type Client struct {
 	indexMessage string
 	indexReady   bool
 	sawProgress  bool
-	readyCh      chan struct{}
 	graceTimeout time.Duration
 	graceTimer   *time.Timer
 }
@@ -88,7 +88,7 @@ func NewClient(reader io.Reader, writer io.Writer, options ClientOptions) *Clien
 	if options.IndexGraceTimeout <= 0 {
 		options.IndexGraceTimeout = 2 * time.Second
 	}
-	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), writes: make(chan writeRequest, 32), opened: make(map[string]int), activeTokens: make(map[string]struct{}), readyCh: make(chan struct{}), graceTimeout: options.IndexGraceTimeout}
+	c := &Client{r: bufio.NewReader(reader), rawReader: reader, w: writer, max: options.MaxMessageBytes, timeout: options.RequestTimeout, notify: options.Notification, pending: make(map[uint64]chan wireMessage), done: make(chan struct{}), requests: make(chan wireMessage, 32), writes: make(chan writeRequest, 32), opened: make(map[string]int), activeTokens: make(map[string]struct{}), graceTimeout: options.IndexGraceTimeout}
 	c.wg.Add(3)
 	go c.readLoop()
 	go c.requestLoop()
@@ -280,8 +280,7 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 func (c *Client) Initialize(ctx context.Context, rootURI string) error {
 	var r any
 	// window.workDoneProgress lets clangd report background-index progress via
-	// window/workDoneProgress/create + $/progress, which IndexPhase and
-	// WaitForIndexReady depend on.
+	// window/workDoneProgress/create + $/progress, which IndexPhase depends on.
 	capabilities := map[string]any{"window": map[string]any{"workDoneProgress": true}}
 	if err := c.Call(ctx, "initialize", map[string]any{"processId": nil, "rootUri": rootURI, "capabilities": capabilities}, &r); err != nil {
 		return err
@@ -333,12 +332,11 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// markIndexReadyLocked closes readyCh at most once. Callers must hold progressMu.
+// markIndexReadyLocked is idempotent. Callers must hold progressMu.
 func (c *Client) markIndexReadyLocked() {
 	if !c.indexReady {
 		c.indexReady = true
 		c.indexMessage = ""
-		close(c.readyCh)
 	}
 }
 
@@ -390,26 +388,6 @@ func (c *Client) IndexMessage() string {
 	return c.indexMessage
 }
 
-// WaitForIndexReady blocks until the background index is ready (or was never
-// needed) or ctx is done. It never sleeps a fixed duration: readiness is
-// signaled by closing readyCh from handleProgress or the startup grace timer.
-func (c *Client) WaitForIndexReady(ctx context.Context) error {
-	c.progressMu.Lock()
-	ready := c.indexReady
-	ch := c.readyCh
-	c.progressMu.Unlock()
-	if ready {
-		return nil
-	}
-	select {
-	case <-ch:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("%w: %w", ErrIndexBuilding, ctx.Err())
-	case <-c.done:
-		return ErrClosed
-	}
-}
 func (c *Client) Shutdown(ctx context.Context) error {
 	var r any
 	err := c.Call(ctx, "shutdown", nil, &r)

@@ -104,6 +104,12 @@ type SearchSymbolsInput struct {
 type SearchSymbolsResult struct {
 	Items     []lsp.Symbol `json:"items"`
 	Truncated bool         `json:"truncated"`
+	// IndexState is the clangd session/background-index phase at the time
+	// of this query (see ProjectStatusResult.IndexState). search_symbols no
+	// longer waits for the index to finish, so an empty or short Items with
+	// IndexState other than "ready" means the index may simply not have
+	// reached the relevant files yet -- not that the symbol doesn't exist.
+	IndexState string `json:"index_state,omitempty"`
 }
 
 func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (SearchSymbolsResult, error) {
@@ -132,7 +138,11 @@ func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (Sear
 	defer cancel()
 	// When scoping by path, ask for clangd's full result budget rather than
 	// max+1: the scope filter below runs after clangd's own cap, so a
-	// narrow request would starve it of candidates to filter from.
+	// narrow request would starve it of candidates to filter from. This
+	// only widens anything when the caller's own max_items is below
+	// s.limits.MaxItems; clangd's own default result cap (~100, since
+	// nothing here configures --limit-results) is otherwise the binding
+	// constraint regardless of what n asks for.
 	n := max + 1
 	if pathScope != "" {
 		n = s.limits.MaxItems + 1
@@ -141,10 +151,22 @@ func (s *Server) SearchSymbols(ctx context.Context, in SearchSymbolsInput) (Sear
 	if err != nil {
 		return SearchSymbolsResult{}, err
 	}
+	// scopeMayHaveDroppedMatches is the best signal available locally for
+	// "clangd's own result cap, not just the scope filter, may have kept
+	// this from being complete": clangd returned as many items as we asked
+	// for, so items beyond its ranking cutoff -- some possibly in scope --
+	// were never seen at all. When it returned fewer than n, nothing was
+	// held back by any cap and the scope filter alone fully explains any
+	// items dropped below.
+	scopeMayHaveDroppedMatches := pathScope != "" && len(items) >= n
 	if pathScope != "" {
 		items = filterSymbolsByPathScope(items, pathScope)
 	}
-	result := SearchSymbolsResult{Items: items}
+	result := SearchSymbolsResult{Items: items, Truncated: scopeMayHaveDroppedMatches}
+	// Best-effort and never blocking: see IndexState's own doc comment.
+	if state, err := s.queries.IndexState(ctx, p); err == nil {
+		result.IndexState = state.Phase
+	}
 	if len(result.Items) > max {
 		result.Items = result.Items[:max]
 		result.Truncated = true
@@ -666,9 +688,10 @@ func mapError(err error) error {
 	if err == nil {
 		return nil
 	}
-	// Checked before the generic deadline case: WaitForIndexReady wraps
-	// context.DeadlineExceeded in ErrIndexBuilding, and the actionable
-	// "still indexing" message is more useful here than a bare timeout.
+	// Checked before the generic deadline case: lspQueries.Symbols wraps a
+	// deadline in ErrIndexBuilding while the index isn't ready yet, and the
+	// actionable "still indexing" message is more useful here than a bare
+	// timeout.
 	if errors.Is(err, lsp.ErrIndexBuilding) {
 		return errors.New("code intelligence index is still building for this project; retry shortly")
 	}

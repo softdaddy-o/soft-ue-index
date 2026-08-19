@@ -744,13 +744,16 @@ func readLSPFrame(r *bufio.Reader) (map[string]any, error) {
 	return m, nil
 }
 
-// newScriptedProject registers project id under the real per-user cache
-// directory (matching validateProjectCache) so lspQueries.client accepts
-// it, and cleans up afterward. It intentionally does not reuse a real
-// project's ID (e.g. any locally registered "elpis") so it cannot collide
-// with actual daemon state on this machine.
+// newScriptedProject registers project id under a cache directory that
+// matches validateProjectCache's expectations, so lspQueries.client accepts
+// it.
 func newScriptedProject(t *testing.T, id string) registry.Project {
 	t.Helper()
+	// Redirect os.UserCacheDir (and so projectCache) into a throwaway
+	// directory instead of the real per-user cache: hermetic, and cannot
+	// leave residue in or collide with real project state (e.g. a locally
+	// registered "elpis") if the test fails or is killed before cleanup.
+	t.Setenv("LocalAppData", t.TempDir())
 	cache, err := projectCache(id)
 	if err != nil {
 		t.Fatal(err)
@@ -758,7 +761,6 @@ func newScriptedProject(t *testing.T, id string) registry.Project {
 	if err := os.MkdirAll(cache, 0700); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(cache) })
 	db := filepath.Join(cache, compdb.DatabaseName)
 	if err := os.WriteFile(db, []byte("[]"), 0o600); err != nil {
 		t.Fatal(err)
@@ -769,6 +771,35 @@ func newScriptedProject(t *testing.T, id string) registry.Project {
 		UProject:   filepath.Join(root, "Game.uproject"),
 		Toolchain:  registry.Toolchain{ClangdPath: "fake"},
 		Generation: registry.GenerationState{CacheDir: cache, CompilationDatabase: db},
+	}
+}
+
+func TestWrapIndexBuildingTimeoutPreservesDeadlineExceededAndOnlyAppliesWhileNotReady(t *testing.T) {
+	notReady := wrapIndexBuildingTimeout(context.DeadlineExceeded, "indexing")
+	if !errors.Is(notReady, lsp.ErrIndexBuilding) {
+		t.Fatalf("err=%v, want ErrIndexBuilding while phase=indexing", notReady)
+	}
+	if !errors.Is(notReady, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want it to still chain to context.DeadlineExceeded", notReady)
+	}
+
+	// The bug this guards against: a single %w (dropping the underlying
+	// error) applied unconditionally produced a message that could read
+	// "background index is still building: index phase is \"ready\"" --
+	// self-contradictory, and mapError's ErrIndexBuilding branch shadowed
+	// the real cause (a slow query, or an unrelated caller deadline) for
+	// an index that was not building at all.
+	ready := wrapIndexBuildingTimeout(context.DeadlineExceeded, "ready")
+	if errors.Is(ready, lsp.ErrIndexBuilding) {
+		t.Fatalf("err=%v, must not claim the index is building when phase=ready", ready)
+	}
+	if !errors.Is(ready, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want it to still be recognizable as a deadline error when phase=ready", ready)
+	}
+
+	other := errors.New("boom")
+	if got := wrapIndexBuildingTimeout(other, "indexing"); got != other {
+		t.Fatalf("non-deadline error was altered: %v", got)
 	}
 }
 

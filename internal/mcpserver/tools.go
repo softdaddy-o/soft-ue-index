@@ -25,7 +25,7 @@ func (s *Server) MCPServer(version string) *mcp.Server {
 	mcp.AddTool(m, &mcp.Tool{Name: "project_status", Description: "Get compilation database status for one explicit project."}, func(ctx context.Context, _ *mcp.CallToolRequest, in ProjectStatusInput) (*mcp.CallToolResult, ProjectStatusResult, error) {
 		return admitted(s, func() (ProjectStatusResult, error) { return s.ProjectStatus(ctx, in) })
 	})
-	mcp.AddTool(m, &mcp.Tool{Name: "search_symbols", Description: "Search symbols in one explicit project. Pass path_prefix (an absolute directory path) to keep only symbols under it (recommended on large projects, where an unscoped query can fill the whole result budget with unrelated engine symbols)."}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchSymbolsInput) (*mcp.CallToolResult, SearchSymbolsResult, error) {
+	mcp.AddTool(m, &mcp.Tool{Name: "search_symbols", Description: "Search symbols in one explicit project. Does not wait for the background index to finish, so a cold session can return short or empty results before it has reached the relevant files -- check the returned index_state (\"starting\"/\"indexing\"/\"ready\"/\"degraded\") before concluding a symbol does not exist. Pass path_prefix (an absolute directory path) to keep only symbols under it (recommended on large projects, where an unscoped query can fill the whole result budget with unrelated engine symbols)."}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchSymbolsInput) (*mcp.CallToolResult, SearchSymbolsResult, error) {
 		return admitted(s, func() (SearchSymbolsResult, error) { return s.SearchSymbols(ctx, in) })
 	})
 	addLocations(m, "find_definition", "Find a definition.", s.FindDefinition, s)
