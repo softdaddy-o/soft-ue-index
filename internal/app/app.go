@@ -963,7 +963,11 @@ func (q lspQueries) Symbols(ctx context.Context, p registry.Project, s string, n
 	c, done, e := q.client(ctx, p)
 	defer done()
 	if e != nil {
-		return nil, e
+		// A deadline here means the session itself hasn't started yet
+		// (clangd spawn, initialize, seed didOpen) -- the phase is "starting"
+		// by definition, since q.client only returns once a *lsp.Client
+		// exists.
+		return nil, wrapIndexBuildingTimeout(e, "starting")
 	}
 	// Do not wait for the background index to finish: clangd answers
 	// workspace/symbol from whatever it has already indexed, and that is
@@ -975,16 +979,23 @@ func (q lspQueries) Symbols(ctx context.Context, p registry.Project, s string, n
 	// though clangd could already answer.
 	items, err := c.WorkspaceSymbols(ctx, s, lsp.Limits{MaxItems: n})
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			// A real per-RPC deadline here is unusual (cold-start
-			// contention, or a very large query) rather than the common
-			// case, so report the current index phase for context instead
-			// of a bare timeout.
-			err = fmt.Errorf("%w: index phase is %q", lsp.ErrIndexBuilding, c.IndexPhase())
-		}
-		return nil, err
+		return nil, wrapIndexBuildingTimeout(err, c.IndexPhase())
 	}
 	return filterLSPSymbols(p, items), nil
+}
+
+// wrapIndexBuildingTimeout adds actionable index-phase context to a
+// deadline error, but only while the index genuinely is not ready yet --
+// otherwise the message would claim "still building" for an index that is
+// done, masking what's actually a slow query or an unrelated caller
+// deadline. It always preserves the original error in the chain
+// (errors.Is(err, context.DeadlineExceeded) keeps working) alongside the
+// new sentinel, unlike a single %w that would drop it.
+func wrapIndexBuildingTimeout(err error, phase string) error {
+	if phase != "ready" && errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w (index phase is %q): %w", lsp.ErrIndexBuilding, phase, err)
+	}
+	return err
 }
 
 // IndexState reports the project's clangd session/index phase without

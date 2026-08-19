@@ -610,59 +610,26 @@ func TestIndexPhaseTransitionsThroughWorkDoneProgressLifecycle(t *testing.T) {
 	}
 }
 
-func TestWaitForIndexReadyBlocksUntilProgressEndsThenReturns(t *testing.T) {
+// TestIndexPhaseStaysIndexingPastGraceTimeoutWhenActivelyIndexing covers the
+// invariant that used to be exercised through WaitForIndexReady: the grace
+// timeout is a fallback for "clangd never announced any progress," not a
+// ceiling on how long real progress is allowed to run. A short grace window
+// elapsing while a workDoneProgress is genuinely active must not flip the
+// phase to "ready".
+func TestIndexPhaseStaysIndexingPastGraceTimeoutWhenActivelyIndexing(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()
-	c := NewClient(a, a, ClientOptions{IndexGraceTimeout: time.Hour})
+	c := NewClient(a, a, ClientOptions{IndexGraceTimeout: 10 * time.Millisecond})
 	defer c.Close()
 	r := bufio.NewReader(b)
 
 	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "x", "value": map[string]any{"kind": "begin"}})}))
 	settle(t, r, b, 1)
+	c.StartIndexGraceWindow()
 
-	done := make(chan error, 1)
-	go func() { done <- c.WaitForIndexReady(context.Background()) }()
-
-	select {
-	case err := <-done:
-		t.Fatalf("WaitForIndexReady returned before the index finished: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "x", "value": map[string]any{"kind": "end"}})}))
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("WaitForIndexReady error=%v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("WaitForIndexReady did not unblock after the index finished")
-	}
-}
-
-func TestWaitForIndexReadyReturnsIndexBuildingOnContextDeadlineWhileStillIndexing(t *testing.T) {
-	a, b := net.Pipe()
-	defer b.Close()
-	c := NewClient(a, a, ClientOptions{IndexGraceTimeout: time.Hour})
-	defer c.Close()
-	r := bufio.NewReader(b)
-
-	_, _ = b.Write(frameBytes(wireMessage{JSONRPC: "2.0", Method: "$/progress", Params: mustJSON(map[string]any{"token": "x", "value": map[string]any{"kind": "begin"}})}))
-	settle(t, r, b, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	err := c.WaitForIndexReady(ctx)
-	if !errors.Is(err, ErrIndexBuilding) {
-		t.Fatalf("err=%v, want ErrIndexBuilding", err)
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err=%v, want it to still chain to context.DeadlineExceeded", err)
-	}
-	// The grace timeout must not force readiness while indexing is actively
-	// in progress: only the caller's own deadline ends the wait.
+	time.Sleep(50 * time.Millisecond) // well past the 10ms grace timeout
 	if got := c.IndexPhase(); got != "indexing" {
-		t.Fatalf("phase after deadline=%q, want still indexing", got)
+		t.Fatalf("phase past grace timeout while actively indexing=%q, want still indexing", got)
 	}
 }
 
@@ -675,36 +642,11 @@ func TestIndexBecomesReadyAfterGraceTimeoutWithoutAnyProgress(t *testing.T) {
 	// has been told what to initially index.
 	c.StartIndexGraceWindow()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := c.WaitForIndexReady(ctx); err != nil {
-		t.Fatalf("WaitForIndexReady after grace timeout=%v, want nil", err)
-	}
-	if got := c.IndexPhase(); got != "ready" {
-		t.Fatalf("phase after grace timeout with no progress=%q, want ready", got)
-	}
-}
-
-func TestWaitForIndexReadyReturnsImmediatelyOnceAlreadyReady(t *testing.T) {
-	a, b := net.Pipe()
-	defer b.Close()
-	c := NewClient(a, a, ClientOptions{IndexGraceTimeout: time.Millisecond})
-	defer c.Close()
-	c.StartIndexGraceWindow()
-	// Let the grace timer flip readiness before checking the fast path.
 	deadline := time.Now().Add(time.Second)
 	for c.IndexPhase() != "ready" && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if got := c.IndexPhase(); got != "ready" {
-		t.Fatalf("phase=%q, want ready before exercising the fast path", got)
-	}
-	// An already-canceled context proves WaitForIndexReady took the
-	// already-ready fast path rather than entering its select: a wait would
-	// return ctx.Err() immediately too, but only the fast path returns nil.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := c.WaitForIndexReady(ctx); err != nil {
-		t.Fatalf("WaitForIndexReady once ready with a canceled ctx=%v, want nil", err)
+		t.Fatalf("phase after grace timeout with no progress=%q, want ready", got)
 	}
 }

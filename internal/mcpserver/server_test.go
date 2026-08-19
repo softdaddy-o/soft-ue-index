@@ -274,6 +274,78 @@ func TestSearchSymbolsRejectsPathPrefixOutsideProjectAndEngine(t *testing.T) {
 	}
 }
 
+func TestSearchSymbolsReportsIndexStateAlongsideResults(t *testing.T) {
+	root := t.TempDir()
+	q := &fakeQueries{symbols: []lsp.Symbol{{Name: "One"}}, indexState: IndexState{Phase: "indexing"}}
+	s := New(Dependencies{Projects: fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}, Queries: q})
+
+	result, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "One"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IndexState != "indexing" {
+		t.Fatalf("IndexState=%q, want %q (so a short result on a cold session isn't mistaken for a nonexistent symbol)", result.IndexState, "indexing")
+	}
+}
+
+func TestSearchSymbolsMarksTruncatedWhenScopeMayHaveDroppedMatches(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "Sub")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	inScope := filepath.Join(sub, "Foo.cpp")
+	outOfScope := filepath.Join(root, "Other.cpp")
+	for _, path := range []string{inScope, outOfScope} {
+		if err := os.WriteFile(path, []byte(""), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inScopeURI := "file:///" + strings.ReplaceAll(inScope, "\\", "/")
+	outOfScopeURI := "file:///" + strings.ReplaceAll(outOfScope, "\\", "/")
+	project := fakeProjects{projects: []registry.Project{{ID: "alpha", UProject: filepath.Join(root, "Alpha.uproject")}}}
+
+	// With Limits.MaxItems=2, a scoped search asks for n=3. Clangd (the
+	// fake) returning exactly 3 means its own result cap -- not just the
+	// scope filter -- may have kept this result from being complete: some
+	// in-scope matches beyond clangd's ranking cutoff could have been
+	// dropped before the scope filter ever saw them.
+	full := &fakeQueries{symbols: []lsp.Symbol{
+		{Name: "InScope", Location: lsp.Location{URI: inScopeURI}},
+		{Name: "OutOfScope1", Location: lsp.Location{URI: outOfScopeURI}},
+		{Name: "OutOfScope2", Location: lsp.Location{URI: outOfScopeURI}},
+	}}
+	s := New(Dependencies{Projects: project, Queries: full, Limits: Limits{MaxItems: 2}})
+	result, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "x", PathPrefix: sub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Name != "InScope" {
+		t.Fatalf("unexpected scoped result: %#v", result.Items)
+	}
+	if !result.Truncated {
+		t.Fatal("want Truncated=true: clangd returned a full budget, so scoping cannot be asserted complete")
+	}
+
+	// Clangd (the fake) returning fewer than n means nothing was held back
+	// by any cap; the scope filter alone fully explains the dropped item.
+	partial := &fakeQueries{symbols: []lsp.Symbol{
+		{Name: "InScope", Location: lsp.Location{URI: inScopeURI}},
+		{Name: "OutOfScope1", Location: lsp.Location{URI: outOfScopeURI}},
+	}}
+	s = New(Dependencies{Projects: project, Queries: partial, Limits: Limits{MaxItems: 2}})
+	result, err = s.SearchSymbols(context.Background(), SearchSymbolsInput{ProjectID: "alpha", Query: "x", PathPrefix: sub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Name != "InScope" {
+		t.Fatalf("unexpected scoped result: %#v", result.Items)
+	}
+	if result.Truncated {
+		t.Fatal("want Truncated=false: clangd returned fewer than the requested budget, nothing was held back by a cap")
+	}
+}
+
 func TestSearchSymbolsRejectsMissingOrUnknownProject(t *testing.T) {
 	s := New(Dependencies{Projects: fakeProjects{}})
 	if _, err := s.SearchSymbols(context.Background(), SearchSymbolsInput{Query: "Actor"}); !errors.Is(err, ErrProjectRequired) {
