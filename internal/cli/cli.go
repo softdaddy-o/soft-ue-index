@@ -59,7 +59,7 @@ func Parse(args []string) (Command, error) {
 			return Command{}, usageError("add requires a project path")
 		}
 		command.ProjectPath = positionals[1]
-	case "generate", "status", "remove":
+	case "generate", "status", "remove", "index-engine":
 		if len(positionals) != 2 {
 			return Command{}, usageError("%s requires a project name", command.Name)
 		}

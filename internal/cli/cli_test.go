@@ -27,6 +27,23 @@ func TestParseAddCommand(t *testing.T) {
 	}
 }
 
+func TestParseIndexEngineCommand(t *testing.T) {
+	command, err := Parse([]string{"index-engine", "game"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.Name != "index-engine" || command.ProjectName != "game" {
+		t.Fatalf("command=%#v", command)
+	}
+}
+
+func TestParseIndexEngineRequiresProjectName(t *testing.T) {
+	_, err := Parse([]string{"index-engine"})
+	if !errors.Is(err, ErrUsage) {
+		t.Fatalf("error = %v, want ErrUsage", err)
+	}
+}
+
 func TestParseGenerateEngineScope(t *testing.T) {
 	command, err := Parse([]string{"generate", "game", "--engine-scope=full"})
 	if err != nil {
