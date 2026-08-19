@@ -1067,9 +1067,13 @@ func (q lspQueries) OutgoingCalls(ctx context.Context, p registry.Project, i lsp
 }
 
 func filterLSPSymbols(p registry.Project, in []lsp.Symbol) []lsp.Symbol {
+	if len(in) == 0 {
+		return in
+	}
+	roots := resultRoots(p)
 	out := make([]lsp.Symbol, 0, len(in))
 	for _, item := range in {
-		if lspResultURIAllowed(p, item.Location.URI) {
+		if lspResultURIAllowedIn(roots, item.Location.URI) {
 			out = append(out, item)
 		}
 	}
@@ -1077,9 +1081,13 @@ func filterLSPSymbols(p registry.Project, in []lsp.Symbol) []lsp.Symbol {
 }
 
 func filterLSPLocations(p registry.Project, in []lsp.Location) []lsp.Location {
+	if len(in) == 0 {
+		return in
+	}
+	roots := resultRoots(p)
 	out := make([]lsp.Location, 0, len(in))
 	for _, item := range in {
-		if lspResultURIAllowed(p, item.URI) {
+		if lspResultURIAllowedIn(roots, item.URI) {
 			out = append(out, item)
 		}
 	}
@@ -1087,9 +1095,13 @@ func filterLSPLocations(p registry.Project, in []lsp.Location) []lsp.Location {
 }
 
 func filterLSPCallItems(p registry.Project, in []lsp.CallHierarchyItem) []lsp.CallHierarchyItem {
+	if len(in) == 0 {
+		return in
+	}
+	roots := resultRoots(p)
 	out := make([]lsp.CallHierarchyItem, 0, len(in))
 	for _, item := range in {
-		if lspResultURIAllowed(p, item.URI) {
+		if lspResultURIAllowedIn(roots, item.URI) {
 			out = append(out, item)
 		}
 	}
@@ -1097,11 +1109,15 @@ func filterLSPCallItems(p registry.Project, in []lsp.CallHierarchyItem) []lsp.Ca
 }
 
 func filterLSPCalls(p registry.Project, in []lsp.CallHierarchyCall) []lsp.CallHierarchyCall {
+	if len(in) == 0 {
+		return in
+	}
+	roots := resultRoots(p)
 	out := make([]lsp.CallHierarchyCall, 0, len(in))
 	for _, call := range in {
 		hasItem := call.From != nil || call.To != nil
-		fromAllowed := call.From == nil || lspResultURIAllowed(p, call.From.URI)
-		toAllowed := call.To == nil || lspResultURIAllowed(p, call.To.URI)
+		fromAllowed := call.From == nil || lspResultURIAllowedIn(roots, call.From.URI)
+		toAllowed := call.To == nil || lspResultURIAllowedIn(roots, call.To.URI)
 		if hasItem && fromAllowed && toAllowed {
 			out = append(out, call)
 		}
@@ -1109,7 +1125,30 @@ func filterLSPCalls(p registry.Project, in []lsp.CallHierarchyCall) []lsp.CallHi
 	return out
 }
 
+// resultRoots canonicalizes p's project and engine roots once so a caller
+// filtering N LSP results doesn't pay N redundant EvalSymlinks resolutions
+// of the same two roots. A second, larger instance of the same redundancy
+// still exists one layer up: mcpserver's Server.allowed -> safePath also
+// re-resolves both roots on every single result it checks (Opus review,
+// PR #6/#8) -- restructuring that shared cross-package path is deferred,
+// several other call sites depend on safePath's current shape -- but
+// hoisting the same-package redundancy below is a safe, self-contained win
+// on its own.
+func resultRoots(p registry.Project) []string {
+	roots := make([]string, 0, 2)
+	for _, root := range []string{filepath.Dir(p.UProject), p.Engine.Root} {
+		if canonicalRoot, err := canonicalResultPath(root); err == nil {
+			roots = append(roots, canonicalRoot)
+		}
+	}
+	return roots
+}
+
 func lspResultURIAllowed(p registry.Project, raw string) bool {
+	return lspResultURIAllowedIn(resultRoots(p), raw)
+}
+
+func lspResultURIAllowedIn(roots []string, raw string) bool {
 	path, err := localFileURIPath(raw)
 	if err != nil {
 		return false
@@ -1118,9 +1157,8 @@ func lspResultURIAllowed(p registry.Project, raw string) bool {
 	if err != nil {
 		return false
 	}
-	for _, root := range []string{filepath.Dir(p.UProject), p.Engine.Root} {
-		canonicalRoot, err := canonicalResultPath(root)
-		if err == nil && pathWithinRoot(path, canonicalRoot) {
+	for _, root := range roots {
+		if pathWithinRoot(path, root) {
 			return true
 		}
 	}
