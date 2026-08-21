@@ -74,6 +74,43 @@ RIFF/CdIx
   whole file instead produces false positives, because random bytes in `refs`
   and `symb` resemble drive-letter paths.
 
+### What the index costs a running clangd
+
+Measured on the real 539 MB index, with background indexing disabled so the
+number is attributable to the mounted index alone:
+
+| | |
+| --- | --- |
+| Index on disk | 539 MB |
+| Resident as a Dex index | **1.80 GiB** (clangd's own estimate, 1,936,333,376 bytes) |
+| Time to load | 40 s |
+| clangd private bytes, one Engine file open, before any index query | 525 MB |
+| clangd private bytes after the index loads | **3.0 GB** |
+
+Three things follow, and they matter more than any detail of the transfer
+format.
+
+**It is not mmap'd and it is not lazy per-symbol.** `loadIndex` calls
+`MemoryBuffer::getFile`, deserialises the whole thing into symbol, ref, and
+relation slabs, then builds a Dex index over them. Nothing is paged.
+
+**It expands about 3.4x.** 395 MB of the 539 MB file is the `refs` chunk. The
+on-disk form is varint-packed; the in-memory form is pointer-based, and Dex
+adds trigram posting lists on top.
+
+**It loads lazily, on the first query that needs it.** `ProjectAwareIndex`
+constructs the index inside `getIndex()`, which nothing calls until a symbol
+query arrives. Opening a file costs nothing; the first go-to-definition costs
+40 seconds and 1.8 GiB. A probe that only opens a file measures the
+translation unit and reports no index at all, which is how this cost was
+initially missed.
+
+This is the honest trade this feature makes: hours of indexing CPU, once, in
+exchange for 1.8 GiB resident and a 40 second first-query stall on every
+session that queries symbols. Sharing the artifact removes the CPU cost for
+everyone after the first person. It does nothing about the resident cost, and
+nothing in this design should be read as claiming otherwise.
+
 Rewriting the URI set is therefore sufficient **for an index of this shape**.
 That last clause matters. The measured index carried `meta`, `stri`, `symb`,
 `refs`, `rela`, and `srcs`, and nothing else. clangd's serializer can also emit
