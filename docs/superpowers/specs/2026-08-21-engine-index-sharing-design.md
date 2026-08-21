@@ -69,12 +69,25 @@ RIFF/CdIx
   produced by a zlib-enabled clangd.
 - Of 1,360,749 string entries, **66,484** are `file:///` URIs. Everything else
   is symbol names and other content.
-- **Zero** absolute paths appear outside those URIs. This was checked by
-  scanning the `stri` chunk in isolation. Scanning the whole file instead
-  produces false positives, because random bytes in `refs` and `symb` resemble
-  drive-letter paths.
+- In the measured index, **zero** absolute paths appear outside those URIs.
+  This was checked by scanning the `stri` chunk in isolation. Scanning the
+  whole file instead produces false positives, because random bytes in `refs`
+  and `symb` resemble drive-letter paths.
 
-Rewriting the URI set is therefore both sufficient and complete.
+Rewriting the URI set is therefore sufficient **for an index of this shape**.
+That last clause matters. The measured index carried `meta`, `stri`, `symb`,
+`refs`, `rela`, and `srcs`, and nothing else. clangd's serializer can also emit
+a `cmdl` chunk holding a compile command: its working directory and its
+argument list are interned into the same string table as ordinary strings, not
+as `file://` URIs, and they routinely contain raw absolute paths.
+
+So "every path is a URI" is a property of the artifacts this project produces
+today, not a guarantee of the format. Publishing must not rely on it. The
+residue check is what enforces the invariant in general, and it runs over
+every string-table entry rather than over URIs only — which is why an index
+carrying a `cmdl` chunk fails to publish loudly instead of shipping a
+publisher's build directory. A fixture containing `cmdl` belongs in the test
+suite for exactly that reason.
 
 ## Design
 
@@ -169,6 +182,47 @@ The word *normalised* carries weight there. Compile arguments embed absolute
 include directories. Hashing them raw would make the identity path-dependent
 again and defeat the whole scheme.
 
+#### What a real entry actually looks like
+
+This was checked against this project's own generated database, 26,782
+entries, rather than assumed. **Every** entry has the same three-token shape:
+
+```json
+{"directory": "<project or plugin dir>",
+ "file":      "<absolute source path>",
+ "arguments": ["<absolute path to clang-cl.exe>",
+               "@<absolute path to a .rsp response file>",
+               "<absolute source path>"]}
+```
+
+Two consequences, both fatal to a naive reading of "normalise the compile
+arguments":
+
+- **The flags are not in `arguments`.** They live in a response file, 1,234
+  distinct ones for this project, about 62 KB each, holding the `/I`, `/D`,
+  and `/std:` flags — including quoted values such as
+  `/I"C:\Program Files\...\MSVC\...\INCLUDE"`. An implementation that
+  normalises only `arguments` sees no include paths at all, finds no
+  toolchain roots, and hashes a per-user response-file path.
+- **`arguments[0]` is the compiler.** It is an absolute path that belongs to
+  none of the four roots. A residue check applied to it naively fails every
+  entry in the database.
+
+So the identity computation must:
+
+1. Treat `arguments[0]` as the compiler, not as a path value. Hash the
+   compiler's identity, never its install path.
+2. **Expand `@response` files** and normalise the expanded flags. Expansion
+   must handle the quoting the files actually use; splitting on whitespace
+   corrupts every path containing a space, and this project's own response
+   files contain several.
+3. Resolve any relative path value against the entry's `directory`, and
+   normalise `directory` itself — it participates in argument semantics.
+
+Response-file expansion is a required capability of this feature, not an
+optimisation. Without it the structural hash is neither path-independent nor
+meaningful.
+
 The structural hash is under-specified unless every input is pinned, and two
 implementations that differ on any of these never match each other. The
 definition is therefore fixed here:
@@ -210,13 +264,37 @@ values. Adapters return only derived values, never raw file contents, because
 marker files routinely contain internal build paths that must not reach a
 published manifest.
 
+#### What the primary key does not prove
+
+The structural hash covers file *paths* and *flags*, not file *contents*. Two
+engines with identical `Build.version`, identical module layout, and identical
+flags produce the same primary key even if their source differs. A patch that
+only edits existing files — the common case for a licensee fork — is entirely
+invisible to it. Header-only changes are the worst case, because they change
+what every dependent translation unit means without changing any path.
+
+This is a real limitation, not a theoretical one, and no amount of optional
+discriminators fixes it: a discriminator only helps when both sides happen to
+carry the same kind. The primary key alone is therefore **not** sufficient
+evidence to install an index.
+
+The match policy below is what makes that safe: a primary-key-only match is
+never installed silently.
+
 Match policy:
 
-- Candidates must agree on the primary key.
-- If both sides carry the same discriminator, it must match, or the candidate
-  is rejected.
-- If only one side carries a discriminator, the candidate is offered with an
-  explicit warning and requires confirmation.
+- Candidates must agree on the primary key. Disagreement is no match.
+- Any discriminator kind present on **both** sides must agree, or the
+  candidate is rejected outright. A shared marker that disagrees is stronger
+  evidence against a match than the primary key is for it.
+- A candidate is `Confirmed` only when the two sides carry the **same set** of
+  discriminator kinds and all of them agree. Equal-on-what-overlaps is not
+  enough: a manifest that simply omits the one marker that would disagree
+  must not be able to buy a confirmation by staying silent.
+- Anything else — no shared kind, or one side carrying kinds the other lacks —
+  is `PrimaryOnly`. That grade is offered to the user with an explicit warning
+  naming what could not be confirmed, and requires confirmation before
+  installing. It is never auto-selected.
 
 ### 3. Artifact layout
 
@@ -259,29 +337,66 @@ offers to push. `--no-remote` disables both prompts for scripted use.
 
 ### 5. Transport
 
-| Direction | Mechanism | Rationale |
+| Direction | Target | Mechanism |
 | --- | --- | --- |
-| Download | standard library `net/http` | Public release assets need no auth, so no new dependency |
-| Upload | shell out to `gh release upload` | Avoids implementing token storage and refresh |
+| Download | public repo | standard library `net/http`, no auth needed |
+| Download | private repo | `gh api` and `gh release download` |
+| Upload | either | `gh release upload` |
 
 The module currently depends only on go-winio, fsnotify, the MCP SDK, and
 `golang.org/x/sys`. This split adds no third-party dependency.
 
-The upload target is configurable so a team can publish to a private
-repository instead of a public one.
+The target repository is configurable so a team can publish privately. That
+configurability is only real if reads are authenticated too: unauthenticated
+HTTP against a private repository returns 404 for both the release listing and
+every asset. So the transport picks its mechanism from the target, and falls
+back to `gh` whenever an anonymous read fails with 404 or 403 on a repository
+the user has configured explicitly. Upload always goes through `gh`, which
+already owns token storage and refresh.
+
+Publishing is not an overwrite. `gh release upload` is invoked with
+`--clobber` only when the user passed `--force`; otherwise a name collision
+must fail, so that a concurrent publisher's asset is never silently replaced.
+Existence is checked against raw asset names rather than against matched
+candidates, because the candidate filter deliberately drops entries whose
+discriminators disagree — exactly the entries a blind upload would destroy.
 
 ### 6. Integrity and failure handling
 
-- Install refuses unless the manifest's clangd **major** version equals the
-  local clangd's major version. The manifest also records the index format
-  version read from the `meta` chunk, and install refuses if the artifact's
-  actual `meta` value disagrees with what its manifest claims. Deriving the
-  local clangd's expected format version directly is not practical at install
-  time, so the clangd major version is the operative gate and `meta` is the
-  tamper and corruption check. A mismatch is a hard refusal, not a warning:
-  clangd owns this format and may change it, and silently loading a stale
-  format is the failure mode most likely to waste a user's afternoon.
-- SHA-256 of the compressed artifact is verified before decompression.
+Everything in this section assumes the artifact is hostile. It arrives over
+the network, and it is fed to a language server that runs against the user's
+source. "It came from our own release page" is not a security property.
+
+- **The local format version is measured, not assumed.** clangd's index format
+  constant is independent of its release version and can change without a
+  major bump, so comparing clangd major versions does not prove the local
+  reader will accept the artifact. Install therefore derives the local
+  expected value directly: run the local `clangd-indexer` once over a
+  single-entry throwaway database and read the `meta` chunk of the result.
+  That probe takes well under a second, is cached per clangd path, and gives
+  an exact answer instead of a proxy. Install refuses unless the artifact's
+  `meta` equals the probed value, and separately refuses if the artifact's
+  `meta` disagrees with what its own manifest claims, which catches a
+  mislabelled or damaged download. Both are hard refusals.
+- **Digests are mandatory, not optional.** A manifest missing either digest is
+  rejected before anything is decompressed. Treating an absent digest as
+  "skip verification" hands an attacker the verification bypass for free.
+- SHA-256 of the compressed artifact is verified before decompression, and the
+  decompressed index is verified against its own recorded digest afterwards.
+- **Decompression is bounded at every layer.** The manifest records both the
+  compressed and the uncompressed size, and each is enforced against a
+  configured ceiling before allocation. This applies twice: to the gzip
+  envelope, and again to the index's own string table, whose 32-bit header is
+  an attacker-controlled allocation size. clangd's own reader applies a
+  plausibility ratio before allocating for exactly this reason. Reads are
+  bounded and length-checked rather than `io.ReadAll` into whatever arrives.
+- **Asset names are derived from a digest, never from engine metadata.** The
+  readable label comes from `Build.version`, whose `BranchName` is arbitrary
+  text from a file on disk; using it to build a filename lets a `/`, `\`, `:`,
+  or `..` escape the staging directory or produce an unusable asset name. The
+  filename key is a fixed-length lowercase hex digest of the identity, and the
+  readable label lives only inside the manifest. The resolved staging path is
+  additionally checked to still be under the staging directory.
 - After de-normalisation the installer asserts that no `ENGINE_PATH`
   placeholder remains. A residue means the rewrite was incomplete, and the
   install fails rather than installing a half-rewritten index.
@@ -319,12 +434,26 @@ bytes, not mocks.
 - Identity is discriminating: a changed patch checksum, or a changed structural
   hash, must produce a different identity.
 - Percent-encoded roots survive rewriting.
-- Publishing refuses when a local path would remain.
+- Publishing refuses when a local path would remain, including when the path
+  is not a URI: a fixture carrying a `cmdl` chunk with an absolute working
+  directory must fail to publish.
 - Both string-table forms round-trip: a fixture with a zlib-compressed `stri`
   and one with a raw `stri` must both normalise correctly, and both must
   re-emit raw.
 - An argument carrying an unrecognised absolute path fails key computation
   rather than being hashed as-is.
+- Identity is computed correctly from the real database shape: an entry of the
+  form `[compiler, @response-file, source]` resolves its flags by expanding the
+  response file, and a response file containing a quoted path with spaces is
+  tokenised without corrupting it.
+- The compiler's install path does not enter the identity, so two machines with
+  the same compiler at different locations agree.
+- A manifest with a missing or malformed digest is rejected before any
+  decompression.
+- A string table whose 32-bit header declares an implausible uncompressed size
+  is rejected before allocating for it.
+- An identity whose `BranchName` contains a path separator or `..` still
+  produces a staging path inside the staging directory.
 
 The clangd-facing behaviour cannot be proven by unit tests alone. An end-to-end
 check must confirm that an index normalised, published, fetched, and
