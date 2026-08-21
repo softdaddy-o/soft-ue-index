@@ -59,8 +59,14 @@ RIFF/CdIx
 - All strings live in one deduplicated table in `stri`. Every other chunk
   refers to them by varint index, so rewriting a string does not disturb any
   other chunk.
-- In the measured index the table was stored **uncompressed** and
-  NUL-separated, so no compression round-trip is required.
+- The table is NUL-separated behind a fixed 32-bit little-endian header. That
+  header is the uncompressed size: **0 means the table is stored raw**, and any
+  other value means the remainder is zlib-compressed to that size. Which form
+  a writer emits depends on `llvm::compression::zlib::isAvailable()` in the
+  clangd build that produced it, so both forms occur in the wild. The measured
+  index happened to be raw; that is a property of one build, not of the format,
+  and an implementation that assumes raw will corrupt or silently skip indexes
+  produced by a zlib-enabled clangd.
 - Of 1,360,749 string entries, **66,484** are `file:///` URIs. Everything else
   is symbol names and other content.
 - **Zero** absolute paths appear outside those URIs. This was checked by
@@ -113,6 +119,31 @@ placeholder costs only go-to-definition on that symbol, affecting about 1.1%
 of entries, and the project's own live index generally covers those symbols
 anyway.
 
+#### Rewriter mechanics
+
+Rewriting changes string lengths, so this is a re-serialisation, not an
+in-place byte patch. An implementation that patches bytes in place produces a
+file that loads as garbage, and the current chunk sizes would no longer
+describe their contents.
+
+The rewriter therefore:
+
+1. Parses the RIFF container into chunks.
+2. Decodes `stri` according to its 32-bit header, decompressing when nonzero.
+3. Rewrites matching URIs, leaving every other string untouched.
+4. Re-emits `stri`, then re-emits the file with a corrected chunk size, a
+   corrected top-level RIFF size, and RIFF's even-byte padding recomputed.
+5. Copies `meta`, `symb`, `refs`, `rela`, and `srcs` through byte-for-byte.
+
+Re-emitted tables are written **raw** (32-bit header of 0), never
+zlib-compressed. A compressed table is unreadable to a clangd built without
+zlib, so emitting raw is strictly more compatible, and the size cost is
+absorbed by the gzip applied to the artifact for transport.
+
+Step 5 is the invariant worth testing directly: a normalise followed by a
+de-normalise back to the original root must leave `symb`, `refs`, and `rela`
+byte-identical.
+
 ### 2. Engine identity
 
 The existing content key hashes the engine root path and local absolute file
@@ -136,8 +167,29 @@ Primary key, always computable:
 
 The word *normalised* carries weight there. Compile arguments embed absolute
 include directories. Hashing them raw would make the identity path-dependent
-again and defeat the whole scheme. Include paths are rewritten to the same
-placeholders as above before hashing.
+again and defeat the whole scheme.
+
+The structural hash is under-specified unless every input is pinned, and two
+implementations that differ on any of these never match each other. The
+definition is therefore fixed here:
+
+- **Paths** are made relative to the engine root, separators normalised to
+  `/`, lowercased on case-insensitive filesystems, deduplicated, and sorted
+  by byte order.
+- **Arguments** keep their order within an entry; entries are ordered by their
+  normalised relative path.
+- **Path-bearing arguments** are substituted with the same placeholders used
+  for URIs. Both joined and separated spellings are recognised, in the flag
+  forms clang and clang-cl actually accept: `-I`, `-isystem`, `-imsvc`,
+  `-iquote`, `-idirafter`, `-isysroot`, `--sysroot`, `-include`,
+  `-fmodule-file`, `-fmodules-cache-path`, `/I`, `/external:I`, and the source
+  file operand itself.
+- **Any token that still contains an absolute path after substitution is a
+  hard error.** Key computation fails rather than passing it through. Passing
+  through is the tempting default and it is exactly wrong: one stray absolute
+  path silently makes the key machine-specific again, which is the failure the
+  identity layer exists to prevent, and it would fail invisibly rather than
+  loudly.
 
 Discriminators, recorded when present:
 
@@ -194,7 +246,10 @@ soft-ue-index engine-index push [--yes]   # normalise, verify, upload
 
 `list` and `pull` resolve the local engine identity first and report what
 matched and at what strength. `push` refuses when an artifact for the same
-identity already exists, unless forced.
+identity already exists, unless forced. That refusal is a likely experience for
+the second person to finish a long build, so its message says plainly that the
+existing artifact already matches their engine and no upload is needed. Read as
+a bare rejection it looks like a bug.
 
 `index-engine` gains a remote check before it starts building. Committing 46
 hours of CPU without first asking whether the artifact already exists is the
@@ -265,6 +320,11 @@ bytes, not mocks.
   hash, must produce a different identity.
 - Percent-encoded roots survive rewriting.
 - Publishing refuses when a local path would remain.
+- Both string-table forms round-trip: a fixture with a zlib-compressed `stri`
+  and one with a raw `stri` must both normalise correctly, and both must
+  re-emit raw.
+- An argument carrying an unrecognised absolute path fails key computation
+  rather than being hashed as-is.
 
 The clangd-facing behaviour cannot be proven by unit tests alone. An end-to-end
 check must confirm that an index normalised, published, fetched, and
