@@ -298,7 +298,7 @@ func TestParseAgreesWithARealClangdIndex(t *testing.T) {
 	if parsed.FormType != FormType {
 		t.Fatalf("form type = %q, want %q", parsed.FormType, FormType)
 	}
-	if _, ok := parsed.Find(StringTableChunkID); !ok {
+	if _, ok := parsed.Find("stri"); !ok {
 		t.Fatal("real index has no stri chunk")
 	}
 	if got := parsed.Marshal(); !bytes.Equal(got, raw) {
@@ -307,7 +307,7 @@ func TestParseAgreesWithARealClangdIndex(t *testing.T) {
 }
 ```
 
-`StringTableChunkID` arrives in Task 2; until then, drop that one assertion and add it back when Task 2 lands. Add `"os"` to the test file's imports.
+The chunk id is spelled literally so this test compiles in Task 1, before Task 2 introduces `StringTableChunkID`. Add `"os"` and `"bytes"` to the test file's imports.
 
 Run: `SOFT_UE_INDEX_TEST_IDX=<path to a real engine.idx> go test ./internal/idxrewrite/... -run RealClangdIndex -v`
 Expected: PASS, or SKIP when the variable is unset.
@@ -467,6 +467,14 @@ import (
 // StringTableChunkID is the RIFF chunk holding every string in the index.
 const StringTableChunkID = "stri"
 
+// Bounds applied to the string table before allocating for it. The measured
+// real index has a 59 MB table, so 1 GB is generous headroom while still
+// refusing an artifact that asks for the address space.
+const (
+	MaxStringTableBytes  = 1 << 30
+	MaxCompressionRatio  = 1032
+)
+
 // DecodeStringTable splits the string table chunk into its NUL-terminated
 // entries. The chunk begins with a 32-bit little-endian uncompressed size:
 // zero means the remainder is the raw table, and any other value means the
@@ -479,6 +487,16 @@ func DecodeStringTable(chunk []byte) ([][]byte, error) {
 	uncompressedSize := binary.LittleEndian.Uint32(chunk[0:4])
 	body := chunk[4:]
 	if uncompressedSize != 0 {
+		// That header is four attacker-controlled bytes that select an
+		// allocation size, so it is checked before it is trusted. clangd's own
+		// reader applies the same kind of plausibility bound. Without this a
+		// few-kilobyte download can ask for gigabytes.
+		if uint64(uncompressedSize) > MaxStringTableBytes {
+			return nil, fmt.Errorf("%w: string table declares %d bytes, over the %d byte ceiling", ErrNotAnIndex, uncompressedSize, uint64(MaxStringTableBytes))
+		}
+		if uint64(uncompressedSize) > uint64(len(body))*MaxCompressionRatio {
+			return nil, fmt.Errorf("%w: string table declares %d bytes from %d compressed, an implausible ratio", ErrNotAnIndex, uncompressedSize, len(body))
+		}
 		r, err := zlib.NewReader(bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("open compressed string table: %w", err)
@@ -487,6 +505,12 @@ func DecodeStringTable(chunk []byte) ([][]byte, error) {
 		out := make([]byte, uncompressedSize)
 		if _, err := io.ReadFull(r, out); err != nil {
 			return nil, fmt.Errorf("decompress string table: %w", err)
+		}
+		// The stream must end exactly here. A stream that keeps going is not
+		// the table it claimed to be.
+		var extra [1]byte
+		if n, err := r.Read(extra[:]); n != 0 || err != io.EOF {
+			return nil, fmt.Errorf("%w: string table expands past its declared %d bytes", ErrNotAnIndex, uncompressedSize)
 		}
 		body = out
 	}
@@ -593,16 +617,25 @@ func TestDecodeURIPrefixLenMapsDecodedLengthToEncodedOffset(t *testing.T) {
 	}
 }
 
-func TestDecodeURIPrefixLenReturnsNegativeWhenPrefixSplitsAnEscape(t *testing.T) {
-	// A decoded length that would land in the middle of "%20" has no
-	// encoded offset; the caller must treat that as "not a prefix match".
+func TestDecodeURIPrefixLenHandlesBoundariesAroundAnEscape(t *testing.T) {
 	uri := "file:///C:/a%20b/x.h"
-	if got := DecodeURIPrefixLen(uri, len("C:/a")+1); got >= 0 {
-		// len("C:/a")+1 lands exactly after the space, which is valid.
-		t.Logf("boundary after the escape is a legal offset: %d", got)
+	// Immediately before the escape.
+	if got, want := DecodeURIPrefixLen(uri, len("C:/a")), len("file:///C:/a"); got != want {
+		t.Fatalf("offset before escape = %d, want %d", got, want)
 	}
+	// Immediately after it: one decoded byte spans three encoded bytes.
+	if got, want := DecodeURIPrefixLen(uri, len("C:/a ")), len("file:///C:/a%20"); got != want {
+		t.Fatalf("offset after escape = %d, want %d", got, want)
+	}
+	// Past the end has no offset at all.
 	if got := DecodeURIPrefixLen(uri, 999); got != -1 {
 		t.Fatalf("out-of-range decoded length returned %d, want -1", got)
+	}
+}
+
+func TestDecodeURIPrefixLenRejectsANonFileURI(t *testing.T) {
+	if got := DecodeURIPrefixLen("http://example/x", 3); got != -1 {
+		t.Fatalf("non-file URI returned %d, want -1", got)
 	}
 }
 
@@ -1172,7 +1205,7 @@ func AbsolutePathResidue(idx []byte) (int, []string, error) {
 	count := 0
 	var samples []string
 	for _, e := range entries {
-		if !HasDriveLetterPath(string(e)) {
+		if !HasAbsolutePath(string(e)) {
 			continue
 		}
 		count++
@@ -1183,25 +1216,88 @@ func AbsolutePathResidue(idx []byte) (int, []string, error) {
 	return count, samples, nil
 }
 
-// HasDriveLetterPath reports whether s contains a Windows absolute path such
-// as "C:/x" or "C:\\x", in either raw or percent-encoded form.
-func HasDriveLetterPath(s string) bool {
-	for i := 0; i+2 < len(s)+1 && i+1 < len(s); i++ {
-		c := s[i]
-		isLetter := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
-		if !isLetter || s[i+1] != ':' {
-			continue
+// AbsolutePathIndex returns the offset of the first unambiguously absolute
+// path in s, or -1. Only drive-letter and UNC forms count here, in raw and
+// percent-encoded spelling, because those cannot be confused with anything
+// else. A leading "/" is deliberately excluded: clang-cl spells flags that
+// way, and treating "/nologo" as a path would reject every real database.
+func AbsolutePathIndex(s string) int {
+	for i := 0; i < len(s); i++ {
+		if at := absoluteAt(s, i); at {
+			return i
 		}
-		if i+2 >= len(s) {
-			continue
+	}
+	return -1
+}
+
+func absoluteAt(s string, i int) bool {
+	c := s[i]
+	if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+		// C:/x or C:\x
+		if i+2 < len(s) && s[i+1] == ':' && (s[i+2] == '/' || s[i+2] == '\\') {
+			return true
 		}
-		if s[i+2] == '/' || s[i+2] == '\\' {
+		// C%3A/x, as a URI would spell it
+		if i+5 < len(s) && s[i+1] == '%' && s[i+2] == '3' &&
+			(s[i+3] == 'A' || s[i+3] == 'a') && (s[i+4] == '/' || s[i+4] == '\\') {
+			return true
+		}
+	}
+	// UNC: \\server\share or //server/share, but not the "//" inside a URI
+	// scheme, which is why the preceding byte must not be a colon.
+	if i+2 < len(s) && (c == '\\' || c == '/') && s[i+1] == c && s[i+2] != c {
+		if i == 0 || s[i-1] != ':' {
 			return true
 		}
 	}
 	return false
 }
+
+// PlaceholderResidue counts string-table entries still carrying the given
+// placeholder. Install asserts this is zero for ENGINE_PATH. It decodes the
+// table rather than scanning the whole file: converting a 539 MB index to a
+// string doubles peak memory and would also match placeholder bytes that
+// merely occur inside refs or symb.
+func PlaceholderResidue(idx []byte, placeholder string) (int, error) {
+	c, err := Parse(idx)
+	if err != nil {
+		return 0, err
+	}
+	chunk, ok := c.Find(StringTableChunkID)
+	if !ok {
+		return 0, fmt.Errorf("%w: missing string table", ErrNotAnIndex)
+	}
+	entries, err := DecodeStringTable(chunk.Data)
+	if err != nil {
+		return 0, err
+	}
+	prefix := URIScheme + placeholder
+	count := 0
+	for _, e := range entries {
+		if strings.HasPrefix(string(e), prefix) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// HasAbsolutePath reports whether s is or contains an absolute path. It is
+// stricter than AbsolutePathIndex: it also treats a POSIX rooted path as
+// absolute. Use it on values that are known to be paths -- a flag's value, a
+// source operand, a string-table entry -- never on an arbitrary token, where
+// a clang-cl flag would trip it.
+func HasAbsolutePath(s string) bool {
+	if AbsolutePathIndex(s) >= 0 {
+		return true
+	}
+	if strings.HasPrefix(s, "/") && strings.Count(s, "/") > 1 {
+		return true
+	}
+	return false
+}
 ```
+
+`rewrite.go` needs `"strings"` in its imports.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1386,21 +1482,39 @@ git commit -m "feat(engineid): parse the full Build.version identity marker"
 
 ---
 
-## Task 6: Compile-argument path substitution
+## Task 6: Response-file expansion and compile-argument path substitution
 
 **Files:**
 - Create: `internal/engineid/argpaths.go`
 - Test: `internal/engineid/argpaths_test.go`
 
 **Interfaces:**
-- Consumes: `idxrewrite.Roots`, `idxrewrite.HasDriveLetterPath`, placeholder constants.
-- Produces: `var ErrAbsolutePathInArgs error`, `func NormalizeArgs(args []string, roots idxrewrite.Roots) ([]string, error)`.
+- Consumes: `idxrewrite.Roots`, `idxrewrite.HasAbsolutePath`, placeholder constants, `compdb.Entry`.
+- Produces: `var ErrAbsolutePathInArgs error`, `var ErrDanglingFlagValue error`, `func TokenizeResponseFile(body string) []string`, `func ExpandArguments(entry compdb.Entry, read func(path string) (string, error)) ([]string, string, error)`, `func NormalizeArgs(args []string, roots idxrewrite.Roots) ([]string, error)`.
 
-Compile arguments embed absolute include directories. Hashing them raw would make the identity path-dependent again and defeat the entire scheme, so every path-bearing flag value is substituted first.
+### What the real data looks like
+
+Checked against this project's own generated database — 26,782 entries, all of the same shape:
+
+```json
+{"directory": "<project or plugin dir>",
+ "file":      "<absolute source path>",
+ "arguments": ["C:\\Program Files\\LLVM\\bin\\clang-cl.exe",
+               "@C:\\Users\\<user>\\AppData\\Local\\soft-ue-index\\projects\\<id>\\responses\\<sha256>.rsp",
+               "<absolute source path>"]}
+```
+
+Three facts that decide this task's shape:
+
+1. **The flags are not in `arguments`.** They live in a response file, 1,234 distinct ones here, about 62 KB each. Normalising only `arguments` sees no include paths at all.
+2. **`arguments[0]` is the compiler**, an absolute path under none of the four roots. Treating it as a path value fails every entry.
+3. **Response files contain quoted values with spaces**, for example `/I"C:\Program Files\...\MSVC\...\INCLUDE"`. Splitting on whitespace corrupts them.
+
+So expansion comes first, then substitution. `ExpandArguments` returns the expanded flag list *and* the compiler's base name separately; the install path of the compiler never enters the identity, only its identity does, so two machines with clang-cl in different locations still agree.
 
 A token that still holds an absolute path after substitution is a **hard error**. Passing it through is the tempting default and it is exactly wrong: one stray absolute path silently makes the key machine-specific, and it fails invisibly rather than loudly.
 
-The check applies to flag *values* and bare operands only, never to flag names. `/I` is a clang-cl flag, not a POSIX absolute path.
+The residue check runs over the value-bearing portion of **every** token, including joined flags this table does not know. An unknown flag that happens to carry a path — `-fmodule-map-file=D:/x`, `/FoD:/x`, `/winsysrootD:/x` — must not escape by virtue of starting with `-` or `/`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1523,7 +1637,137 @@ func TestNormalizeArgsIsCaseInsensitiveOnRoots(t *testing.T) {
 		t.Fatalf("got %q", got[0])
 	}
 }
+
+// Real response files quote values that contain spaces. Splitting on
+// whitespace corrupts every MSVC and Windows Kits include path.
+func TestTokenizeResponseFileKeepsQuotedValuesIntact(t *testing.T) {
+	body := "/nologo\n/std:c++20\n" +
+		`/I"C:\Program Files\Microsoft Visual Studio\18\VC\INCLUDE"` + "\n" +
+		`/ID:\Elpis_UE5.8\Engine\Source` + "\n"
+	got := TokenizeResponseFile(body)
+	want := []string{"/nologo", "/std:c++20",
+		`/IC:\Program Files\Microsoft Visual Studio\18\VC\INCLUDE`,
+		`/ID:\Elpis_UE5.8\Engine\Source`}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestTokenizeResponseFileSplitsSpaceSeparatedTokens(t *testing.T) {
+	got := TokenizeResponseFile(`-DA=1 -DB=2   -isystem "C:/a b/inc"`)
+	want := []string{"-DA=1", "-DB=2", "-isystem", "C:/a b/inc"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// arguments[0] is the compiler. Its install path must not reach the identity,
+// or two machines with clang-cl in different places never match.
+func TestExpandArgumentsSeparatesTheCompilerFromTheFlags(t *testing.T) {
+	entry := compdb.Entry{
+		Directory: `D:/Elpis_UE5.8`,
+		File:      `D:/Elpis_UE5.8/Engine/Source/A.cpp`,
+		Arguments: []string{
+			`C:\Program Files\LLVM\bin\clang-cl.exe`,
+			`@C:\Users\someone\responses\abc.rsp`,
+			`D:/Elpis_UE5.8/Engine/Source/A.cpp`,
+		},
+	}
+	read := func(path string) (string, error) {
+		if !strings.HasSuffix(path, "abc.rsp") {
+			t.Fatalf("unexpected response file %q", path)
+		}
+		return "/std:c++20\n" + `/ID:\Elpis_UE5.8\Engine\Source` + "\n", nil
+	}
+	args, compiler, err := ExpandArguments(entry, read)
+	if err != nil {
+		t.Fatalf("ExpandArguments: %v", err)
+	}
+	if compiler != "clang-cl.exe" {
+		t.Fatalf("compiler = %q, want the base name only", compiler)
+	}
+	for _, a := range args {
+		if strings.Contains(a, "LLVM") || strings.Contains(a, ".rsp") {
+			t.Fatalf("expanded args still carry the compiler or response path: %q", args)
+		}
+	}
+	if strings.Join(args, "|") != `/std:c++20|/ID:\Elpis_UE5.8\Engine\Source|D:/Elpis_UE5.8/Engine/Source/A.cpp` {
+		t.Fatalf("args = %q", args)
+	}
+}
+
+func TestExpandArgumentsReportsAnUnreadableResponseFile(t *testing.T) {
+	entry := compdb.Entry{Arguments: []string{"clang-cl.exe", "@missing.rsp", "a.cpp"}}
+	read := func(string) (string, error) { return "", errors.New("nope") }
+	if _, _, err := ExpandArguments(entry, read); err == nil {
+		t.Fatal("ExpandArguments ignored an unreadable response file")
+	}
+}
+
+func TestExpandArgumentsHandlesEntriesWithInlineFlags(t *testing.T) {
+	entry := compdb.Entry{Arguments: []string{"clang++", "-DX=1", "a.cpp"}}
+	args, compiler, err := ExpandArguments(entry, func(string) (string, error) {
+		t.Fatal("no response file should be read")
+		return "", nil
+	})
+	if err != nil {
+		t.Fatalf("ExpandArguments: %v", err)
+	}
+	if compiler != "clang++" || strings.Join(args, "|") != "-DX=1|a.cpp" {
+		t.Fatalf("args = %q compiler = %q", args, compiler)
+	}
+}
+
+// An unknown joined flag must not smuggle a path through just because it
+// begins with - or /.
+func TestNormalizeArgsRejectsAPathInsideAnUnknownJoinedFlag(t *testing.T) {
+	for _, arg := range []string{
+		`-fmodule-map-file=E:/other/module.modulemap`,
+		`/FoE:/other/out.obj`,
+		`/winsysrootE:/other`,
+		`-ivfsoverlayE:/other/vfs.yaml`,
+	} {
+		if _, err := NormalizeArgs([]string{arg}, testRoots()); !errors.Is(err, ErrAbsolutePathInArgs) {
+			t.Fatalf("NormalizeArgs(%q) err = %v, want ErrAbsolutePathInArgs", arg, err)
+		}
+	}
+}
+
+func TestNormalizeArgsSubstitutesAKnownPathInsideAnUnknownJoinedFlag(t *testing.T) {
+	got, err := NormalizeArgs([]string{`-fmodule-map-file=D:/Elpis_UE5.8/Engine/m.modulemap`}, testRoots())
+	if err != nil {
+		t.Fatalf("NormalizeArgs: %v", err)
+	}
+	if got[0] != "-fmodule-map-file=ENGINE_PATH/Engine/m.modulemap" {
+		t.Fatalf("got %q", got[0])
+	}
+}
+
+// -include-pch is not -include; prefix matching alone mis-parses it.
+func TestNormalizeArgsDoesNotMistakeALongerFlagForAShorterOne(t *testing.T) {
+	got, err := NormalizeArgs([]string{"-include-pch", `D:/Elpis_UE5.8/Engine/a.pch`}, testRoots())
+	if err != nil {
+		t.Fatalf("NormalizeArgs: %v", err)
+	}
+	if strings.Join(got, "|") != "-include-pch|ENGINE_PATH/Engine/a.pch" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestNormalizeArgsRejectsADanglingValueFlag(t *testing.T) {
+	if _, err := NormalizeArgs([]string{"-isystem"}, testRoots()); !errors.Is(err, ErrDanglingFlagValue) {
+		t.Fatalf("err = %v, want ErrDanglingFlagValue", err)
+	}
+}
+
+func TestNormalizeArgsRejectsAUNCPath(t *testing.T) {
+	if _, err := NormalizeArgs([]string{`-I\\server\share\inc`}, testRoots()); !errors.Is(err, ErrAbsolutePathInArgs) {
+		t.Fatalf("err = %v, want ErrAbsolutePathInArgs", err)
+	}
+}
 ```
+
+Add `"github.com/softdaddy-o/soft-ue-index/internal/compdb"` to this file's import block.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1549,36 +1793,107 @@ import (
 // identity layer exists to prevent, and it would fail silently.
 var ErrAbsolutePathInArgs = errors.New("unrecognised absolute path in compile arguments")
 
-// separatedValueFlags take their path as the following argument.
+// ErrDanglingFlagValue reports a value-taking flag with nothing after it.
+// Silently succeeding there would hash a truncated argument list.
+var ErrDanglingFlagValue = errors.New("compile argument flag is missing its value")
+
+// separatedValueFlags take their path as the following argument. Matched by
+// exact spelling, never by prefix, so that -include-pch is not read as
+// -include followed by "-pch".
 var separatedValueFlags = map[string]bool{
 	"-I": true, "-isystem": true, "-imsvc": true, "-iquote": true,
-	"-idirafter": true, "-isysroot": true, "-include": true, "--sysroot": true,
+	"-idirafter": true, "-isysroot": true, "--sysroot": true,
+	"-include": true, "-include-pch": true, "-ivfsoverlay": true,
+	"-fmodule-map-file": true, "/I": true, "/FI": true, "/Fo": true, "/Fp": true,
 }
 
-// joinedValuePrefixes carry their path in the same token.
+// joinedValuePrefixes carry their value in the same token, longest first so
+// that /external:I wins over /I and -isystem over -I.
 var joinedValuePrefixes = []string{
-	"--sysroot=", "-fmodules-cache-path=", "-fmodule-file=",
-	"-idirafter", "-isysroot", "-isystem", "-imsvc", "-iquote", "-include",
-	"/external:I", "-I", "/I",
+	"-fmodules-cache-path=", "-fmodule-map-file=", "-fmodule-file=",
+	"-ivfsoverlay", "-include-pch", "--sysroot=", "/external:I",
+	"-idirafter", "-winsysroot", "/winsysroot", "-isysroot",
+	"-isystem", "-imsvc", "-iquote", "-include", "-I", "/I", "/FI", "/Fo", "/Fp",
+}
+
+// TokenizeResponseFile splits a clang response file into arguments. Values are
+// commonly quoted because they contain spaces -- this project's own response
+// files quote every MSVC and Windows Kits include path -- so splitting on
+// whitespace alone corrupts them.
+func TokenizeResponseFile(body string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote, started := false, false
+	flush := func() {
+		if started {
+			out = append(out, cur.String())
+			cur.Reset()
+			started = false
+		}
+	}
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		switch {
+		case c == '"':
+			inQuote = !inQuote
+			started = true
+		case !inQuote && (c == ' ' || c == '\t' || c == '\r' || c == '\n'):
+			flush()
+		default:
+			cur.WriteByte(c)
+			started = true
+		}
+	}
+	flush()
+	return out
+}
+
+// ExpandArguments resolves one database entry into the flags that actually
+// applied, plus the compiler's base name.
+//
+// The real database this feature targets stores nothing but
+// [compiler, @response-file, source]: the flags live in the response file, so
+// an implementation that reads only Arguments sees no include paths at all.
+// The compiler is returned separately and by base name only, because its
+// install path is machine-specific and must never reach the identity.
+func ExpandArguments(entry compdb.Entry, read func(path string) (string, error)) ([]string, string, error) {
+	args := entry.Arguments
+	if len(args) == 0 {
+		return nil, "", fmt.Errorf("entry for %q has no arguments; a command string cannot be tokenised reliably across platforms", entry.File)
+	}
+	compiler := filepath.Base(strings.ReplaceAll(args[0], `\`, "/"))
+	out := make([]string, 0, len(args))
+	for _, arg := range args[1:] {
+		if !strings.HasPrefix(arg, "@") {
+			out = append(out, arg)
+			continue
+		}
+		body, err := read(arg[1:])
+		if err != nil {
+			return nil, "", fmt.Errorf("expand response file %s: %w", arg[1:], err)
+		}
+		out = append(out, TokenizeResponseFile(body)...)
+	}
+	return out, compiler, nil
 }
 
 // NormalizeArgs substitutes every path-bearing argument value with the
 // placeholder for the root containing it, leaving flag names untouched.
 func NormalizeArgs(args []string, roots idxrewrite.Roots) ([]string, error) {
 	out := make([]string, 0, len(args))
-	expectValue := false
+	pending := ""
 	for _, arg := range args {
-		if expectValue {
-			expectValue = false
+		if pending != "" {
 			value, err := substitutePath(arg, roots)
 			if err != nil {
 				return nil, err
 			}
+			pending = ""
 			out = append(out, value)
 			continue
 		}
 		if separatedValueFlags[arg] {
-			expectValue = true
+			pending = arg
 			out = append(out, arg)
 			continue
 		}
@@ -1590,21 +1905,19 @@ func NormalizeArgs(args []string, roots idxrewrite.Roots) ([]string, error) {
 			out = append(out, prefix+value)
 			continue
 		}
-		if strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "/") {
-			out = append(out, arg)
-			continue
-		}
-		value, err := substitutePath(arg, roots)
+		value, err := substituteEmbedded(arg, roots)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, value)
 	}
+	if pending != "" {
+		return nil, fmt.Errorf("%w: %s", ErrDanglingFlagValue, pending)
+	}
 	return out, nil
 }
 
-// splitJoined finds the longest matching joined-value prefix, so that
-// "/external:I" wins over "/I" and "-isystem" over "-I".
+// splitJoined finds the longest matching joined-value prefix.
 func splitJoined(arg string) (prefix, rest string, ok bool) {
 	best := ""
 	for _, p := range joinedValuePrefixes {
@@ -1618,6 +1931,25 @@ func splitJoined(arg string) (prefix, rest string, ok bool) {
 	return best, arg[len(best):], true
 }
 
+// substituteEmbedded handles a token this table does not recognise. A flag
+// name alone is harmless, but an unknown joined flag can still carry a path
+// -- /FoD:/out.obj, -fmodule-map-file=D:/x -- so the value-bearing tail is
+// substituted and then residue-checked rather than waved through because the
+// token happens to start with - or /.
+func substituteEmbedded(arg string, roots idxrewrite.Roots) (string, error) {
+	slashed := strings.ReplaceAll(arg, `\`, "/")
+	at := idxrewrite.AbsolutePathIndex(slashed)
+	if at < 0 {
+		return slashed, nil
+	}
+	head, tail := slashed[:at], slashed[at:]
+	value, err := substitutePath(tail, roots)
+	if err != nil {
+		return "", err
+	}
+	return head + value, nil
+}
+
 // substitutePath rewrites one path value, erroring if it is absolute and
 // under no known root.
 func substitutePath(value string, roots idxrewrite.Roots) (string, error) {
@@ -1625,7 +1957,7 @@ func substitutePath(value string, roots idxrewrite.Roots) (string, error) {
 	lowered := strings.ToLower(slashed)
 	for _, b := range roots.Each() {
 		root := strings.ToLower(strings.TrimRight(strings.ReplaceAll(b.Path, `\`, "/"), "/"))
-		if !strings.HasPrefix(lowered, root) {
+		if root == "" || !strings.HasPrefix(lowered, root) {
 			continue
 		}
 		if len(slashed) > len(root) && slashed[len(root)] != '/' {
@@ -1633,11 +1965,25 @@ func substitutePath(value string, roots idxrewrite.Roots) (string, error) {
 		}
 		return b.Placeholder + slashed[len(root):], nil
 	}
-	if idxrewrite.HasDriveLetterPath(slashed) {
+	if idxrewrite.HasAbsolutePath(slashed) {
 		return "", fmt.Errorf("%w: %s", ErrAbsolutePathInArgs, value)
 	}
 	return slashed, nil
 }
+```
+
+Imports for this file:
+
+```go
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/softdaddy-o/soft-ue-index/internal/compdb"
+	"github.com/softdaddy-o/soft-ue-index/internal/idxrewrite"
+)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1663,7 +2009,7 @@ git commit -m "feat(engineid): substitute path-bearing compile arguments, fail o
 
 **Interfaces:**
 - Consumes: Task 5 `BuildVersion`, Task 6 `NormalizeArgs`, `compdb.Entry`, `idxrewrite.Roots`.
-- Produces: `func StructuralHash(engineRoot string, entries []compdb.Entry, v BuildVersion, roots idxrewrite.Roots) (string, error)`.
+- Produces: `type ResponseReader func(path string) (string, error)`, `func CachingResponseReader() ResponseReader`, `func StructuralHash(engineRoot string, entries []compdb.Entry, v BuildVersion, roots idxrewrite.Roots, read ResponseReader) (string, error)`.
 
 Every input is pinned here, because two implementations that differ on any of them never match each other:
 
@@ -1683,8 +2029,16 @@ import (
 	"github.com/softdaddy-o/soft-ue-index/internal/compdb"
 )
 
+// entry mirrors the real database shape: argv0 is the compiler, then flags,
+// then the source operand.
 func entry(file string, args ...string) compdb.Entry {
-	return compdb.Entry{Directory: "D:/Elpis_UE5.8", File: file, Arguments: args}
+	argv := append([]string{`C:/Program Files/LLVM/bin/clang-cl.exe`}, args...)
+	return compdb.Entry{Directory: "D:/Elpis_UE5.8", File: file, Arguments: append(argv, file)}
+}
+
+// noResponses is a reader for fixtures whose flags are already inline.
+func noResponses(path string) (string, error) {
+	return "", fmt.Errorf("unexpected response file %s", path)
 }
 
 func sampleEntries() []compdb.Entry {
@@ -1701,7 +2055,7 @@ func sampleVersion() BuildVersion {
 // The regression the whole identity layer exists for: the same engine at a
 // different path must hash identically, where engineindex.Key would not.
 func TestStructuralHashIsIndependentOfTheEngineRootPath(t *testing.T) {
-	here, err := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots())
+	here, err := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots(), noResponses)
 	if err != nil {
 		t.Fatalf("StructuralHash: %v", err)
 	}
@@ -1711,7 +2065,7 @@ func TestStructuralHashIsIndependentOfTheEngineRootPath(t *testing.T) {
 	}
 	movedRoots := testRoots()
 	movedRoots.Engine = "C:/UE_5.8"
-	there, err := StructuralHash(`C:/UE_5.8`, moved, sampleVersion(), movedRoots)
+	there, err := StructuralHash(`C:/UE_5.8`, moved, sampleVersion(), movedRoots, noResponses)
 	if err != nil {
 		t.Fatalf("StructuralHash: %v", err)
 	}
@@ -1723,11 +2077,11 @@ func TestStructuralHashIsIndependentOfTheEngineRootPath(t *testing.T) {
 func TestStructuralHashIsStableUnderEntryOrder(t *testing.T) {
 	forward := sampleEntries()
 	reversed := []compdb.Entry{forward[1], forward[0]}
-	a, err := StructuralHash(`D:/Elpis_UE5.8`, forward, sampleVersion(), testRoots())
+	a, err := StructuralHash(`D:/Elpis_UE5.8`, forward, sampleVersion(), testRoots(), noResponses)
 	if err != nil {
 		t.Fatalf("StructuralHash: %v", err)
 	}
-	b, err := StructuralHash(`D:/Elpis_UE5.8`, reversed, sampleVersion(), testRoots())
+	b, err := StructuralHash(`D:/Elpis_UE5.8`, reversed, sampleVersion(), testRoots(), noResponses)
 	if err != nil {
 		t.Fatalf("StructuralHash: %v", err)
 	}
@@ -1737,9 +2091,9 @@ func TestStructuralHashIsStableUnderEntryOrder(t *testing.T) {
 }
 
 func TestStructuralHashSeparatesDifferentModuleSets(t *testing.T) {
-	base, _ := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots())
+	base, _ := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots(), noResponses)
 	extra := append(sampleEntries(), entry(`D:/Elpis_UE5.8/Engine/Source/C.cpp`))
-	other, err := StructuralHash(`D:/Elpis_UE5.8`, extra, sampleVersion(), testRoots())
+	other, err := StructuralHash(`D:/Elpis_UE5.8`, extra, sampleVersion(), testRoots(), noResponses)
 	if err != nil {
 		t.Fatalf("StructuralHash: %v", err)
 	}
@@ -1749,12 +2103,12 @@ func TestStructuralHashSeparatesDifferentModuleSets(t *testing.T) {
 }
 
 func TestStructuralHashSeparatesDifferentCompileArguments(t *testing.T) {
-	base, _ := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots())
+	base, _ := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots(), noResponses)
 	shipping := []compdb.Entry{
 		entry(`D:/Elpis_UE5.8/Engine/Source/A.cpp`, `-ID:/Elpis_UE5.8/Engine/Source`, "-DWITH_EDITOR=0"),
 		entry(`D:/Elpis_UE5.8/Engine/Source/B.cpp`, `-ID:/Elpis_UE5.8/Engine/Source`),
 	}
-	other, err := StructuralHash(`D:/Elpis_UE5.8`, shipping, sampleVersion(), testRoots())
+	other, err := StructuralHash(`D:/Elpis_UE5.8`, shipping, sampleVersion(), testRoots(), noResponses)
 	if err != nil {
 		t.Fatalf("StructuralHash: %v", err)
 	}
@@ -1764,16 +2118,16 @@ func TestStructuralHashSeparatesDifferentCompileArguments(t *testing.T) {
 }
 
 func TestStructuralHashSeparatesBuildIDAndLicenseeFlag(t *testing.T) {
-	base, _ := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots())
+	base, _ := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots(), noResponses)
 	v := sampleVersion()
 	v.BuildID = "different"
-	other, _ := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), v, testRoots())
+	other, _ := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), v, testRoots(), noResponses)
 	if base == other {
 		t.Fatal("BuildId is not part of the hash")
 	}
 	v = sampleVersion()
 	v.IsLicenseeVersion = 1
-	other, _ = StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), v, testRoots())
+	other, _ = StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), v, testRoots(), noResponses)
 	if base == other {
 		t.Fatal("IsLicenseeVersion is not part of the hash")
 	}
@@ -1781,13 +2135,13 @@ func TestStructuralHashSeparatesBuildIDAndLicenseeFlag(t *testing.T) {
 
 func TestStructuralHashPropagatesAnUnrecognisedAbsolutePath(t *testing.T) {
 	bad := []compdb.Entry{entry(`D:/Elpis_UE5.8/Engine/Source/A.cpp`, `-IE:/Other/include`)}
-	if _, err := StructuralHash(`D:/Elpis_UE5.8`, bad, sampleVersion(), testRoots()); err == nil {
+	if _, err := StructuralHash(`D:/Elpis_UE5.8`, bad, sampleVersion(), testRoots(), noResponses); err == nil {
 		t.Fatal("StructuralHash accepted an unrecognised absolute path")
 	}
 }
 
 func TestStructuralHashIsSixteenHexCharacters(t *testing.T) {
-	got, err := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots())
+	got, err := StructuralHash(`D:/Elpis_UE5.8`, sampleEntries(), sampleVersion(), testRoots(), noResponses)
 	if err != nil {
 		t.Fatalf("StructuralHash: %v", err)
 	}
@@ -1831,23 +2185,31 @@ import (
 // forms carry paths. Two implementations that disagree on any of them
 // produce identities that never match, which would be invisible until
 // nobody could ever find anybody else's index.
-func StructuralHash(engineRoot string, entries []compdb.Entry, v BuildVersion, roots idxrewrite.Roots) (string, error) {
-	type row struct{ file, args string }
+func StructuralHash(engineRoot string, entries []compdb.Entry, v BuildVersion, roots idxrewrite.Roots, read ResponseReader) (string, error) {
+	type row struct{ file, dir, compiler, args string }
 	rows := make([]row, 0, len(entries))
 	for _, e := range entries {
 		rel, err := relativeToRoot(engineRoot, e.File)
 		if err != nil {
 			return "", err
 		}
-		args := e.Arguments
-		if len(args) == 0 && e.Command != "" {
-			args = strings.Fields(e.Command)
-		}
-		normalized, err := NormalizeArgs(args, roots)
+		expanded, compiler, err := ExpandArguments(e, read)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", rel, err)
 		}
-		rows = append(rows, row{file: rel, args: strings.Join(normalized, "\x00")})
+		normalized, err := NormalizeArgs(expanded, roots)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", rel, err)
+		}
+		// Directory decides what a relative argument means, so it belongs in
+		// the hash, normalised, because it is an absolute local path.
+		dir := normalizeDirectory(e.Directory, roots)
+		rows = append(rows, row{
+			file:     rel,
+			dir:      dir,
+			compiler: strings.ToLower(compiler),
+			args:     strings.Join(normalized, "\x00"),
+		})
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].file != rows[j].file {
@@ -1863,12 +2225,49 @@ func StructuralHash(engineRoot string, entries []compdb.Entry, v BuildVersion, r
 			continue
 		}
 		seen[r] = true
-		_, _ = io.WriteString(h, r.file)
-		h.Write([]byte{0})
-		_, _ = io.WriteString(h, r.args)
+		for _, field := range []string{r.file, r.dir, r.compiler, r.args} {
+			_, _ = io.WriteString(h, field)
+			h.Write([]byte{0})
+		}
 		h.Write([]byte{'\n'})
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// ResponseReader reads a response file referenced by an @argument. Injected so
+// tests need no real files, and so callers can cache: this project's database
+// references 1,234 distinct response files across 26,782 entries, so a naive
+// reader opens each one about twenty times.
+type ResponseReader func(path string) (string, error)
+
+// CachingResponseReader reads each response file from disk exactly once.
+func CachingResponseReader() ResponseReader {
+	cache := map[string]string{}
+	return func(path string) (string, error) {
+		if body, ok := cache[path]; ok {
+			return body, nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		cache[path] = string(raw)
+		return cache[path], nil
+	}
+}
+
+// normalizeDirectory renders an entry's working directory in a spelling that
+// is the same on every machine. A directory under a known root becomes
+// placeholder-relative; a project directory, which by definition is not the
+// engine, contributes only its base name. It never returns an absolute path.
+func normalizeDirectory(dir string, roots idxrewrite.Roots) string {
+	if dir == "" {
+		return ""
+	}
+	if value, err := substitutePath(dir, roots); err == nil {
+		return strings.ToLower(value)
+	}
+	return "project:" + strings.ToLower(filepath.Base(filepath.ToSlash(dir)))
 }
 
 // relativeToRoot renders a source path relative to the engine root, in the
@@ -2319,7 +2718,7 @@ git commit -m "feat(engineid): pluggable distribution discriminators, derived va
 
 **Interfaces:**
 - Consumes: Tasks 5, 7, 8.
-- Produces: `type Identity struct { Primary string; Version BuildVersion; Structural string; Discriminators []Discriminator }`, `func Compute(engineRoot string, entries []compdb.Entry, roots idxrewrite.Roots) (Identity, error)`, `type Strength int` with `NoMatch`, `PrimaryOnly`, `Confirmed`, `func Match(local, remote Identity) Strength`, `func (s Strength) String() string`.
+- Produces: `type Identity struct { Primary string; Version BuildVersion; Structural string; Discriminators []Discriminator }`, `func Compute(engineRoot string, entries []compdb.Entry, roots idxrewrite.Roots, read ResponseReader) (Identity, error)`, `type Strength int` with `NoMatch`, `PrimaryOnly`, `Confirmed`, `func Match(local, remote Identity) Strength`, `func (s Strength) String() string`.
 
 The match policy from the spec:
 
@@ -2350,7 +2749,7 @@ func TestComputeBuildsAReadablePrimaryKey(t *testing.T) {
 	entries := []compdb.Entry{entry(rootJoin(root, "Engine/Source/A.cpp"), "-DWITH_EDITOR=1")}
 	roots := testRoots()
 	roots.Engine = toSlash(root)
-	got, err := Compute(root, entries, roots)
+	got, err := Compute(root, entries, roots, noResponses)
 	if err != nil {
 		t.Fatalf("Compute: %v", err)
 	}
@@ -2376,11 +2775,24 @@ func TestMatchIsPrimaryOnlyWithNoSharedDiscriminator(t *testing.T) {
 	}
 }
 
-func TestMatchIsConfirmedWhenASharedDiscriminatorAgrees(t *testing.T) {
+func TestMatchIsConfirmedOnlyWhenBothSidesCarryTheSameKinds(t *testing.T) {
 	local := idWith("same", Discriminator{"provenance", "x"}, Discriminator{"gitdeps-commit", "c"})
-	remote := idWith("same", Discriminator{"provenance", "x"})
+	remote := idWith("same", Discriminator{"provenance", "x"}, Discriminator{"gitdeps-commit", "c"})
 	if got := Match(local, remote); got != Confirmed {
 		t.Fatalf("Match = %v, want Confirmed", got)
+	}
+}
+
+// A manifest that omits the marker which would disagree must not be able to
+// buy a confirmation by staying silent.
+func TestMatchStaysPrimaryOnlyWhenTheRemoteOmitsAKind(t *testing.T) {
+	local := idWith("same", Discriminator{"provenance", "x"}, Discriminator{"gitdeps-commit", "c"})
+	remote := idWith("same", Discriminator{"provenance", "x"})
+	if got := Match(local, remote); got != PrimaryOnly {
+		t.Fatalf("Match = %v, want PrimaryOnly", got)
+	}
+	if kinds := UnconfirmedKinds(local, remote); len(kinds) != 1 || kinds[0] != "gitdeps-commit" {
+		t.Fatalf("UnconfirmedKinds = %v, want [gitdeps-commit]", kinds)
 	}
 }
 
@@ -2456,12 +2868,12 @@ type Identity struct {
 
 // Compute derives the identity of the engine at engineRoot, given the
 // engine-scoped entries of a compilation database generated against it.
-func Compute(engineRoot string, entries []compdb.Entry, roots idxrewrite.Roots) (Identity, error) {
+func Compute(engineRoot string, entries []compdb.Entry, roots idxrewrite.Roots, read ResponseReader) (Identity, error) {
 	version, err := ReadBuildVersion(engineRoot)
 	if err != nil {
 		return Identity{}, err
 	}
-	structural, err := StructuralHash(engineRoot, entries, version, roots)
+	structural, err := StructuralHash(engineRoot, entries, version, roots, read)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -2498,10 +2910,18 @@ func (s Strength) String() string {
 	}
 }
 
-// Match applies the spec's policy: the primary key must agree; any
-// discriminator kind present on both sides must agree or the candidate is
-// rejected; a candidate that shares no discriminator is offered only as
-// PrimaryOnly, which callers surface as a warning.
+// Match applies the spec's policy.
+//
+// The primary key must agree. Any discriminator kind present on both sides
+// must agree, or the candidate is rejected outright: a shared marker that
+// disagrees is stronger evidence against a match than the primary key is for
+// it.
+//
+// Confirmed requires the two sides to carry the SAME SET of kinds. Agreeing
+// on the overlap is not enough, because a manifest that simply omits the one
+// marker that would disagree could otherwise buy a confirmation by staying
+// silent. Anything short of full coverage stays PrimaryOnly, which callers
+// must surface as a warning rather than install silently.
 func Match(local, remote Identity) Strength {
 	if local.Primary == "" || local.Primary != remote.Primary {
 		return NoMatch
@@ -2510,13 +2930,17 @@ func Match(local, remote Identity) Strength {
 	for _, d := range remote.Discriminators {
 		remoteByKind[d.Kind] = d.Value
 	}
-	shared := 0
+	localByKind := make(map[string]string, len(local.Discriminators))
 	for _, d := range local.Discriminators {
-		value, ok := remoteByKind[d.Kind]
+		localByKind[d.Kind] = d.Value
+	}
+	shared := 0
+	for kind, value := range localByKind {
+		remoteValue, ok := remoteByKind[kind]
 		if !ok {
 			continue
 		}
-		if value != d.Value {
+		if remoteValue != value {
 			return NoMatch
 		}
 		shared++
@@ -2524,7 +2948,31 @@ func Match(local, remote Identity) Strength {
 	if shared == 0 {
 		return PrimaryOnly
 	}
+	if shared != len(localByKind) || shared != len(remoteByKind) {
+		return PrimaryOnly
+	}
 	return Confirmed
+}
+
+// UnconfirmedKinds names the discriminator kinds that only one side carries,
+// so a PrimaryOnly warning can say what specifically could not be checked
+// instead of just asserting that something could not.
+func UnconfirmedKinds(local, remote Identity) []string {
+	present := map[string]int{}
+	for _, d := range local.Discriminators {
+		present[d.Kind] |= 1
+	}
+	for _, d := range remote.Discriminators {
+		present[d.Kind] |= 2
+	}
+	var out []string
+	for kind, seen := range present {
+		if seen != 3 {
+			out = append(out, kind)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 ```
 
@@ -2553,7 +3001,7 @@ git commit -m "feat(engineid): assemble engine identity and apply the match poli
 
 **Interfaces:**
 - Consumes: `engineid.Identity`, `engineid.BuildVersion`, `engineid.Discriminator`, `idxrewrite.IndexFormatVersion`.
-- Produces: `const SchemaVersion = 1`, `type Manifest struct{...}`, `func (m Manifest) Validate() error`, `func (m Manifest) CheckCompatible(localClangdVersion string, actualFormat uint32) error`, `func ArtifactName(engineID string) string`, `func ManifestName(engineID string) string`, `func Pack(idx []byte, m Manifest) ([]byte, Manifest, error)`, `func Unpack(artifact []byte, m Manifest) ([]byte, error)`, `var ErrIncompatible error`, `var ErrCorrupt error`.
+- Produces: `const SchemaVersion = 1`, `type Manifest struct{...}`, `func (m Manifest) Validate() error`, `func (m Manifest) CheckCompatible(localIndexFormat, actualFormat uint32) error`, `func AssetKey(engineID string) string`, `func ArtifactName(engineID string) string`, `func ManifestName(engineID string) string`, `func Pack(idx []byte, m Manifest) ([]byte, Manifest, error)`, `func Unpack(artifact []byte, m Manifest) ([]byte, error)`, `var ErrIncompatible error`, `var ErrCorrupt error`.
 
 The compatibility gate is deliberately two-part. Deriving the index format version the local clangd expects is not practical at install time, so the **clangd major version** is the operative gate, and the `meta` value is a corruption and mislabelling check against what the manifest claims.
 
@@ -2573,16 +3021,25 @@ import (
 )
 
 func sampleManifest() Manifest {
+	digest := strings.Repeat("ab", 32)
 	return Manifest{
-		SchemaVersion: SchemaVersion,
-		EngineID:      "5.8.1-cl55116800-UE5-0123456789abcdef",
-		Version:       engineid.BuildVersion{MajorVersion: 5, MinorVersion: 8, PatchVersion: 1},
-		ClangdVersion: "20.1.8",
-		IndexFormat:   20,
-		Placeholders:  []string{idxrewrite.EnginePlaceholder},
-		EngineEntries: 24996,
-		URICount:      66484,
-		PublishedAt:   time.Unix(0, 0).UTC(),
+		SchemaVersion:  SchemaVersion,
+		EngineID:       "5.8.1-cl55116800-UE5-0123456789abcdef",
+		Structural:     "0123456789abcdef",
+		Version:        engineid.BuildVersion{MajorVersion: 5, MinorVersion: 8, PatchVersion: 1},
+		ClangdVersion:  "20.1.8",
+		IndexFormat:    20,
+		Placeholders: []string{
+			idxrewrite.EnginePlaceholder, idxrewrite.SDKPlaceholder,
+			idxrewrite.MSVCPlaceholder, idxrewrite.ClangPlaceholder,
+		},
+		ArtifactSHA256: digest,
+		IndexSHA256:    digest,
+		ArtifactBytes:  348241956,
+		IndexBytes:     565237356,
+		EngineEntries:  24996,
+		URICount:       66484,
+		PublishedAt:    time.Unix(0, 0).UTC(),
 	}
 }
 
@@ -2613,21 +3070,23 @@ func TestValidateRejectsALocalPathAnywhereInTheManifest(t *testing.T) {
 	}
 }
 
-func TestCheckCompatibleAcceptsMatchingClangdMajorAndFormat(t *testing.T) {
-	if err := sampleManifest().CheckCompatible("20.1.8", 20); err != nil {
+func TestCheckCompatibleAcceptsAFormatTheLocalClangdReads(t *testing.T) {
+	if err := sampleManifest().CheckCompatible(20, 20); err != nil {
 		t.Fatalf("CheckCompatible: %v", err)
 	}
 }
 
-func TestCheckCompatibleAcceptsADifferentClangdPatchRelease(t *testing.T) {
-	if err := sampleManifest().CheckCompatible("20.9.0", 20); err != nil {
-		t.Fatalf("CheckCompatible rejected a same-major clangd: %v", err)
+// clangd's format constant moves independently of its release version, so the
+// gate must compare formats, not versions.
+func TestCheckCompatibleRejectsAFormatTheLocalClangdDoesNotRead(t *testing.T) {
+	err := sampleManifest().CheckCompatible(21, 20)
+	if !errors.Is(err, ErrIncompatible) {
+		t.Fatalf("err = %v, want ErrIncompatible", err)
 	}
 }
 
-func TestCheckCompatibleRejectsADifferentClangdMajor(t *testing.T) {
-	err := sampleManifest().CheckCompatible("21.0.0", 20)
-	if !errors.Is(err, ErrIncompatible) {
+func TestCheckCompatibleRejectsAnUnknownLocalFormat(t *testing.T) {
+	if err := sampleManifest().CheckCompatible(0, 20); !errors.Is(err, ErrIncompatible) {
 		t.Fatalf("err = %v, want ErrIncompatible", err)
 	}
 }
@@ -2635,18 +3094,66 @@ func TestCheckCompatibleRejectsADifferentClangdMajor(t *testing.T) {
 // The artifact claiming one format while carrying another means it was
 // mislabelled or corrupted in transit.
 func TestCheckCompatibleRejectsAFormatDisagreeingWithTheManifest(t *testing.T) {
-	err := sampleManifest().CheckCompatible("20.1.8", 19)
+	err := sampleManifest().CheckCompatible(20, 19)
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("err = %v, want ErrCorrupt", err)
 	}
 }
 
-func TestArtifactAndManifestNamesAreDerivedFromTheEngineID(t *testing.T) {
-	if got, want := ArtifactName("abc"), "engine-index-abc.idx.gz"; got != want {
-		t.Fatalf("ArtifactName = %q, want %q", got, want)
+// A filename built from engine metadata is a path-traversal vector: BranchName
+// is arbitrary text read off disk.
+func TestAssetNamesAreDigestsAndNeverCarryEngineMetadata(t *testing.T) {
+	hostile := `5.8.1-cl1-../../../../etc/UE5-0123456789abcdef`
+	for _, name := range []string{ArtifactName(hostile), ManifestName(hostile)} {
+		if strings.ContainsAny(name, `/\:`) || strings.Contains(name, "..") {
+			t.Fatalf("asset name %q is not filename-safe", name)
+		}
 	}
-	if got, want := ManifestName("abc"), "engine-index-abc.json"; got != want {
-		t.Fatalf("ManifestName = %q, want %q", got, want)
+	if ArtifactName("a") == ArtifactName("b") {
+		t.Fatal("distinct engine ids collided on one asset name")
+	}
+	if ArtifactName("a") != ArtifactName("a") {
+		t.Fatal("asset name is not stable")
+	}
+}
+
+func TestValidateRejectsAMissingDigest(t *testing.T) {
+	m := sampleManifest()
+	m.ArtifactSHA256 = ""
+	if err := m.Validate(); err == nil {
+		t.Fatal("Validate accepted a manifest with no artifact digest; an optional integrity check is a bypass")
+	}
+}
+
+func TestValidateRejectsANonCanonicalDigest(t *testing.T) {
+	m := sampleManifest()
+	m.ArtifactSHA256 = strings.ToUpper(m.ArtifactSHA256)
+	if err := m.Validate(); err == nil {
+		t.Fatal("Validate accepted an uppercase digest")
+	}
+}
+
+func TestValidateRejectsDuplicateDiscriminatorKinds(t *testing.T) {
+	m := sampleManifest()
+	m.Discriminators = []engineid.Discriminator{{Kind: "provenance", Value: "a"}, {Kind: "provenance", Value: "b"}}
+	if err := m.Validate(); err == nil {
+		t.Fatal("Validate accepted a duplicated discriminator kind")
+	}
+}
+
+func TestValidateRejectsAnEngineIDInconsistentWithItsStructuralHash(t *testing.T) {
+	m := sampleManifest()
+	m.Structural = "ffffffffffffffff"
+	if err := m.Validate(); err == nil {
+		t.Fatal("Validate accepted an engineId that does not end with its structural hash")
+	}
+}
+
+func TestValidateRejectsAnUnexpectedPlaceholderSet(t *testing.T) {
+	m := sampleManifest()
+	m.Placeholders = []string{"SOMETHING_ELSE"}
+	if err := m.Validate(); err == nil {
+		t.Fatal("Validate accepted an unexpected placeholder set")
 	}
 }
 ```
@@ -2715,9 +3222,10 @@ Expected: FAIL to compile, `undefined: Manifest`.
 package indexshare
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -2747,6 +3255,8 @@ type Manifest struct {
 	Placeholders   []string                 `json:"placeholders"`
 	ArtifactSHA256 string                   `json:"artifactSha256"`
 	IndexSHA256    string                   `json:"indexSha256"`
+	ArtifactBytes  int64                    `json:"artifactBytes"`
+	IndexBytes     int64                    `json:"indexBytes"`
 	EngineEntries  int                      `json:"engineEntries"`
 	URICount       int                      `json:"uriCount"`
 	PublishedAt    time.Time                `json:"publishedAt"`
@@ -2763,67 +3273,138 @@ func (m Manifest) Identity() engineid.Identity {
 	}
 }
 
-// Validate checks the manifest is well formed and path-free.
+// Validate checks the manifest is well formed, path-free, and carries every
+// field the install path relies on.
+//
+// Every check here runs against a document fetched over the network. An
+// optional field is an optional check, and an optional integrity check is a
+// bypass, so nothing that guards installation is allowed to be empty.
 func (m Manifest) Validate() error {
 	if m.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("%w: manifest schema %d, this build understands %d", ErrIncompatible, m.SchemaVersion, SchemaVersion)
 	}
-	if strings.TrimSpace(m.EngineID) == "" {
-		return fmt.Errorf("%w: manifest has no engine id", ErrIncompatible)
+	for field, value := range map[string]string{
+		"engineId":      m.EngineID,
+		"structural":    m.Structural,
+		"clangdVersion": m.ClangdVersion,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%w: manifest has no %s", ErrIncompatible, field)
+		}
 	}
-	if strings.TrimSpace(m.ClangdVersion) == "" {
-		return fmt.Errorf("%w: manifest has no clangd version", ErrIncompatible)
+	for field, value := range map[string]string{
+		"artifactSha256": m.ArtifactSHA256,
+		"indexSha256":    m.IndexSHA256,
+	} {
+		if !isSHA256Hex(value) {
+			return fmt.Errorf("%w: %s is not a 64-character lowercase hex digest", ErrIncompatible, field)
+		}
 	}
+	if m.ArtifactBytes <= 0 || m.IndexBytes <= 0 {
+		return fmt.Errorf("%w: manifest must declare positive artifactBytes and indexBytes", ErrIncompatible)
+	}
+	if m.IndexFormat == 0 {
+		return fmt.Errorf("%w: manifest declares no index format version", ErrIncompatible)
+	}
+	if m.EngineEntries < 0 || m.URICount < 0 {
+		return fmt.Errorf("%w: manifest declares a negative count", ErrIncompatible)
+	}
+	if !strings.HasSuffix(m.EngineID, m.Structural) {
+		return fmt.Errorf("%w: engineId %q does not end with its structural hash %q", ErrIncompatible, m.EngineID, m.Structural)
+	}
+	if err := validatePlaceholders(m.Placeholders); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
 	for _, d := range m.Discriminators {
-		if idxrewrite.HasDriveLetterPath(d.Value) {
+		if seen[d.Kind] {
+			return fmt.Errorf("%w: duplicate discriminator kind %q", ErrIncompatible, d.Kind)
+		}
+		seen[d.Kind] = true
+		if strings.TrimSpace(d.Value) == "" {
+			return fmt.Errorf("%w: discriminator %q has no value", ErrIncompatible, d.Kind)
+		}
+		if idxrewrite.HasAbsolutePath(d.Value) {
 			return fmt.Errorf("%w: discriminator %q carries a local path", ErrIncompatible, d.Kind)
 		}
 	}
-	if idxrewrite.HasDriveLetterPath(m.EngineID) || idxrewrite.HasDriveLetterPath(m.Version.BuildID) {
+	if idxrewrite.HasAbsolutePath(m.EngineID) || idxrewrite.HasAbsolutePath(m.Version.BuildID) {
 		return fmt.Errorf("%w: manifest carries a local path", ErrIncompatible)
 	}
 	return nil
 }
 
-// CheckCompatible gates installation. The clangd major version is the
-// operative test, because deriving the index format a local clangd expects
-// is not practical at install time. The meta value is then checked against
-// what the manifest claims, which catches a mislabelled or damaged artifact.
-func (m Manifest) CheckCompatible(localClangdVersion string, actualFormat uint32) error {
-	if err := m.Validate(); err != nil {
-		return err
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
 	}
-	want, err := majorVersion(m.ClangdVersion)
-	if err != nil {
-		return fmt.Errorf("%w: manifest clangd version %q: %v", ErrIncompatible, m.ClangdVersion, err)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
 	}
-	have, err := majorVersion(localClangdVersion)
-	if err != nil {
-		return fmt.Errorf("%w: local clangd version %q: %v", ErrIncompatible, localClangdVersion, err)
+	return true
+}
+
+func validatePlaceholders(got []string) error {
+	want := []string{
+		idxrewrite.EnginePlaceholder, idxrewrite.SDKPlaceholder,
+		idxrewrite.MSVCPlaceholder, idxrewrite.ClangPlaceholder,
 	}
-	if want != have {
-		return fmt.Errorf("%w: built for clangd %d.x, this machine runs clangd %d.x -- clangd owns the index format and changes it between majors", ErrIncompatible, want, have)
+	if len(got) != len(want) {
+		return fmt.Errorf("%w: manifest declares %d placeholders, expected %d", ErrIncompatible, len(got), len(want))
 	}
-	if actualFormat != m.IndexFormat {
-		return fmt.Errorf("%w: index declares format %d but its manifest claims %d", ErrCorrupt, actualFormat, m.IndexFormat)
+	for i := range want {
+		if got[i] != want[i] {
+			return fmt.Errorf("%w: placeholder %d is %q, expected %q", ErrIncompatible, i, got[i], want[i])
+		}
 	}
 	return nil
 }
 
-func majorVersion(v string) (int, error) {
-	field := strings.SplitN(strings.TrimSpace(v), ".", 2)[0]
-	n, err := strconv.Atoi(field)
-	if err != nil {
-		return 0, fmt.Errorf("not a version number")
+// CheckCompatible gates installation.
+//
+// It compares the artifact against the format the LOCAL clangd actually
+// accepts, measured by ProbeIndexFormat, not against a clangd version number.
+// clangd's index format constant is independent of its release version and
+// can change without a major bump, so a version comparison is a proxy that
+// can be wrong in both directions. The second check, artifact against its own
+// manifest, catches a mislabelled or damaged download.
+func (m Manifest) CheckCompatible(localIndexFormat, actualFormat uint32) error {
+	if err := m.Validate(); err != nil {
+		return err
 	}
-	return n, nil
+	if actualFormat != m.IndexFormat {
+		return fmt.Errorf("%w: index declares format %d but its manifest claims %d", ErrCorrupt, actualFormat, m.IndexFormat)
+	}
+	if localIndexFormat == 0 {
+		return fmt.Errorf("%w: could not determine the index format this machine's clangd accepts", ErrIncompatible)
+	}
+	if actualFormat != localIndexFormat {
+		return fmt.Errorf("%w: artifact is index format %d, this machine's clangd reads format %d (published from clangd %s) -- clangd refuses any other version outright",
+			ErrIncompatible, actualFormat, localIndexFormat, m.ClangdVersion)
+	}
+	return nil
+}
+
+// AssetKey is the filename-safe key for an identity.
+//
+// The readable engine label is built from Build.version, whose BranchName is
+// arbitrary text read off disk. Using it in a filename would let a slash,
+// colon, or ".." escape the staging directory or produce an asset name GitHub
+// rejects. So the filename is a digest and the readable label lives only
+// inside the manifest, where it cannot become a path component.
+func AssetKey(engineID string) string {
+	sum := sha256.Sum256([]byte(engineID))
+	return hex.EncodeToString(sum[:])[:32]
 }
 
 // ArtifactName is the release asset name holding the compressed index.
-func ArtifactName(engineID string) string { return "engine-index-" + engineID + ".idx.gz" }
+func ArtifactName(engineID string) string { return "engine-index-" + AssetKey(engineID) + ".idx.gz" }
 
 // ManifestName is the release asset name holding the manifest.
-func ManifestName(engineID string) string { return "engine-index-" + engineID + ".json" }
+func ManifestName(engineID string) string { return "engine-index-" + AssetKey(engineID) + ".json" }
 ```
 
 - [ ] **Step 4: Write pack.go**
@@ -2858,13 +3439,25 @@ func Pack(idx []byte, m Manifest) ([]byte, Manifest, error) {
 	}
 	artifact := buf.Bytes()
 	m.ArtifactSHA256 = digest(artifact)
+	m.IndexBytes = int64(len(idx))
+	m.ArtifactBytes = int64(len(artifact))
 	return artifact, m, nil
 }
 
-// Unpack verifies the artifact digest before decompressing, then verifies
-// the decompressed index against the manifest.
+// Unpack verifies the artifact digest before decompressing, decompresses
+// under a declared bound, then verifies the decompressed index.
+//
+// Both digests are required, never "verify if present". Validate has already
+// rejected an absent or malformed digest by the time this runs, so there is
+// no path here that skips a check because a field was empty.
 func Unpack(artifact []byte, m Manifest) ([]byte, error) {
-	if got := digest(artifact); m.ArtifactSHA256 != "" && got != m.ArtifactSHA256 {
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
+	if int64(len(artifact)) != m.ArtifactBytes {
+		return nil, fmt.Errorf("%w: artifact is %d bytes, manifest declares %d", ErrCorrupt, len(artifact), m.ArtifactBytes)
+	}
+	if got := digest(artifact); got != m.ArtifactSHA256 {
 		return nil, fmt.Errorf("%w: artifact digest %s does not match the manifest's %s", ErrCorrupt, got, m.ArtifactSHA256)
 	}
 	r, err := gzip.NewReader(bytes.NewReader(artifact))
@@ -2872,11 +3465,17 @@ func Unpack(artifact []byte, m Manifest) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	defer r.Close()
-	idx, err := io.ReadAll(r)
-	if err != nil {
+	// Read exactly the declared length, then require EOF. io.ReadAll here
+	// would let a validly-digested gzip bomb decide how much memory to take.
+	idx := make([]byte, m.IndexBytes)
+	if _, err := io.ReadFull(r, idx); err != nil {
 		return nil, fmt.Errorf("%w: decompress: %v", ErrCorrupt, err)
 	}
-	if got := digest(idx); m.IndexSHA256 != "" && got != m.IndexSHA256 {
+	var extra [1]byte
+	if n, err := r.Read(extra[:]); n != 0 || err != io.EOF {
+		return nil, fmt.Errorf("%w: artifact expands past its declared %d bytes", ErrCorrupt, m.IndexBytes)
+	}
+	if got := digest(idx); got != m.IndexSHA256 {
 		return nil, fmt.Errorf("%w: index digest %s does not match the manifest's %s", ErrCorrupt, got, m.IndexSHA256)
 	}
 	return idx, nil
@@ -2893,12 +3492,85 @@ func digest(b []byte) string {
 Run: `go test ./internal/indexshare/... -v`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Measure the local index format**
+
+`CheckCompatible` needs the format this machine's clangd actually reads.
+clangd's format constant moves independently of its release version, so it is
+measured, not inferred. Create `internal/engineindex/probe.go`:
+
+```go
+package engineindex
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/softdaddy-o/soft-ue-index/internal/idxrewrite"
+)
+
+// ProbeIndexFormat reports the index format version the local clangd-indexer
+// emits, by building a one-file index and reading its meta chunk.
+//
+// This exists because clangd's format constant is not tied to its release
+// version: comparing clangd versions is a proxy that can be wrong in both
+// directions, and clangd refuses any format but its own outright. The probe
+// costs one trivial compile, so measuring beats guessing.
+func ProbeIndexFormat(ctx context.Context, runner Runner, indexerPath string) (uint32, error) {
+	dir, err := os.MkdirTemp("", "soft-ue-index-probe-")
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(dir)
+	src := filepath.Join(dir, "probe.cpp")
+	if err := os.WriteFile(src, []byte("int softUeIndexProbe() { return 0; }\n"), 0o600); err != nil {
+		return 0, err
+	}
+	db := []map[string]any{{
+		"directory": filepath.ToSlash(dir),
+		"file":      filepath.ToSlash(src),
+		"arguments": []string{"clang++", "-std=c++17", "-c", filepath.ToSlash(src)},
+	}}
+	body, err := json.Marshal(db)
+	if err != nil {
+		return 0, err
+	}
+	dbPath := filepath.Join(dir, "compile_commands.json")
+	if err := os.WriteFile(dbPath, body, 0o600); err != nil {
+		return 0, err
+	}
+	idxPath := filepath.Join(dir, "probe.idx")
+	logPath := filepath.Join(dir, "probe.log")
+	if err := BuildIndex(ctx, runner, indexerPath, dbPath, idxPath, logPath); err != nil {
+		return 0, fmt.Errorf("probe the local index format: %w", err)
+	}
+	raw, err := os.ReadFile(idxPath)
+	if err != nil {
+		return 0, err
+	}
+	return idxrewrite.IndexFormatVersion(raw)
+}
+```
+
+Test it in `internal/engineindex/probe_test.go` with a fake `Runner` that writes
+a fixture index to the staging path, asserting the probe returns that fixture's
+meta value and that it surfaces a runner failure rather than returning zero
+silently. Add a second test guarded by `SOFT_UE_INDEX_TEST_INDEXER`, skipped
+when unset, that runs the probe against a real `clangd-indexer` and asserts a
+nonzero result -- the fake proves the plumbing, only the real binary proves the
+number.
+
+The result is cached per resolved clangd-indexer path for the process lifetime;
+recomputing it per command would add a compile to every `engine-index list`.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 gofmt -l ./... && go build ./... && go vet ./... && go test ./...
-git add internal/indexshare/manifest.go internal/indexshare/pack.go internal/indexshare/manifest_test.go internal/indexshare/pack_test.go
-git commit -m "feat(indexshare): manifest schema, compatibility gates, and packaging"
+git add internal/indexshare/manifest.go internal/indexshare/pack.go internal/indexshare/manifest_test.go internal/indexshare/pack_test.go internal/engineindex/probe.go internal/engineindex/probe_test.go
+git commit -m "feat(indexshare): manifest schema, measured format gate, and packaging"
 ```
 
 ---
@@ -2911,7 +3583,7 @@ git commit -m "feat(indexshare): manifest schema, compatibility gates, and packa
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `type Asset struct { Name, URL string; Size int64 }`, `type Release struct { Tag string; Assets []Asset }`, `type Uploader func(ctx context.Context, repo, tag string, files []string) error`, `type Client struct { Repo string; BaseURL string; HTTP *http.Client; Upload Uploader }`, `func NewClient(repo string) *Client`, `func (c *Client) Releases(ctx context.Context) ([]Release, error)`, `func (c *Client) Fetch(ctx context.Context, url string) ([]byte, error)`, `func (c *Client) Publish(ctx context.Context, tag string, files []string) error`, `func GHUploader(ctx context.Context, repo, tag string, files []string) error`.
+- Produces: `type Asset struct { Name, URL string; Size int64 }`, `type Release struct { Tag string; Assets []Asset }`, `type Uploader func(ctx context.Context, repo, tag string, files []string, force bool) error`, `type Client struct { Repo string; BaseURL string; HTTP *http.Client; Upload Uploader }`, `func NewClient(repo string) *Client`, `func (c *Client) Releases(ctx context.Context) ([]Release, error)`, `func (c *Client) Fetch(ctx context.Context, url string) ([]byte, error)`, `func (c *Client) Publish(ctx context.Context, tag string, files []string) error`, `func GHUploader(ctx context.Context, repo, tag string, files []string) error`.
 
 Download uses `net/http` because a public release asset needs no authentication, which keeps the module dependency-free. Upload shells out to `gh`, which already owns token storage and refresh.
 
@@ -2998,23 +3670,43 @@ func TestPublishDelegatesToTheConfiguredUploader(t *testing.T) {
 	var gotRepo, gotTag string
 	var gotFiles []string
 	c := NewClient("owner/repo")
-	c.Upload = func(ctx context.Context, repo, tag string, files []string) error {
-		gotRepo, gotTag, gotFiles = repo, tag, files
+	var gotForce bool
+	c.Upload = func(ctx context.Context, repo, tag string, files []string, force bool) error {
+		gotRepo, gotTag, gotFiles, gotForce = repo, tag, files, force
 		return nil
 	}
-	if err := c.Publish(context.Background(), "engine-index", []string{"a.gz", "a.json"}); err != nil {
+	if err := c.Publish(context.Background(), "engine-index", []string{"a.gz", "a.json"}, false); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	if gotRepo != "owner/repo" || gotTag != "engine-index" || len(gotFiles) != 2 {
-		t.Fatalf("uploader saw %q %q %v", gotRepo, gotTag, gotFiles)
+	if gotRepo != "owner/repo" || gotTag != "engine-index" || len(gotFiles) != 2 || gotForce {
+		t.Fatalf("uploader saw %q %q %v force=%v", gotRepo, gotTag, gotFiles, gotForce)
+	}
+}
+
+// Clobbering on every publish lets a routine upload destroy a concurrent
+// publisher's asset.
+func TestPublishOnlyClobbersWhenForced(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		var got bool
+		c := NewClient("owner/repo")
+		c.Upload = func(ctx context.Context, repo, tag string, files []string, f bool) error {
+			got = f
+			return nil
+		}
+		if err := c.Publish(context.Background(), "t", []string{"a"}, force); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		if got != force {
+			t.Fatalf("force = %v, want %v", got, force)
+		}
 	}
 }
 
 func TestPublishPropagatesAnUploaderFailure(t *testing.T) {
 	sentinel := errors.New("gh failed")
 	c := NewClient("owner/repo")
-	c.Upload = func(ctx context.Context, repo, tag string, files []string) error { return sentinel }
-	if err := c.Publish(context.Background(), "t", []string{"a"}); !errors.Is(err, sentinel) {
+	c.Upload = func(ctx context.Context, repo, tag string, files []string, force bool) error { return sentinel }
+	if err := c.Publish(context.Background(), "t", []string{"a"}, false); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the uploader's error", err)
 	}
 }
@@ -3067,7 +3759,7 @@ type Release struct {
 }
 
 // Uploader publishes files to a release. Injected so tests do not shell out.
-type Uploader func(ctx context.Context, repo, tag string, files []string) error
+type Uploader func(ctx context.Context, repo, tag string, files []string, force bool) error
 
 // Client talks to a GitHub repository's releases. Reads go over plain HTTP
 // because public release assets need no authentication, which keeps this
@@ -3078,15 +3770,24 @@ type Client struct {
 	BaseURL string
 	HTTP    *http.Client
 	Upload  Uploader
+	// Authenticated reads a URL with credentials. Used when an anonymous read
+	// is refused, which is what a private repository looks like from outside.
+	Authenticated func(ctx context.Context, url string) ([]byte, error)
 }
+
+// MaxDownloadBytes bounds any single network body. The measured artifact is
+// 332 MB, so 2 GB matches GitHub's own per-asset ceiling with room to spare
+// while still refusing an unbounded stream.
+const MaxDownloadBytes = 2 << 30
 
 // NewClient builds a client for an "owner/name" repository.
 func NewClient(repo string) *Client {
 	return &Client{
 		Repo:    repo,
 		BaseURL: "https://api.github.com",
-		HTTP:    &http.Client{Timeout: 30 * time.Minute},
-		Upload:  GHUploader,
+		HTTP:          &http.Client{Timeout: 30 * time.Minute},
+		Upload:        GHUploader,
+		Authenticated: GHFetch,
 	}
 }
 
@@ -3134,14 +3835,25 @@ func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 		return nil, fmt.Errorf("request %s: %w", url, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+		// Either it genuinely is not there, or the repository is private and
+		// this request had no credentials. gh knows which.
+		if c.Authenticated != nil {
+			return c.Authenticated(ctx, url)
+		}
+		return nil, fmt.Errorf("request %s: %s (private repositories need gh; install and run gh auth login)", url, resp.Status)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("request %s: %s", url, resp.Status)
 	}
-	return io.ReadAll(resp.Body)
+	// Bound the read: this is a network body, and io.ReadAll lets the far end
+	// decide how much memory to take.
+	return io.ReadAll(io.LimitReader(resp.Body, MaxDownloadBytes))
 }
 
-// Publish uploads files to the given release tag.
-func (c *Client) Publish(ctx context.Context, tag string, files []string) error {
+// Publish uploads files to the given release tag. force decides whether an
+// existing asset of the same name may be replaced.
+func (c *Client) Publish(ctx context.Context, tag string, files []string, force bool) error {
 	if err := c.validRepo(); err != nil {
 		return err
 	}
@@ -3149,22 +3861,63 @@ func (c *Client) Publish(ctx context.Context, tag string, files []string) error 
 	if upload == nil {
 		upload = GHUploader
 	}
-	return upload(ctx, c.Repo, tag, files)
+	return upload(ctx, c.Repo, tag, files, force)
+}
+
+// AssetNames returns every asset name on one release tag. Push checks this
+// rather than the matched-candidate list, because a same-named asset whose
+// discriminators disagree is filtered out of candidates and would otherwise
+// be invisible to an overwrite check.
+func (c *Client) AssetNames(ctx context.Context, tag string) (map[string]bool, error) {
+	releases, err := c.Releases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, r := range releases {
+		if r.Tag != tag {
+			continue
+		}
+		for _, a := range r.Assets {
+			out[a.Name] = true
+		}
+	}
+	return out, nil
 }
 
 // GHUploader publishes through the gh CLI, creating the release on first use.
-func GHUploader(ctx context.Context, repo, tag string, files []string) error {
+//
+// --clobber is passed only for an explicit force. Passing it unconditionally
+// would let a routine publish silently destroy a concurrent publisher's asset.
+func GHUploader(ctx context.Context, repo, tag string, files []string, force bool) error {
 	create := exec.CommandContext(ctx, "gh", "release", "create", tag,
 		"--repo", repo, "--title", tag, "--notes", "Prebuilt clangd engine indexes.")
 	if out, err := create.CombinedOutput(); err != nil && !strings.Contains(string(out), "already exists") {
 		return fmt.Errorf("gh release create: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	args := append([]string{"release", "upload", tag, "--repo", repo, "--clobber"}, files...)
-	upload := exec.CommandContext(ctx, "gh", args...)
+	args := []string{"release", "upload", tag, "--repo", repo}
+	if force {
+		args = append(args, "--clobber")
+	}
+	upload := exec.CommandContext(ctx, "gh", append(args, files...)...)
 	if out, err := upload.CombinedOutput(); err != nil {
 		return fmt.Errorf("gh release upload: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// GHFetch reads a URL through the gh CLI, which supplies the credentials an
+// anonymous request lacks. Used as the fallback for private repositories: the
+// spec promises a configurable target, and unauthenticated HTTP against a
+// private repository returns 404 for the listing and every asset, so without
+// this the private option does not exist.
+func GHFetch(ctx context.Context, url string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "gh", "api", url)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh api %s: %w", url, err)
+	}
+	return out, nil
 }
 ```
 
@@ -3191,7 +3944,7 @@ git commit -m "feat(indexshare): list and download releases over net/http, uploa
 
 **Interfaces:**
 - Consumes: Tasks 10 and 11, plus `engineid.Identity`/`Match`/`Strength` and `idxrewrite.Denormalize`/`Normalize`/`AbsolutePathResidue`/`IndexFormatVersion`/`Roots`.
-- Produces: `type Candidate struct { Manifest Manifest; Asset Asset; Strength engineid.Strength }`, `func List(ctx context.Context, c *Client, local engineid.Identity) ([]Candidate, error)`, `type PullRequest struct { Candidate Candidate; Roots idxrewrite.Roots; DestIndex string; LocalClangdVersion string }`, `func Pull(ctx context.Context, c *Client, req PullRequest) error`, `type PushRequest struct { Index []byte; Manifest Manifest; Roots idxrewrite.Roots; StageDir string; Force bool }`, `func Push(ctx context.Context, c *Client, req PushRequest) error`, `var ErrAlreadyPublished error`, `var ErrLocalPathsRemain error`.
+- Produces: `type Candidate struct { Manifest Manifest; Asset Asset; Strength engineid.Strength }`, `func List(ctx context.Context, c *Client, local engineid.Identity) ([]Candidate, error)`, `type PullRequest struct { Candidate Candidate; Roots idxrewrite.Roots; DestIndex string; LocalIndexFormat uint32 }`, `func Pull(ctx context.Context, c *Client, req PullRequest) error`, `type PushRequest struct { Index []byte; Manifest Manifest; Roots idxrewrite.Roots; StageDir string; Force bool }`, `func Push(ctx context.Context, c *Client, req PushRequest) error`, `var ErrAlreadyPublished error`, `var ErrLocalPathsRemain error`.
 
 `Push` refuses when an artifact for the same identity already exists. That refusal is a likely experience for the second person to finish a long build, so its message says plainly that the existing artifact already matches and no upload is needed; read as a bare rejection it looks like a bug.
 
@@ -3323,7 +4076,7 @@ func TestPullInstallsAnIndexRetargetedToTheLocalEngineRoot(t *testing.T) {
 		Candidate:          cands[0],
 		Roots:              idxrewrite.Roots{Engine: "C:/UE_5.8"},
 		DestIndex:          dest,
-		LocalClangdVersion: "20.1.8",
+		LocalIndexFormat:   20,
 	})
 	if err != nil {
 		t.Fatalf("Pull: %v", err)
@@ -3348,7 +4101,7 @@ func TestPullRefusesAnIncompatibleClangdMajor(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "engine.idx")
 	err := Pull(context.Background(), c, PullRequest{
 		Candidate: cands[0], Roots: idxrewrite.Roots{Engine: "C:/UE_5.8"},
-		DestIndex: dest, LocalClangdVersion: "21.0.0",
+		DestIndex: dest, LocalIndexFormat: 21,
 	})
 	if !errors.Is(err, ErrIncompatible) {
 		t.Fatalf("err = %v, want ErrIncompatible", err)
@@ -3363,7 +4116,7 @@ func TestPushRefusesWhenTheSameIdentityIsAlreadyPublished(t *testing.T) {
 	m.EngineID = localIdentity().Primary
 	m.Discriminators = localIdentity().Discriminators
 	c := catalogueServer(t, []Manifest{m}, nil)
-	c.Upload = func(ctx context.Context, repo, tag string, files []string) error {
+	c.Upload = func(ctx context.Context, repo, tag string, files []string, force bool) error {
 		t.Fatal("Push uploaded despite an existing artifact")
 		return nil
 	}
@@ -3381,7 +4134,7 @@ func TestPushRefusesWhenTheSameIdentityIsAlreadyPublished(t *testing.T) {
 
 func TestPushRefusesWhenLocalPathsWouldRemain(t *testing.T) {
 	c := catalogueServer(t, nil, nil)
-	c.Upload = func(ctx context.Context, repo, tag string, files []string) error {
+	c.Upload = func(ctx context.Context, repo, tag string, files []string, force bool) error {
 		t.Fatal("Push uploaded an artifact carrying local paths")
 		return nil
 	}
@@ -3398,8 +4151,13 @@ func TestPushRefusesWhenLocalPathsWouldRemain(t *testing.T) {
 func TestPushUploadsBothAssetsWhenNothingIsPublished(t *testing.T) {
 	c := catalogueServer(t, nil, nil)
 	var uploaded []string
-	c.Upload = func(ctx context.Context, repo, tag string, files []string) error {
+	var existedAtUploadTime []bool
+	c.Upload = func(ctx context.Context, repo, tag string, files []string, force bool) error {
 		uploaded = files
+		for _, f := range files {
+			_, err := os.Stat(f)
+			existedAtUploadTime = append(existedAtUploadTime, err == nil)
+		}
 		return nil
 	}
 	idx := fixtureIndex(t, "file:///D:/E/Engine/A.cpp")
@@ -3412,9 +4170,16 @@ func TestPushUploadsBothAssetsWhenNothingIsPublished(t *testing.T) {
 	if len(uploaded) != 2 {
 		t.Fatalf("uploaded %v, want the artifact and its manifest", uploaded)
 	}
+	for i, ok := range existedAtUploadTime {
+		if !ok {
+			t.Fatalf("staged file %s did not exist when upload ran", uploaded[i])
+		}
+	}
+	// A 332 MB artifact left behind after every successful push is real
+	// leakage, so staging is cleaned up once the upload returns.
 	for _, f := range uploaded {
-		if _, err := os.Stat(f); err != nil {
-			t.Fatalf("staged file %s missing: %v", f, err)
+		if _, err := os.Stat(f); err == nil {
+			t.Fatalf("staging file %s survived a successful push", f)
 		}
 	}
 }
@@ -3480,9 +4245,17 @@ func List(ctx context.Context, c *Client, local engineid.Identity) ([]Candidate,
 	if err != nil {
 		return nil, err
 	}
+	// Only the catalogue release. Merging assets across every release lets an
+	// unrelated tag shadow a catalogue entry by name.
 	byName := map[string]Asset{}
 	for _, r := range releases {
+		if r.Tag != DefaultTag {
+			continue
+		}
 		for _, a := range r.Assets {
+			if _, clash := byName[a.Name]; clash {
+				return nil, fmt.Errorf("release %s has two assets named %s", r.Tag, a.Name)
+			}
 			byName[a.Name] = a
 		}
 	}
@@ -3500,6 +4273,11 @@ func List(ctx context.Context, c *Client, local engineid.Identity) ([]Candidate,
 			continue
 		}
 		if err := m.Validate(); err != nil {
+			continue
+		}
+		// The asset name is derived from the identity, so a name that does not
+		// match the manifest it carries means one of the two is lying.
+		if name != ManifestName(m.EngineID) {
 			continue
 		}
 		strength := engineid.Match(local, m.Identity())
@@ -3525,8 +4303,10 @@ func List(ctx context.Context, c *Client, local engineid.Identity) ([]Candidate,
 type PullRequest struct {
 	Candidate          Candidate
 	Roots              idxrewrite.Roots
-	DestIndex          string
-	LocalClangdVersion string
+	DestIndex        string
+	// LocalIndexFormat is what this machine's clangd actually reads, as
+	// measured by probing it, not inferred from a version number.
+	LocalIndexFormat uint32
 }
 
 // Pull downloads a candidate, verifies it, retargets it to the local roots,
@@ -3548,7 +4328,7 @@ func Pull(ctx context.Context, c *Client, req PullRequest) (err error) {
 	if err != nil {
 		return err
 	}
-	if err := req.Candidate.Manifest.CheckCompatible(req.LocalClangdVersion, format); err != nil {
+	if err := req.Candidate.Manifest.CheckCompatible(req.LocalIndexFormat, format); err != nil {
 		return err
 	}
 	out, res, err := idxrewrite.Denormalize(idx, req.Roots)
@@ -3558,8 +4338,15 @@ func Pull(ctx context.Context, c *Client, req PullRequest) (err error) {
 	if res.Rewritten[idxrewrite.EnginePlaceholder] == 0 {
 		return fmt.Errorf("%w: no engine paths were retargeted", ErrCorrupt)
 	}
-	if strings.Contains(string(out), idxrewrite.URIScheme+idxrewrite.EnginePlaceholder) {
-		return fmt.Errorf("%w: an %s placeholder survived installation", ErrCorrupt, idxrewrite.EnginePlaceholder)
+	// Check the string table, not the whole file. Converting a 539 MB index to
+	// a string doubles peak memory and would also match placeholder bytes that
+	// happen to occur inside refs or symb.
+	left, err := idxrewrite.PlaceholderResidue(out, idxrewrite.EnginePlaceholder)
+	if err != nil {
+		return err
+	}
+	if left > 0 {
+		return fmt.Errorf("%w: %d %s placeholders survived installation", ErrCorrupt, left, idxrewrite.EnginePlaceholder)
 	}
 	if err := os.MkdirAll(filepath.Dir(req.DestIndex), 0o700); err != nil {
 		return err
@@ -3603,13 +4390,25 @@ func Push(ctx context.Context, c *Client, req PushRequest) error {
 		return fmt.Errorf("%w: %d entries still hold a local path (for example %s); configure the missing toolchain roots and retry, or the artifact would publish them",
 			ErrLocalPathsRemain, residue, strings.Join(samples, ", "))
 	}
-	existing, err := List(ctx, c, req.Manifest.Identity())
+	// A URI under no known root keeps whatever absolute path it had. The
+	// residue check above catches the drive-letter and UNC spellings, but the
+	// count below is the direct statement of the invariant and catches forms
+	// the scanner does not model.
+	if rewriteResult.Unmatched > 0 {
+		return fmt.Errorf("%w: %d file URIs fall under no configured root (for example %s); every root referenced by the index must be known before it can be published",
+			ErrLocalPathsRemain, rewriteResult.Unmatched, strings.Join(rewriteResult.UnmatchedSamples, ", "))
+	}
+	// Existence is checked against raw asset names, not against matched
+	// candidates. List deliberately drops entries whose discriminators
+	// disagree -- exactly the entries a blind upload would destroy.
+	taken, err := c.AssetNames(ctx, DefaultTag)
 	if err != nil {
 		return err
 	}
-	if len(existing) > 0 && !req.Force {
-		return fmt.Errorf("%w: %s already matches this engine (%s), so there is nothing to upload -- pass --force only to replace it",
-			ErrAlreadyPublished, ArtifactName(existing[0].Manifest.EngineID), existing[0].Strength)
+	wanted := ArtifactName(req.Manifest.EngineID)
+	if taken[wanted] && !req.Force {
+		return fmt.Errorf("%w: %s already matches this engine, so there is nothing to upload; pass --force only if you intend to replace it",
+			ErrAlreadyPublished, wanted)
 	}
 	format, err := idxrewrite.IndexFormatVersion(normalized)
 	if err != nil {
@@ -3633,8 +4432,20 @@ func Push(ctx context.Context, c *Client, req PushRequest) error {
 	if err := m.Validate(); err != nil {
 		return err
 	}
-	artifactPath := filepath.Join(req.StageDir, ArtifactName(m.EngineID))
-	manifestPath := filepath.Join(req.StageDir, ManifestName(m.EngineID))
+	// Own the staging directory so a 332 MB artifact is not left behind after
+	// a successful publish.
+	stage, err := os.MkdirTemp(req.StageDir, "engine-index-push-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	artifactPath := filepath.Join(stage, ArtifactName(m.EngineID))
+	manifestPath := filepath.Join(stage, ManifestName(m.EngineID))
+	for _, path := range []string{artifactPath, manifestPath} {
+		if !strings.HasPrefix(filepath.Clean(path), filepath.Clean(stage)+string(filepath.Separator)) {
+			return fmt.Errorf("refusing to stage outside %s: %s", stage, path)
+		}
+	}
 	if err := os.WriteFile(artifactPath, artifact, 0o600); err != nil {
 		return err
 	}
@@ -3645,7 +4456,7 @@ func Push(ctx context.Context, c *Client, req PushRequest) error {
 	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
 		return err
 	}
-	return c.Publish(ctx, DefaultTag, []string{artifactPath, manifestPath})
+	return c.Publish(ctx, DefaultTag, []string{artifactPath, manifestPath}, req.Force)
 }
 ```
 
@@ -3724,6 +4535,19 @@ func TestParseIndexEngineAcceptsNoRemote(t *testing.T) {
 }
 
 // Flags must stay scoped, the way --engine-scope and --child already are.
+func TestParseScopesEngineIndexFlagsToTheirAction(t *testing.T) {
+	for _, args := range [][]string{
+		{"engine-index", "list", "elpis", "--force"},
+		{"engine-index", "pull", "elpis", "--force"},
+		{"engine-index", "list", "elpis", "--yes"},
+		{"engine-index", "push", "elpis", "--repo="},
+	} {
+		if _, err := Parse(args); !errors.Is(err, ErrUsage) {
+			t.Fatalf("Parse(%v) err = %v, want ErrUsage", args, err)
+		}
+	}
+}
+
 func TestParseRejectsEngineIndexFlagsOnOtherCommands(t *testing.T) {
 	for _, args := range [][]string{
 		{"list", "--yes"},
@@ -3835,6 +4659,17 @@ After the existing `--engine-scope` and `--child` scope checks, add:
 	if command.NoRemote && command.Name != "index-engine" {
 		return Command{}, usageError("--no-remote only applies to index-engine")
 	}
+	// Scope per action too. A --force accepted on list reads as supported and
+	// does nothing, which is worse than being rejected.
+	if command.Force && command.Action != "push" {
+		return Command{}, usageError("--force only applies to engine-index push")
+	}
+	if command.Yes && command.Action != "pull" && command.Action != "push" {
+		return Command{}, usageError("--yes only applies to engine-index pull and push")
+	}
+	if command.Name == "engine-index" && command.Repo != "" && strings.TrimSpace(command.Repo) == "" {
+		return Command{}, usageError("--repo requires an owner/name value")
+	}
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -3891,7 +4726,7 @@ func TestIndexEngineReportsAMatchingRemoteIndexBeforeBuilding(t *testing.T) {
 	env := newShareEnv(t)
 	env.remote.publish(t, env.localEngineID(t))
 	var built bool
-	env.deps.IndexEngine = func(ctx context.Context, p registryProject) (IndexEngineResult, error) {
+	env.deps.IndexEngine = func(ctx context.Context, p registry.Project) (IndexEngineResult, error) {
 		built = true
 		return IndexEngineResult{}, nil
 	}
@@ -3907,7 +4742,7 @@ func TestIndexEngineReportsAMatchingRemoteIndexBeforeBuilding(t *testing.T) {
 func TestIndexEngineStillBuildsWithNoRemoteMatch(t *testing.T) {
 	env := newShareEnv(t)
 	var built bool
-	env.deps.IndexEngine = func(ctx context.Context, p registryProject) (IndexEngineResult, error) {
+	env.deps.IndexEngine = func(ctx context.Context, p registry.Project) (IndexEngineResult, error) {
 		built = true
 		return IndexEngineResult{EngineEntries: 1, IndexPath: "idx"}, nil
 	}
@@ -3922,7 +4757,7 @@ func TestIndexEngineBuildsAnywayWhenTheRemoteCheckFails(t *testing.T) {
 	env := newShareEnv(t)
 	env.remote.failEverything()
 	var built bool
-	env.deps.IndexEngine = func(ctx context.Context, p registryProject) (IndexEngineResult, error) {
+	env.deps.IndexEngine = func(ctx context.Context, p registry.Project) (IndexEngineResult, error) {
 		built = true
 		return IndexEngineResult{EngineEntries: 1, IndexPath: "idx"}, nil
 	}
@@ -3938,7 +4773,7 @@ func TestIndexEngineBuildsAnywayWhenTheRemoteCheckFails(t *testing.T) {
 func TestIndexEngineSkipsTheRemoteCheckWithNoRemote(t *testing.T) {
 	env := newShareEnv(t)
 	env.remote.failIfCalled(t)
-	env.deps.IndexEngine = func(ctx context.Context, p registryProject) (IndexEngineResult, error) {
+	env.deps.IndexEngine = func(ctx context.Context, p registry.Project) (IndexEngineResult, error) {
 		return IndexEngineResult{EngineEntries: 1, IndexPath: "idx"}, nil
 	}
 	env.run(t, "index-engine", "elpis", "--no-remote")
@@ -3988,8 +4823,9 @@ func TestEngineIndexPushReportsAnExistingArtifactAsNothingToDo(t *testing.T) {
 }
 ```
 
-`registryProject` in the snippets above is `registry.Project`; import it the
-way `app_indexengine_test.go` already does.
+The snippets above use `registry.Project` directly; import
+`github.com/softdaddy-o/soft-ue-index/internal/registry` the way
+`app_indexengine_test.go` already does.
 
 Read `internal/app/app_indexengine_test.go` and `internal/testutil/fixtures.go`
 before writing the harness, and mirror their construction rather than
@@ -4065,6 +4901,16 @@ Add to the `Dependencies` struct (`internal/app/app.go:49`), alongside the exist
 	ShareClient func(repo string) *indexshare.Client
 	// DefaultRepo is the owner/name repository used when --repo is absent.
 	DefaultRepo string
+	// RemoteCheck reports published indexes matching p, for index-engine to
+	// offer before it spends hours building.
+	//
+	// It is a separate injectable rather than a call inside indexEngine
+	// because every existing index-engine test injects only IndexEngine. If
+	// the check were wired in directly, those tests would start resolving an
+	// engine identity and reaching the network before their stub ran, and
+	// their fixtures cannot do either. Tests that do not set this get the
+	// no-op below.
+	RemoteCheck func(context.Context, registry.Project) ([]indexshare.Candidate, error)
 ```
 
 Default them in `New` (`internal/app/app.go:65`), next to the existing `if a.d.IndexEngine == nil` line:
@@ -4075,6 +4921,9 @@ Default them in `New` (`internal/app/app.go:65`), next to the existing `if a.d.I
 	}
 	if a.d.DefaultRepo == "" {
 		a.d.DefaultRepo = "softdaddy-o/soft-ue-index"
+	}
+	if a.d.RemoteCheck == nil {
+		a.d.RemoteCheck = a.remoteCheckReal
 	}
 ```
 
@@ -4107,8 +4956,12 @@ func (a *App) localIdentity(p registry.Project) (engineid.Identity, idxrewrite.R
 	if len(engineEntries) == 0 {
 		return engineid.Identity{}, idxrewrite.Roots{}, nil, engineindex.ErrNoEngineEntries
 	}
-	roots := toolchainRoots(p, engineEntries)
-	id, err := engineid.Compute(p.Engine.Root, engineEntries, roots)
+	// One reader for both passes. The database references far fewer response
+	// files than entries -- 1,234 against 26,782 in the measured project --
+	// so caching turns twenty reads of each file into one.
+	read := engineid.CachingResponseReader()
+	roots := toolchainRoots(p, engineEntries, read)
+	id, err := engineid.Compute(p.Engine.Root, engineEntries, roots, read)
 	return id, roots, engineEntries, err
 }
 ```
@@ -4120,18 +4973,24 @@ the placeholder in place.
 
 ```go
 // toolchainRootMarkers maps a placeholder's root to the path segment that
-// identifies it. The root is the path truncated just after that segment.
+// identifies it. The root is the path truncated just after that segment, so
+// every machine agrees on the same depth.
 var toolchainRootMarkers = []struct{ field, marker string }{
-	{"sdk", "/Windows Kits/"},
-	{"msvc", "/Microsoft Visual Studio/"},
+	{"sdk", "/windows kits/"},
+	{"msvc", "/microsoft visual studio/"},
 	{"clang", "/lib/clang/"},
 }
 
-// toolchainRoots scans compile arguments for the SDK, MSVC, and clang
-// resource directories so their URIs can be normalised too. They are about
-// 1.1% of a real index's URIs, but a published artifact carrying them would
-// also carry the publisher's username and install layout.
-func toolchainRoots(p registry.Project, entries []compdb.Entry) idxrewrite.Roots {
+// toolchainRoots finds the SDK, MSVC, and clang resource directories so their
+// URIs can be normalised too. They are about 1.1% of a real index's URIs, but
+// a published artifact carrying them would also carry the publisher's
+// username and install layout.
+//
+// This must expand response files. In the real database every entry is
+// [compiler, @response-file, source]: scanning Arguments alone finds no
+// include paths at all and silently returns three empty roots, which then
+// fails publishing with a confusing residue error instead of here.
+func toolchainRoots(p registry.Project, entries []compdb.Entry, read engineid.ResponseReader) idxrewrite.Roots {
 	roots := idxrewrite.Roots{Engine: filepath.ToSlash(p.Engine.Root)}
 	assign := func(field, value string) {
 		switch field {
@@ -4150,19 +5009,23 @@ func toolchainRoots(p registry.Project, entries []compdb.Entry) idxrewrite.Roots
 		}
 	}
 	for _, e := range entries {
-		args := e.Arguments
-		if len(args) == 0 && e.Command != "" {
-			args = strings.Fields(e.Command)
+		args, _, err := engineid.ExpandArguments(e, read)
+		if err != nil {
+			continue
 		}
 		for _, arg := range args {
-			slashed := filepath.ToSlash(strings.ReplaceAll(arg, `\`, "/"))
+			slashed := strings.ReplaceAll(arg, `\`, "/")
+			lowered := strings.ToLower(slashed)
 			for _, m := range toolchainRootMarkers {
-				at := strings.Index(slashed, m.marker)
+				at := strings.Index(lowered, m.marker)
 				if at < 0 {
 					continue
 				}
-				start := strings.IndexAny(slashed, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
-				if start < 0 || start+1 >= len(slashed) || slashed[start+1] != ':' {
+				// Find where the path itself starts, which is not where the
+				// token starts: "/I" and quoting put the drive letter well
+				// inside the token.
+				start := idxrewrite.AbsolutePathIndex(slashed)
+				if start < 0 || start > at {
 					continue
 				}
 				assign(m.field, slashed[start:at+len(m.marker)-1])
@@ -4178,19 +5041,23 @@ func toolchainRoots(p registry.Project, entries []compdb.Entry) idxrewrite.Roots
 	return roots
 }
 
-// clangResourceRoot guesses the resource directory next to a clangd binary,
+// clangResourceRoot locates the resource directory next to a clangd binary,
 // returning "" when it is not where a standard layout puts it.
+//
+// It stops at lib/clang, not at lib/clang/<version>, so that it agrees with
+// the marker-based path above. Two code paths that pick different depths for
+// the same directory normalise the same index differently, which shows up
+// only as a mysteriously unmatched identity.
 func clangResourceRoot(clangdPath string) string {
 	if clangdPath == "" {
 		return ""
 	}
-	base := filepath.Dir(filepath.Dir(clangdPath))
-	matches, err := filepath.Glob(filepath.Join(base, "lib", "clang", "*"))
-	if err != nil || len(matches) == 0 {
+	base := filepath.Join(filepath.Dir(filepath.Dir(clangdPath)), "lib", "clang")
+	info, err := os.Stat(base)
+	if err != nil || !info.IsDir() {
 		return ""
 	}
-	sort.Strings(matches)
-	return filepath.ToSlash(matches[len(matches)-1])
+	return filepath.ToSlash(base)
 }
 ```
 
