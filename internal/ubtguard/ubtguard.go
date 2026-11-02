@@ -34,7 +34,6 @@ func Busy(procs []Process, ownPID int) string {
 		case (name == "dotnet.exe" || name == "cmd.exe" || name == "powershell.exe" || name == "pwsh.exe") &&
 			(strings.Contains(cmd, "unrealbuildtool") || strings.Contains(cmd, "runubt.bat") || strings.Contains(cmd, "\\build\\batchfiles\\build.bat")):
 		case name == "unrealeditor-cmd.exe" && strings.Contains(cmd, "-compile"):
-		case name == "livecodingconsole.exe":
 		default:
 			continue
 		}

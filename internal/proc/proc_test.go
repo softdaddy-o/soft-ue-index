@@ -19,7 +19,7 @@ func TestCommandHidesWindowOnWindows(t *testing.T) {
 		got := cmd.flags()
 		want := uint32(0)
 		if runtime.GOOS == "windows" {
-			want = createNoWindow
+			want = 0x08000000
 		}
 		if got&want != want {
 			t.Errorf("%s: flags %#x missing %#x", name, got, want)
