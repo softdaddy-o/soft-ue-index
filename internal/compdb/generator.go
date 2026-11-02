@@ -5,9 +5,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/softdaddy-o/soft-ue-index/internal/proc"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 )
 
@@ -49,7 +49,7 @@ func (r ExecRunner) Run(ctx context.Context, command Command, log io.Writer) (st
 	if limit <= 0 {
 		limit = 64 << 10
 	}
-	cmd := exec.CommandContext(ctx, command.Executable, command.Args...)
+	cmd := proc.CommandContext(ctx, command.Executable, command.Args...)
 	var out, errOut boundedBuffer
 	out.limit, errOut.limit = limit, limit
 	cmd.Stdout = io.MultiWriter(&out, log)

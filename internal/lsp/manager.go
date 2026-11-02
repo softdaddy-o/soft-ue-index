@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/softdaddy-o/soft-ue-index/internal/proc"
 	"io"
 	"net/url"
 	"os"
@@ -65,7 +66,7 @@ func (p *execProcess) Wait() error {
 	return err
 }
 func (ExecFactory) Start(ctx context.Context, path string, args []string, logPath string) (Process, error) {
-	cmd := exec.CommandContext(ctx, path, args...)
+	cmd := proc.CommandContext(ctx, path, args...)
 	var err error
 	var logFile io.Closer
 	if logPath != "" {

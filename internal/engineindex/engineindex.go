@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/softdaddy-o/soft-ue-index/internal/proc"
 	"io"
 	"os"
 	"os/exec"
@@ -152,7 +153,7 @@ type Runner interface {
 type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, exe string, args []string, stdout, log io.Writer) error {
-	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd := proc.CommandContext(ctx, exe, args...)
 	cmd.Stdout = stdout
 	cmd.Stderr = log
 	return cmd.Run()

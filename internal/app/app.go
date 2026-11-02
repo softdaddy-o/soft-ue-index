@@ -9,11 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/softdaddy-o/soft-ue-index/internal/proc"
+	"github.com/softdaddy-o/soft-ue-index/internal/ubtguard"
 	"io"
 	"io/fs"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -754,6 +755,11 @@ func (a *App) generateRealScoped(ctx context.Context, p registry.Project, engine
 	if !ok {
 		return p, errors.Join(riderErr, errors.New("bundled Unreal dotnet was not found"))
 	}
+	if err := ubtguard.Wait(ctx, ubtguard.ListProcesses, ubtguard.Options{OwnPID: os.Getpid()}, func(who string, next time.Duration) {
+		a.reportWatchError(fmt.Errorf("deferring compilation database generation: %s is running; retry in %s", who, next))
+	}); err != nil {
+		return p, errors.Join(riderErr, err)
+	}
 	staging, err := compdb.Generate(ctx, compdb.ExecRunner{}, compdb.Input{DotNet: dotnet, UBTDLL: ubt, UProject: p.UProject, Target: p.Target, Configuration: p.Configuration, Platform: p.Platform}, cache, filepath.Join(cache, "ubt.log"))
 	if err != nil {
 		return p, errors.Join(riderErr, err)
@@ -1049,7 +1055,7 @@ func (r execRunner) Run(name string, args ...string) (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := proc.CommandContext(ctx, name, args...)
 	buffer := &probeBuffer{limit: limit}
 	cmd.Stdout, cmd.Stderr = buffer, buffer
 	err := cmd.Run()
